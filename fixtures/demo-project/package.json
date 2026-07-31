@@ -1,0 +1,12 @@
+{
+  "name": "demo-project",
+  "private": true,
+  "scripts": {
+    "seed": "pnpm --filter @demo/api seed",
+    "dev:api": "pnpm --filter @demo/api dev",
+    "dev:web": "pnpm --filter @demo/web dev"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3", "esbuild"]
+  }
+}

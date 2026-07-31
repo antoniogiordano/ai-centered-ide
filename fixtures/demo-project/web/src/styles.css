@@ -1,0 +1,30 @@
+:root {
+  color-scheme: light;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  background: linear-gradient(160deg, #e8f0e6 0%, #d5e2f0 100%);
+  color: #14201a;
+  min-height: 100vh;
+}
+body { margin: 0; }
+main {
+  max-width: 420px;
+  margin: 4rem auto;
+  padding: 1.5rem;
+}
+h1 { font-family: "Fraunces", Georgia, serif; font-weight: 600; }
+input, button {
+  display: block;
+  width: 100%;
+  margin: 0.5rem 0;
+  padding: 0.65rem 0.75rem;
+  font: inherit;
+  box-sizing: border-box;
+}
+button {
+  background: #1f4d3a;
+  color: #f4fff8;
+  border: none;
+  cursor: pointer;
+}
+ul { padding-left: 1.2rem; }
+.error { color: #8b1e1e; }

@@ -1,0 +1,25 @@
+{
+  "name": "spike-pty",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx index.ts",
+    "postinstall": "node fix-perms.mjs",
+    "test:stream": "tsx index.ts stream",
+    "test:kill": "tsx index.ts kill-tree",
+    "test:stress": "tsx index.ts stress",
+    "test:resize": "tsx index.ts resize"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["node-pty", "esbuild"]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "spike-browser-surface",
+  "version": "0.0.1",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "start:recorder": "electron . --recorder"
+  },
+  "dependencies": {
+    "electron": "^33.2.1"
+  }
+}

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>QA Fixture SPA</title>
+  <style>
+    body { font-family: Georgia, serif; margin: 2rem; background: #f7f3ea; color: #1a1a1a; }
+    nav a { margin-right: 1rem; }
+    .card { margin-top: 1rem; }
+    input, select, button { display: block; margin: 0.4rem 0; padding: 0.4rem; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="#/" data-testid="nav-home">Home</a>
+    <a href="#/login" data-testid="login">Login</a>
+    <a href="#/items" data-testid="go-items">Items</a>
+  </nav>
+  <main id="app"></main>
+  <script>
+    const app = document.getElementById('app');
+    const items = [];
+    function render() {
+      const hash = location.hash || '#/';
+      if (hash.startsWith('#/login')) {
+        app.innerHTML = '<div class="card"><h1>Login</h1>' +
+          '<label>Email <input id="email" name="email" type="email" /></label>' +
+          '<label><input id="remember" type="checkbox" /> Remember</label>' +
+          '<label>Role <select id="role"><option value="user">user</option><option value="admin">admin</option></select></label>' +
+          '<form id="login-form"><button type="submit">Sign in</button></form></div>';
+        document.getElementById('login-form').onsubmit = (e) => { e.preventDefault(); location.hash = '#/items'; };
+      } else if (hash.startsWith('#/items')) {
+        app.innerHTML = '<div class="card"><h1>Items</h1><ul id="list"></ul>' +
+          '<input data-testid="new-item" id="new" placeholder="New item" />' +
+          '<button data-testid="add" id="add">Add</button></div>';
+        const list = document.getElementById('list');
+        items.forEach((it) => { const li = document.createElement('li'); li.textContent = it; list.appendChild(li); });
+        document.getElementById('add').onclick = () => {
+          const v = document.getElementById('new').value;
+          items.push(v);
+          render();
+        };
+      } else if (hash.startsWith('#/done')) {
+        app.innerHTML = '<h1 data-testid="done">Done</h1>';
+      } else {
+        app.innerHTML = '<h1>Home</h1><p>Client-side routed fixture.</p>';
+      }
+    }
+    window.addEventListener('hashchange', render);
+    render();
+  </script>
+</body>
+</html>

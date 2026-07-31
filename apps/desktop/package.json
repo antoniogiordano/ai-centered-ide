@@ -1,0 +1,30 @@
+{
+  "name": "@ai-ide/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/bundle-preload.mjs",
+    "dev": "node scripts/dev.mjs",
+    "test": "vitest run",
+    "lint": "eslint src",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.preload.json --noEmit"
+  },
+  "dependencies": {
+    "@ai-ide/agent": "workspace:*",
+    "@ai-ide/provider": "workspace:*",
+    "@ai-ide/shared": "workspace:*",
+    "@ai-ide/storage": "workspace:*",
+    "@ai-ide/tools": "workspace:*",
+    "@ai-ide/workspace": "workspace:*",
+    "electron": "^36.4.0",
+    "keytar": "^7.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.29",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.1"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "services": [
+    {
+      "id": "api",
+      "command": "pnpm --filter @demo/api start",
+      "cwd": ".",
+      "port": 3001,
+      "dependsOn": [],
+      "healthcheck": "http://127.0.0.1:3001/api/health"
+    },
+    {
+      "id": "web",
+      "command": "pnpm --filter @demo/web dev",
+      "cwd": ".",
+      "port": 5173,
+      "dependsOn": ["api"],
+      "healthcheck": "http://127.0.0.1:5173"
+    }
+  ],
+  "tasks": [
+    { "id": "seed", "command": "pnpm seed" }
+  ],
+  "seed": [
+    { "id": "default", "command": "pnpm seed" }
+  ],
+  "cleanup": [
+    { "id": "compose-down", "command": "docker compose down" }
+  ],
+  "qa": {
+    "baseUrl": "http://localhost:5173"
+  }
+}
