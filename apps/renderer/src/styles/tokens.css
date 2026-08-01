@@ -52,6 +52,60 @@ textarea {
   display: grid;
   grid-template-rows: auto 1fr;
   height: 100%;
+  background: var(--bg-base);
+}
+
+/* Plan mode: whole chrome reads as “creating the plan” (straw on black). */
+.app-shell-planning {
+  background-color: #12140f;
+  background-image:
+    radial-gradient(
+      ellipse 120% 95% at 18% -12%,
+      rgba(236, 214, 150, 0.28),
+      transparent 55%
+    ),
+    radial-gradient(
+      ellipse 95% 75% at 92% 12%,
+      rgba(210, 180, 100, 0.18),
+      transparent 50%
+    ),
+    radial-gradient(
+      ellipse 70% 50% at 50% 100%,
+      rgba(236, 214, 150, 0.1),
+      transparent 55%
+    ),
+    linear-gradient(
+      168deg,
+      rgba(236, 214, 150, 0.14) 0%,
+      rgba(236, 214, 150, 0.05) 42%,
+      rgba(236, 214, 150, 0.09) 100%
+    );
+}
+
+.app-shell-planning .chrome {
+  background: rgba(18, 20, 15, 0.48);
+  border-bottom-color: rgba(236, 214, 150, 0.22);
+}
+
+.app-shell-planning .topbar,
+.app-shell-planning .workspace-bar,
+.app-shell-planning .git-bar,
+.app-shell-planning .session-tabs {
+  border-color: rgba(236, 214, 150, 0.16);
+}
+
+.app-shell-planning .pane {
+  background: rgba(18, 20, 15, 0.35);
+  border-right-color: rgba(236, 214, 150, 0.16);
+}
+
+.app-shell-planning .pane-body,
+.app-shell-planning .plan-side-pane {
+  background: transparent;
+}
+
+.app-shell-building {
+  background: var(--bg-base);
 }
 
 .chrome {
@@ -151,6 +205,87 @@ textarea {
 
 .workspace-bar-action {
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workspace-bar-action kbd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted);
+}
+
+.git-bar {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 6px var(--space-4);
+  min-height: 32px;
+  background: #0a0c10;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.git-bar-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6b7280;
+}
+
+.git-bar-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: #c5ccd8;
+}
+
+.git-bar-main.muted {
+  color: #6b7280;
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+
+.git-bar-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.git-bar-key {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #6b7280;
+}
+
+.git-bar-value {
+  color: #d7dde8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-bar-value.muted {
+  color: #6b7280;
+  font-style: italic;
+}
+
+.git-bar-sep {
+  color: #4b5563;
 }
 
 .mode-control {
@@ -251,15 +386,42 @@ textarea {
 .session-tab-main {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   min-width: 0;
-  max-width: 160px;
-  padding: 0 4px 0 12px;
+  max-width: 180px;
+  padding: 0 4px 0 8px;
   border: none;
   background: transparent;
   color: inherit;
   cursor: pointer;
   font: inherit;
   font-size: inherit;
+}
+
+.session-tab-phase {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1;
+}
+
+.session-tab-phase-planning {
+  color: #f0d78c;
+  background: rgba(236, 214, 150, 0.16);
+  border: 1px solid rgba(236, 214, 150, 0.35);
+}
+
+.session-tab-phase-building {
+  color: var(--success);
+  background: rgba(62, 207, 142, 0.12);
+  border: 1px solid rgba(62, 207, 142, 0.4);
 }
 
 .session-tab-title {
@@ -1617,9 +1779,63 @@ textarea {
   font-size: 11px;
 }
 
+.provider-overlay {
+  z-index: 130;
+  align-items: center;
+  padding-top: 0;
+}
+
+.provider-dialog {
+  width: min(520px, calc(100vw - 32px));
+  max-height: min(860px, calc(100vh - 48px));
+  overflow: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+}
+
+.provider-dialog-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-4) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.provider-dialog-kicker {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.provider-dialog-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.provider-dialog-body {
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.provider-dialog-lead {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .onboarding {
-  max-width: 480px;
-  margin: var(--space-5) auto;
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
@@ -1627,6 +1843,33 @@ textarea {
 
 .onboarding h2 {
   margin: 0;
+}
+
+.onboarding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+.onboarding-actions kbd {
+  margin-left: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-muted);
+}
+
+.onboarding-actions .btn:not(.btn-secondary) kbd {
+  border-color: rgba(255, 255, 255, 0.25);
+  color: inherit;
+  opacity: 0.9;
 }
 
 .field label {
@@ -1661,4 +1904,39 @@ textarea {
   color: var(--success);
   border-color: rgba(62, 207, 142, 0.45);
   background: rgba(62, 207, 142, 0.1);
+}
+
+.phase-banner {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.phase-banner-planning {
+  color: #f0d78c;
+  border-color: rgba(236, 214, 150, 0.35);
+  background: rgba(236, 214, 150, 0.12);
+}
+
+.phase-banner-building {
+  color: var(--success);
+  border-color: rgba(62, 207, 142, 0.45);
+  background: rgba(62, 207, 142, 0.1);
+}
+
+.plan-side-pane {
+  flex: 1;
+  min-height: 0;
+}
+
+.plan-board-drafting .plan-phase-draft {
+  border-color: rgba(236, 214, 150, 0.18);
+}
+
+.plan-board-drafting .plan-check-mark {
+  color: rgba(236, 214, 150, 0.65);
+  font-weight: 700;
 }

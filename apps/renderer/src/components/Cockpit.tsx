@@ -192,22 +192,25 @@ function LiveToolRow(props: {
 function PlanBoard(props: {
   state: SessionState | null;
   onOpenQa?: (() => void) | undefined;
+  planning?: boolean;
 }) {
   const phases = props.state?.planPhases ?? [];
   const questions = props.state?.planQuestions ?? [];
   const planStatus = props.state?.planStatus ?? "drafting";
   const mode = props.state?.mode ?? "plan";
+  const planning =
+    props.planning ??
+    (mode === "plan" || planStatus === "drafting");
 
   if (phases.length === 0) {
     return (
       <div className="empty-state verify-empty">
-        <strong>Delivery plan</strong>
+        <strong>{planning ? "Draft plan" : "Delivery plan"}</strong>
         <p>
-          {mode === "plan"
-            ? "Talk with the agent to define phases, checklists, and clarifying questions. The plan will appear here as it takes shape."
+          {planning
+            ? "Shape phases and checklist items with the agent. Clarifying questions refine the plan — progress tracking starts in Build."
             : "No plan defined for this chat yet."}
         </p>
-        <p className="verify-hint">Status: {planStatus}</p>
       </div>
     );
   }
@@ -220,15 +223,14 @@ function PlanBoard(props: {
   const openQuestions = questions.filter((q) => q.status === "open");
 
   return (
-    <div className="plan-board">
+    <div className={`plan-board ${planning ? "plan-board-drafting" : ""}`}>
       <div className="plan-board-header">
         <div>
-          <strong>
-            {mode === "plan" ? "Planning Q&A" : "Executing"} · {planStatus}
-          </strong>
+          <strong>{planning ? "Draft plan" : "Executing"}</strong>
           <p className="verify-hint">
-            {doneCount}/{totalCount} checklist · {phases.length} phase
-            {phases.length === 1 ? "" : "s"}
+            {planning
+              ? `${phases.length} phase${phases.length === 1 ? "" : "s"} · ${totalCount} checklist item${totalCount === 1 ? "" : "s"}`
+              : `${doneCount}/${totalCount} checklist · ${phases.length} phase${phases.length === 1 ? "" : "s"}`}
             {questions.length
               ? ` · ${openQuestions.length} open question${openQuestions.length === 1 ? "" : "s"}`
               : ""}
@@ -304,24 +306,30 @@ function PlanBoard(props: {
         {phases.map((phase, index) => (
           <li
             key={phase.id}
-            className={`plan-phase plan-phase-${phase.status}`}
-            aria-current={phase.status === "in_progress" ? "step" : undefined}
+            className={`plan-phase ${planning ? "plan-phase-draft" : `plan-phase-${phase.status}`}`}
+            aria-current={
+              !planning && phase.status === "in_progress" ? "step" : undefined
+            }
           >
             <div className="plan-phase-header">
               <span className="plan-phase-index">{index + 1}</span>
               <span className="plan-phase-title">{phase.title}</span>
-              <span className="plan-phase-status">
-                {PHASE_STATUS_LABEL[phase.status]}
-              </span>
+              {!planning ? (
+                <span className="plan-phase-status">
+                  {PHASE_STATUS_LABEL[phase.status]}
+                </span>
+              ) : null}
             </div>
             <ul className="plan-checklist">
               {phase.checklist.map((item) => (
                 <li
                   key={item.id}
-                  className={`plan-check ${item.done ? "plan-check-done" : ""}`}
+                  className={`plan-check ${
+                    !planning && item.done ? "plan-check-done" : ""
+                  }`}
                 >
                   <span className="plan-check-mark" aria-hidden>
-                    {item.done ? "✓" : "○"}
+                    {planning ? "·" : item.done ? "✓" : "○"}
                   </span>
                   <span>{item.text}</span>
                 </li>
@@ -427,6 +435,10 @@ export function ConversationPane(props: {
               title: "New chat",
               updatedAt: new Date().toISOString(),
               workspaceName: state?.workspace?.name ?? null,
+              phase:
+                state?.mode === "plan" || state?.planStatus === "drafting"
+                  ? ("planning" as const)
+                  : ("building" as const),
             },
           ]
         : [];
@@ -447,9 +459,15 @@ export function ConversationPane(props: {
                 <button
                   type="button"
                   className="session-tab-main"
-                  title={session.title}
+                  title={`${session.title} · ${session.phase === "building" ? "Build" : "Plan"}`}
                   onClick={() => void switchSession(session.id)}
                 >
+                  <span
+                    className={`session-tab-phase session-tab-phase-${session.phase ?? "planning"}`}
+                    aria-hidden
+                  >
+                    {(session.phase ?? "planning") === "building" ? "B" : "P"}
+                  </span>
                   <span className="session-tab-title">{session.title}</span>
                 </button>
                 <button
@@ -467,7 +485,7 @@ export function ConversationPane(props: {
         <button
           type="button"
           className="session-tab-add"
-          title="New chat"
+          title="New chat (⌘N)"
           aria-label="New chat"
           onClick={() => void createSession()}
         >
@@ -618,8 +636,9 @@ function VerifyTabPanel(props: {
   tab: VerifyTab;
   state: SessionState | null;
   onOpenQa?: (() => void) | undefined;
+  planning?: boolean;
 }) {
-  const { tab, state, onOpenQa } = props;
+  const { tab, state, onOpenQa, planning } = props;
   const turns = state?.turns ?? [];
 
   const fileChanges = useMemo(() => extractFileChanges(turns), [turns]);
@@ -627,7 +646,13 @@ function VerifyTabPanel(props: {
 
   switch (tab) {
     case "plan":
-      return <PlanBoard state={state} onOpenQa={onOpenQa} />;
+      return (
+        <PlanBoard
+          state={state}
+          onOpenQa={onOpenQa}
+          planning={Boolean(planning)}
+        />
+      );
 
     case "browser":
       return (
@@ -732,8 +757,17 @@ export function VerifyPane(props: {
   activeTab: VerifyTab;
   onTabChange: (tab: VerifyTab) => void;
   onOpenQa?: (() => void) | undefined;
+  planning?: boolean;
 }) {
-  const { state, activeTab, onTabChange, onOpenQa } = props;
+  const { state, activeTab, onTabChange, onOpenQa, planning = false } = props;
+
+  if (planning) {
+    return (
+      <div className="pane-body plan-side-pane" role="region" aria-label="Plan">
+        <PlanBoard state={state} onOpenQa={onOpenQa} planning />
+      </div>
+    );
+  }
 
   return (
     <>
@@ -755,7 +789,12 @@ export function VerifyPane(props: {
         </div>
       </div>
       <div className="pane-body" role="tabpanel">
-        <VerifyTabPanel tab={activeTab} state={state} onOpenQa={onOpenQa} />
+        <VerifyTabPanel
+          tab={activeTab}
+          state={state}
+          onOpenQa={onOpenQa}
+          planning={false}
+        />
       </div>
     </>
   );

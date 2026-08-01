@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { deriveProductPhase } from "@ai-ide/shared";
 import { getBridge } from "./bridge";
 import { useBridgeReady, useSessionState } from "./hooks/useSessionState";
 import { OnboardingWizard } from "./components/OnboardingWizard";
@@ -21,14 +22,11 @@ function readOnboardingComplete(): boolean {
   }
 }
 
-function phaseLabel(state: {
-  mode?: string;
-  planStatus?: string;
-} | null): string {
-  if (!state) return "idle";
-  if (state.mode === "plan" || state.planStatus === "drafting") return "planning";
-  if (state.planStatus === "executing") return "building";
-  return state.mode ?? "idle";
+function modShortcutHint(key: string): string {
+  const isApple =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  return isApple ? `⌘${key}` : `Ctrl+${key}`;
 }
 
 function isBusyStatus(status: string | undefined): boolean {
@@ -44,11 +42,17 @@ export function App() {
   const { state, sessions, activeSessionId } = useSessionState();
   const bridgeReady = useBridgeReady();
   const [onboarded, setOnboarded] = useState(readOnboardingComplete);
+  const [providerOpen, setProviderOpen] = useState(() => !readOnboardingComplete());
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [verifyTab, setVerifyTab] = useState<VerifyTab>("plan");
   const [qaOpen, setQaOpen] = useState(false);
   const [qaFocusRequestId, setQaFocusRequestId] = useState(0);
   const [qaDismissedKey, setQaDismissedKey] = useState<string | null>(null);
+  const [gitStatus, setGitStatus] = useState<{
+    isRepo: boolean;
+    localBranch: string | null;
+    remoteBranch: string | null;
+  } | null>(null);
   const composerRef = useRef<HTMLInputElement>(null);
   const lastAutoFocus = useRef<string | null>(null);
 
@@ -64,23 +68,24 @@ export function App() {
     !isBusyStatus(state?.status) &&
     openPlanQuestions.length > 0;
 
-  const completeOnboarding = useCallback(() => {
+  const closeProviderDialog = useCallback(() => {
     try {
       localStorage.setItem(ONBOARDING_KEY, "true");
     } catch {
       /* ignore quota / private mode */
     }
     setOnboarded(true);
+    setProviderOpen(false);
   }, []);
 
   const openProviderSettings = useCallback(() => {
-    try {
-      localStorage.removeItem(ONBOARDING_KEY);
-    } catch {
-      /* ignore */
-    }
-    setOnboarded(false);
+    setProviderOpen(true);
   }, []);
+
+  useEffect(() => {
+    setQaDismissedKey(null);
+    setQaOpen(false);
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (!qaEligible) {
@@ -90,6 +95,28 @@ export function App() {
     if (qaDismissedKey === openQuestionKey) return;
     setQaOpen(true);
   }, [qaEligible, openQuestionKey, qaDismissedKey]);
+
+  const openWorkspace = useCallback(async () => {
+    try {
+      const result = await getBridge()?.workspace.open();
+      if (
+        result &&
+        "canceled" in (result as object) &&
+        (result as { canceled?: boolean }).canceled
+      ) {
+        return;
+      }
+    } catch (err) {
+      console.error("Open workspace failed:", err);
+      window.alert(
+        err instanceof Error ? err.message : "Could not open workspace",
+      );
+    }
+  }, []);
+
+  const createSession = useCallback(async () => {
+    await getBridge()?.session.create();
+  }, []);
 
   useEffect(() => {
     function focusComposer() {
@@ -104,35 +131,19 @@ export function App() {
       el.setSelectionRange(len, len);
     }
 
-    function onKeyDown(e: KeyboardEvent) {
-      const mod = e.metaKey || e.ctrlKey;
-      if (!mod || e.altKey || e.shiftKey) return;
-
-      if (e.code === "KeyK" || e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        e.stopPropagation();
-        setPaletteOpen((open) => !open);
-        return;
-      }
-      if (e.code === "KeyI" || e.key.toLowerCase() === "i") {
-        e.preventDefault();
-        e.stopPropagation();
-        focusComposer();
-      }
-    }
-
-    window.addEventListener("keydown", onKeyDown, true);
-    const unsubFocus = getBridge()?.ui?.onFocusComposer(focusComposer);
-    const unsubPalette = getBridge()?.ui?.onTogglePalette(() => {
-      setPaletteOpen((open) => !open);
-    });
+    const ui = getBridge()?.ui;
+    const unsubs = [
+      ui?.onFocusComposer(focusComposer),
+      ui?.onTogglePalette(() => setPaletteOpen((open) => !open)),
+      ui?.onOpenWorkspace(() => void openWorkspace()),
+      ui?.onNewSession(() => void createSession()),
+      ui?.onOpenProvider(openProviderSettings),
+    ];
 
     return () => {
-      window.removeEventListener("keydown", onKeyDown, true);
-      unsubFocus?.();
-      unsubPalette?.();
+      for (const unsub of unsubs) unsub?.();
     };
-  }, [qaOpen]);
+  }, [qaOpen, openWorkspace, createSession, openProviderSettings]);
 
   async function submitPlanAnswers(answers: PlanQaAnswer[]) {
     const content = formatPlanAnswersMessage(openPlanQuestions, answers);
@@ -164,19 +175,43 @@ export function App() {
     }
   }, [state?.planPhases, state?.mode, state?.planStatus]);
 
-  async function openWorkspace() {
-    try {
-      const result = await getBridge()?.workspace.open();
-      if (result && "canceled" in (result as object) && (result as { canceled?: boolean }).canceled) {
+  const workspaceRoot = state?.workspace?.resolvedRootPath ?? null;
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!workspaceRoot) {
+      setGitStatus(null);
+      return;
+    }
+
+    async function refreshGit() {
+      const gitStatusFn = getBridge()?.workspace.gitStatus;
+      if (!gitStatusFn) {
+        // Preload not rebuilt / bridge outdated — don't claim "not a repo".
         return;
       }
-    } catch (err) {
-      console.error("Open workspace failed:", err);
-      window.alert(
-        err instanceof Error ? err.message : "Could not open workspace",
-      );
+      try {
+        const status = await gitStatusFn();
+        if (!cancelled && status) setGitStatus(status);
+      } catch (err) {
+        console.warn("workspace.gitStatus failed", err);
+        if (!cancelled) {
+          setGitStatus({
+            isRepo: false,
+            localBranch: null,
+            remoteBranch: null,
+          });
+        }
+      }
     }
-  }
+
+    void refreshGit();
+    const timer = window.setInterval(() => void refreshGit(), 8_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [workspaceRoot]);
 
   if (!bridgeReady) {
     return (
@@ -186,32 +221,41 @@ export function App() {
     );
   }
 
-  if (!onboarded) {
-    return <OnboardingWizard onComplete={completeOnboarding} />;
-  }
-
-  const phase = phaseLabel(state);
+  const phase = state
+    ? deriveProductPhase(state)
+    : ("planning" as const);
 
   return (
-    <div className="app-shell">
+    <div
+      className={`app-shell ${phase === "planning" ? "app-shell-planning" : "app-shell-building"}`}
+    >
       <header className="chrome">
         <div className="topbar">
           <div className="topbar-left">
             <strong className="brand">AI-First IDE</strong>
             <span className="status-pill">{state?.status ?? "idle"}</span>
-            <span
-              className={`phase-pill phase-pill-${phase}`}
-              title="Product flow for this chat"
-            >
-              {phase === "planning" ? "Planning" : phase === "building" ? "Building" : phase}
-            </span>
+            {phase === "planning" ? (
+              <span
+                className="phase-banner phase-banner-planning"
+                title="Phase for this chat — plan is being created"
+              >
+                Plan mode · this chat
+              </span>
+            ) : (
+              <span
+                className="phase-banner phase-banner-building"
+                title="Phase for this chat — executing the agreed plan"
+              >
+                Build mode · this chat
+              </span>
+            )}
           </div>
           <div className="topbar-right">
             <button
               type="button"
               className="btn btn-secondary btn-sm"
               onClick={openProviderSettings}
-              title="Change Base URL, API key, and model"
+              title={`Provider settings (${modShortcutHint("P")})`}
             >
               Provider
             </button>
@@ -219,9 +263,9 @@ export function App() {
               type="button"
               className="btn btn-secondary btn-sm palette-trigger"
               onClick={() => setPaletteOpen(true)}
-              title="Command palette (⌘K)"
+              title={`Command palette (${modShortcutHint("K")})`}
             >
-              ⌘K
+              {modShortcutHint("K")}
             </button>
           </div>
         </div>
@@ -250,10 +294,47 @@ export function App() {
           <button
             type="button"
             className="btn workspace-bar-action"
+            title={`Open or change workspace (${modShortcutHint("O")})`}
             onClick={() => void openWorkspace()}
           >
-            {state?.workspace ? "Cambia…" : "Apri workspace"}
+            {state?.workspace ? "Cambia…" : "Apri workspace"}{" "}
+            <kbd>{modShortcutHint("O")}</kbd>
           </button>
+        </div>
+
+        <div
+          className="git-bar"
+          role="status"
+          aria-label="Git branch"
+        >
+          <div className="git-bar-label">Git</div>
+          {!state?.workspace ? (
+            <div className="git-bar-main muted">No workspace</div>
+          ) : gitStatus == null ? (
+            <div className="git-bar-main muted">Checking repository…</div>
+          ) : !gitStatus.isRepo ? (
+            <div className="git-bar-main muted">Not a git repository</div>
+          ) : (
+            <div className="git-bar-main">
+              <span className="git-bar-item">
+                <span className="git-bar-key">local</span>
+                <span className="git-bar-value">
+                  {gitStatus.localBranch ?? "—"}
+                </span>
+              </span>
+              <span className="git-bar-sep" aria-hidden>
+                →
+              </span>
+              <span className="git-bar-item">
+                <span className="git-bar-key">remote</span>
+                <span
+                  className={`git-bar-value ${gitStatus.remoteBranch ? "" : "muted"}`}
+                >
+                  {gitStatus.remoteBranch ?? "not tracking"}
+                </span>
+              </span>
+            </div>
+          )}
         </div>
 
         <ComposerBar state={state} inputRef={composerRef} />
@@ -272,6 +353,7 @@ export function App() {
             state={state}
             activeTab={verifyTab}
             onTabChange={setVerifyTab}
+            planning={phase === "planning"}
             onOpenQa={() => {
               setQaDismissedKey(null);
               setQaOpen(true);
@@ -284,6 +366,7 @@ export function App() {
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
         currentVerifyTab={verifyTab}
+        planning={phase === "planning"}
         onOpenWorkspace={() => void openWorkspace()}
         onFocusComposer={() => {
           if (qaOpen) setQaFocusRequestId((n) => n + 1);
@@ -294,7 +377,7 @@ export function App() {
       />
 
       <PlanQaDialog
-        open={qaOpen && qaEligible}
+        open={qaOpen && qaEligible && !providerOpen}
         questions={openPlanQuestions}
         focusRequestId={qaFocusRequestId}
         onClose={() => {
@@ -302,6 +385,12 @@ export function App() {
           setQaDismissedKey(openQuestionKey);
         }}
         onSubmit={submitPlanAnswers}
+      />
+
+      <OnboardingWizard
+        open={providerOpen || !onboarded}
+        onComplete={closeProviderDialog}
+        onCancel={closeProviderDialog}
       />
     </div>
   );

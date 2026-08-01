@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import {
   IPC_CHANNELS,
+  type ProviderGetConfigResponse,
   type ProviderListModelsResponse,
   type ProviderSaveConfigResponse,
   type ProviderVerifyResponse,
@@ -12,6 +13,7 @@ import {
   type SessionSetModeResponse,
   type SessionSwitchResponse,
   type SessionUpdateEvent,
+  type WorkspaceGitStatusResponse,
   type WorkspaceListRecentResponse,
   type WorkspaceOpenResponse,
 } from "@ai-ide/shared";
@@ -43,8 +45,10 @@ export type DesktopBridge = {
   workspace: {
     open: (path?: string) => Promise<WorkspaceOpenResponse>;
     listRecent: () => Promise<WorkspaceListRecentResponse>;
+    gitStatus: () => Promise<WorkspaceGitStatusResponse>;
   };
   provider: {
+    getConfig: () => Promise<ProviderGetConfigResponse>;
     verify: (input: {
       baseUrl: string;
       apiKey: string;
@@ -63,11 +67,23 @@ export type DesktopBridge = {
   ui: {
     onFocusComposer: (cb: () => void) => () => void;
     onTogglePalette: (cb: () => void) => () => void;
+    onOpenWorkspace: (cb: () => void) => () => void;
+    onNewSession: (cb: () => void) => () => void;
+    onOpenProvider: (cb: () => void) => () => void;
   };
 };
 
 const UI_FOCUS_COMPOSER = "ui:focus-composer";
 const UI_TOGGLE_PALETTE = "ui:toggle-palette";
+const UI_OPEN_WORKSPACE = "ui:open-workspace";
+const UI_NEW_SESSION = "ui:new-session";
+const UI_OPEN_PROVIDER = "ui:open-provider";
+
+function onUiEvent(channel: string, cb: () => void): () => void {
+  const handler = () => cb();
+  ipcRenderer.on(channel, handler);
+  return () => ipcRenderer.removeListener(channel, handler);
+}
 
 const bridge: DesktopBridge = {
   session: {
@@ -109,8 +125,12 @@ const bridge: DesktopBridge = {
     open: (path) =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_OPEN, path ? { path } : {}),
     listRecent: () => ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_RECENT),
+    gitStatus: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_STATUS, {}),
   },
   provider: {
+    getConfig: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_GET_CONFIG, {}),
     verify: (input) => ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_VERIFY, input),
     listModels: (input) =>
       ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_LIST_MODELS, input),
@@ -118,16 +138,11 @@ const bridge: DesktopBridge = {
       ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_SAVE_CONFIG, input),
   },
   ui: {
-    onFocusComposer: (cb) => {
-      const handler = () => cb();
-      ipcRenderer.on(UI_FOCUS_COMPOSER, handler);
-      return () => ipcRenderer.removeListener(UI_FOCUS_COMPOSER, handler);
-    },
-    onTogglePalette: (cb) => {
-      const handler = () => cb();
-      ipcRenderer.on(UI_TOGGLE_PALETTE, handler);
-      return () => ipcRenderer.removeListener(UI_TOGGLE_PALETTE, handler);
-    },
+    onFocusComposer: (cb) => onUiEvent(UI_FOCUS_COMPOSER, cb),
+    onTogglePalette: (cb) => onUiEvent(UI_TOGGLE_PALETTE, cb),
+    onOpenWorkspace: (cb) => onUiEvent(UI_OPEN_WORKSPACE, cb),
+    onNewSession: (cb) => onUiEvent(UI_NEW_SESSION, cb),
+    onOpenProvider: (cb) => onUiEvent(UI_OPEN_PROVIDER, cb),
   },
 };
 

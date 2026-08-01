@@ -12,6 +12,7 @@ import {
 import type { CredentialStore } from "@ai-ide/storage";
 import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
 import { assertHttpsForRemote } from "@ai-ide/provider";
+import { GitService } from "@ai-ide/workspace";
 import { dialog } from "electron";
 import type { SessionManager } from "./session.js";
 
@@ -130,35 +131,42 @@ export function registerIpcHandlers(
     workspaces: session.listRecent(),
   }));
 
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_GIT_STATUS, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.WORKSPACE_GIT_STATUS, payload ?? {});
+    const root = session.getState().workspace?.resolvedRootPath;
+    if (!root) {
+      return { isRepo: false, localBranch: null, remoteBranch: null };
+    }
+    const info = await new GitService(root).branchInfo();
+    if (!info.isRepo) {
+      console.warn("[workspace:git-status] not a repo (or git failed) at", root);
+    }
+    return info;
+  });
+
   ipcMain.handle(IPC_CHANNELS.PROVIDER_VERIFY, async (_event, payload) => {
-    const req = safeValidate(IPC_CHANNELS.PROVIDER_VERIFY, payload);
     try {
+      const req = safeValidate(IPC_CHANNELS.PROVIDER_VERIFY, payload);
       assertHttpsForRemote(req.baseUrl);
-      let models: string[] = [];
-      try {
-        const provider = new OpenAiCompatibleProvider({
-          baseUrl: req.baseUrl,
-          apiKey: req.apiKey,
-          ...(req.model ? { defaultModel: req.model } : {}),
-        });
-        models = (await provider.listModels()).map((m) => m.id);
-      } catch {
-        const provider = new MockProvider({
-          name: "verify-fallback",
-          models: [{ id: req.model ?? "mock-model" }],
-          steps: [{ type: "content", text: "ok" }],
-        });
-        models = (await provider.listModels()).map((m) => m.id);
+      const provider = new OpenAiCompatibleProvider({
+        baseUrl: req.baseUrl,
+        apiKey: req.apiKey,
+        ...(req.model ? { defaultModel: req.model } : {}),
+      });
+      const models = (await provider.listModels()).map((m) => m.id);
+      // Persist key only when present; empty is fine for local providers.
+      if (req.apiKey.trim()) {
+        await credentials.set(CREDENTIAL_SERVICE, "default", req.apiKey);
       }
-      await credentials.set(CREDENTIAL_SERVICE, "default", req.apiKey);
       return { ok: true, models };
     } catch (error) {
       return {
         ok: false,
         error: {
           code: "PROVIDER_ERROR" as const,
-          userMessage: "Could not verify provider settings.",
-          technicalDetail: error instanceof Error ? error.message : String(error),
+          userMessage: "Could not list models from provider.",
+          technicalDetail:
+            error instanceof Error ? error.message : String(error),
         },
       };
     }
@@ -177,8 +185,24 @@ export function registerIpcHandlers(
       baseUrl: req.baseUrl,
       defaultModel: req.defaultModel,
     });
-    await credentials.set(CREDENTIAL_SERVICE, "default", req.apiKey);
+    if (req.apiKey.trim()) {
+      await credentials.set(CREDENTIAL_SERVICE, "default", req.apiKey);
+    }
     return { saved: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDER_GET_CONFIG, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.PROVIDER_GET_CONFIG, payload ?? {});
+    const cfg = storage.getPreference<{
+      baseUrl?: string;
+      defaultModel?: string;
+    }>("providerConfig");
+    const apiKey = await credentials.get(CREDENTIAL_SERVICE, "default");
+    return {
+      baseUrl: cfg?.baseUrl ?? null,
+      defaultModel: cfg?.defaultModel ?? null,
+      apiKey: apiKey ?? null,
+    };
   });
 
   ipcMain.on(IPC_CHANNELS.SESSION_SUBSCRIBE, (event) => {

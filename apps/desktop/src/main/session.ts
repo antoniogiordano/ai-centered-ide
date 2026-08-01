@@ -7,7 +7,7 @@ import type {
   SessionSummary,
   WorkspaceRef,
 } from "@ai-ide/shared";
-import { createEmptySessionState } from "@ai-ide/shared";
+import { createEmptySessionState, deriveProductPhase } from "@ai-ide/shared";
 import type { ProjectStorage } from "@ai-ide/storage";
 import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
 import {
@@ -186,6 +186,7 @@ export class SessionManager {
       title: c.title,
       updatedAt: c.updatedAt,
       workspaceName: c.workspace?.name ?? null,
+      phase: deriveProductPhase({ mode: c.mode, planStatus: c.planStatus }),
     }));
   }
 
@@ -641,10 +642,10 @@ export class SessionManager {
       ? await this.credentials.get(CREDENTIAL_SERVICE, "default")
       : null;
 
-    if (cfg?.baseUrl && apiKey) {
+    if (cfg?.baseUrl) {
       return new OpenAiCompatibleProvider({
         baseUrl: cfg.baseUrl,
-        apiKey,
+        apiKey: apiKey ?? "",
         defaultModel: cfg.defaultModel || "gpt-4o-mini",
       });
     }

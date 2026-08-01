@@ -22,9 +22,11 @@ export const IPC_CHANNELS = {
   SESSION_CLOSE: "session:close",
   WORKSPACE_OPEN: "workspace:open",
   WORKSPACE_LIST_RECENT: "workspace:list-recent",
+  WORKSPACE_GIT_STATUS: "workspace:git-status",
   PROVIDER_VERIFY: "provider:verify",
   PROVIDER_LIST_MODELS: "provider:list-models",
   PROVIDER_SAVE_CONFIG: "provider:save-config",
+  PROVIDER_GET_CONFIG: "provider:get-config",
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];
@@ -175,9 +177,24 @@ export type WorkspaceListRecentResponse = z.infer<
   typeof WorkspaceListRecentResponseSchema
 >;
 
+export const WorkspaceGitStatusRequestSchema = z.object({});
+export type WorkspaceGitStatusRequest = z.infer<
+  typeof WorkspaceGitStatusRequestSchema
+>;
+
+export const WorkspaceGitStatusResponseSchema = z.object({
+  isRepo: z.boolean(),
+  localBranch: z.string().nullable(),
+  remoteBranch: z.string().nullable(),
+});
+export type WorkspaceGitStatusResponse = z.infer<
+  typeof WorkspaceGitStatusResponseSchema
+>;
+
 export const ProviderVerifyRequestSchema = z.object({
   baseUrl: z.string().url(),
-  apiKey: z.string().min(1),
+  /** Optional for local OpenAI-compatible servers (e.g. Ollama). */
+  apiKey: z.string().default(""),
   model: z.string().min(1).optional(),
 });
 export type ProviderVerifyRequest = z.infer<typeof ProviderVerifyRequestSchema>;
@@ -193,7 +210,7 @@ export type ProviderVerifyResponse = z.infer<
 
 export const ProviderListModelsRequestSchema = z.object({
   baseUrl: z.string().url(),
-  apiKey: z.string().min(1),
+  apiKey: z.string().default(""),
 });
 export type ProviderListModelsRequest = z.infer<
   typeof ProviderListModelsRequestSchema
@@ -208,7 +225,7 @@ export type ProviderListModelsResponse = z.infer<
 
 export const ProviderSaveConfigRequestSchema = z.object({
   baseUrl: z.string().url(),
-  apiKey: z.string().min(1),
+  apiKey: z.string().default(""),
   defaultModel: z.string().min(1),
 });
 export type ProviderSaveConfigRequest = z.infer<
@@ -220,6 +237,20 @@ export const ProviderSaveConfigResponseSchema = z.object({
 });
 export type ProviderSaveConfigResponse = z.infer<
   typeof ProviderSaveConfigResponseSchema
+>;
+
+export const ProviderGetConfigRequestSchema = z.object({});
+export type ProviderGetConfigRequest = z.infer<
+  typeof ProviderGetConfigRequestSchema
+>;
+
+export const ProviderGetConfigResponseSchema = z.object({
+  baseUrl: z.string().nullable(),
+  defaultModel: z.string().nullable(),
+  apiKey: z.string().nullable(),
+});
+export type ProviderGetConfigResponse = z.infer<
+  typeof ProviderGetConfigResponseSchema
 >;
 
 export const IpcRequestSchemas = {
@@ -236,9 +267,11 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.SESSION_SWITCH]: SessionSwitchRequestSchema,
   [IPC_CHANNELS.SESSION_CLOSE]: SessionCloseRequestSchema,
   [IPC_CHANNELS.WORKSPACE_OPEN]: WorkspaceOpenRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_STATUS]: WorkspaceGitStatusRequestSchema,
   [IPC_CHANNELS.PROVIDER_VERIFY]: ProviderVerifyRequestSchema,
   [IPC_CHANNELS.PROVIDER_LIST_MODELS]: ProviderListModelsRequestSchema,
   [IPC_CHANNELS.PROVIDER_SAVE_CONFIG]: ProviderSaveConfigRequestSchema,
+  [IPC_CHANNELS.PROVIDER_GET_CONFIG]: ProviderGetConfigRequestSchema,
 } as const;
 
 export type IpcRequestChannel = keyof typeof IpcRequestSchemas;

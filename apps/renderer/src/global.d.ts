@@ -1,4 +1,5 @@
 import type {
+  ProviderGetConfigResponse,
   ProviderListModelsResponse,
   ProviderSaveConfigResponse,
   ProviderVerifyResponse,
@@ -10,6 +11,7 @@ import type {
   SessionSetModeResponse,
   SessionSwitchResponse,
   SessionUpdateEvent,
+  WorkspaceGitStatusResponse,
   WorkspaceListRecentResponse,
   WorkspaceOpenResponse,
 } from "@ai-ide/shared";
@@ -41,8 +43,10 @@ export type DesktopBridge = {
   workspace: {
     open: (path?: string) => Promise<WorkspaceOpenResponse>;
     listRecent: () => Promise<WorkspaceListRecentResponse>;
+    gitStatus: () => Promise<WorkspaceGitStatusResponse>;
   };
   provider: {
+    getConfig: () => Promise<ProviderGetConfigResponse>;
     verify: (input: {
       baseUrl: string;
       apiKey: string;
@@ -61,6 +65,9 @@ export type DesktopBridge = {
   ui?: {
     onFocusComposer: (cb: () => void) => () => void;
     onTogglePalette: (cb: () => void) => () => void;
+    onOpenWorkspace: (cb: () => void) => () => void;
+    onNewSession: (cb: () => void) => () => void;
+    onOpenProvider: (cb: () => void) => () => void;
   };
 };
 

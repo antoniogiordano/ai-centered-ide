@@ -18,6 +18,9 @@ let persistMainWindowState: (() => void) | null = null;
 
 const UI_FOCUS_COMPOSER = "ui:focus-composer";
 const UI_TOGGLE_PALETTE = "ui:toggle-palette";
+const UI_OPEN_WORKSPACE = "ui:open-workspace";
+const UI_NEW_SESSION = "ui:new-session";
+const UI_OPEN_PROVIDER = "ui:open-provider";
 
 type WindowState = {
   x?: number;
@@ -155,6 +158,9 @@ function trackWindowState(win: BrowserWindow): () => void {
 
 function installAppMenu(): void {
   const isMac = process.platform === "darwin";
+  const send = (channel: string) => {
+    mainWindow?.webContents.send(channel);
+  };
   const template: Electron.MenuItemConstructorOptions[] = [
     ...(isMac
       ? [
@@ -163,6 +169,32 @@ function installAppMenu(): void {
           },
         ]
       : []),
+    {
+      label: "File",
+      submenu: [
+        {
+          label: "New Chat",
+          accelerator: "CommandOrControl+N",
+          click: () => send(UI_NEW_SESSION),
+        },
+        {
+          label: "Open Workspace…",
+          accelerator: "CommandOrControl+O",
+          click: () => send(UI_OPEN_WORKSPACE),
+        },
+        {
+          label: "Provider Settings…",
+          accelerator: "CommandOrControl+P",
+          click: () => send(UI_OPEN_PROVIDER),
+        },
+        { type: "separator" },
+        {
+          label: "Command Palette",
+          accelerator: "CommandOrControl+K",
+          click: () => send(UI_TOGGLE_PALETTE),
+        },
+      ],
+    },
     {
       label: "Edit",
       submenu: [
@@ -194,16 +226,7 @@ function installAppMenu(): void {
         {
           label: "Focus Composer",
           accelerator: "CommandOrControl+I",
-          click: () => {
-            mainWindow?.webContents.send(UI_FOCUS_COMPOSER);
-          },
-        },
-        {
-          label: "Command Palette",
-          accelerator: "CommandOrControl+K",
-          click: () => {
-            mainWindow?.webContents.send(UI_TOGGLE_PALETTE);
-          },
+          click: () => send(UI_FOCUS_COMPOSER),
         },
       ],
     },
@@ -301,14 +324,27 @@ export function createMainWindow(_storage: ProjectStorage): BrowserWindow {
     console.error("Failed to load", url, code, desc);
   });
 
-  // Catch ⌘I / Ctrl+I before Monaco or other editors can swallow it.
+  // Catch app shortcuts before Monaco / OS defaults can swallow them.
   win.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown") return;
     const mod = input.meta || input.control;
     if (!mod || input.alt || input.shift) return;
-    if (input.key.toLowerCase() !== "i") return;
+    const key = input.key.toLowerCase();
+    const channel =
+      key === "i"
+        ? UI_FOCUS_COMPOSER
+        : key === "k"
+          ? UI_TOGGLE_PALETTE
+          : key === "n"
+            ? UI_NEW_SESSION
+            : key === "o"
+              ? UI_OPEN_WORKSPACE
+              : key === "p"
+                ? UI_OPEN_PROVIDER
+                : null;
+    if (!channel) return;
     event.preventDefault();
-    win.webContents.send(UI_FOCUS_COMPOSER);
+    win.webContents.send(channel);
   });
 
   const devUrl = process.env.VITE_DEV_SERVER_URL;
@@ -338,7 +374,19 @@ function isAllowedNavigation(url: string): boolean {
   return false;
 }
 
+function ensureGitOnPath(): void {
+  // Electron apps often inherit a minimal PATH (no Homebrew). simple-git needs `git`.
+  const extras = ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
+  const current = process.env.PATH ?? "";
+  const parts = current.split(":").filter(Boolean);
+  for (const dir of extras) {
+    if (!parts.includes(dir)) parts.push(dir);
+  }
+  process.env.PATH = parts.join(":");
+}
+
 app.whenReady().then(async () => {
+  ensureGitOnPath();
   installAppMenu();
   const dbPath = join(app.getPath("userData"), "ai-first-ide.sqlite");
   const storage = new ProjectStorage(openDatabase(dbPath));

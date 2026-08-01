@@ -1,0 +1,16 @@
+---
+description: Every interactive UI action must expose a keyboard shortcut
+alwaysApply: true
+---
+
+# Keyboard shortcuts (SC)
+
+When building or changing UI in this IDE:
+
+1. **Every button / primary action must have a keyboard shortcut**, shown in the label or hint (e.g. `Cancel · Esc`, `Continue · Enter`).
+2. **Submit / continue / confirm / save** → **Enter** (not Shift+Enter unless multiline intentionally allows it).
+3. **Cancel / dismiss / close overlay** → **Esc**.
+4. **Back** (wizard / multi-step) → **Backspace** when not editing text, or a dedicated chord documented on the button.
+5. Wire shortcuts in a `keydown` handler (capture when needed so editors do not swallow them). Disable conflicting shortcuts while the user is typing in a field unless the key is Enter/Esc as specified.
+6. Prefer the same pattern as existing surfaces (Plan Q&A dialog, app menu accelerators, command palette hints).
+7. Do not ship unlabeled icon-only actions without a tooltip that includes the shortcut.

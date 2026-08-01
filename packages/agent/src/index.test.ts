@@ -170,6 +170,21 @@ describe("agent runtime", () => {
     expect(patches).toContain("executing");
   });
 
+  it("ignores checklist done flags while planning", () => {
+    const applied = applyUpsertPlan(newSession("s-done", "plan"), {
+      phases: [
+        {
+          title: "Foundation",
+          status: "completed",
+          checklist: [{ text: "Scaffold", done: true }],
+        },
+      ],
+      questions: [],
+    });
+    expect(applied.state.planPhases[0]?.status).toBe("pending");
+    expect(applied.state.planPhases[0]?.checklist[0]?.done).toBe(false);
+  });
+
   it("strips agent-invented clarifying answers", () => {
     const session = newSession("s-q", "plan");
     const applied = applyUpsertPlan(session, {

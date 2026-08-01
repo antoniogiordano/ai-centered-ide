@@ -4,11 +4,29 @@ import { simpleGit } from "simple-git";
 import { assertInsideWorkspace } from "./perimeter.js";
 import { isEnvFile } from "./filesystem.js";
 
+function resolveGitBinary(): string {
+  const candidates = [
+    process.env.GIT_BINARY,
+    "/usr/bin/git",
+    "/usr/local/bin/git",
+    "/opt/homebrew/bin/git",
+    "git",
+  ].filter((v): v is string => Boolean(v));
+  for (const candidate of candidates) {
+    if (candidate === "git") return candidate;
+    if (existsSync(candidate)) return candidate;
+  }
+  return "git";
+}
+
 export class GitService {
   private readonly git;
 
   constructor(private readonly workspaceRoot: string) {
-    this.git = simpleGit(workspaceRoot);
+    this.git = simpleGit({
+      baseDir: workspaceRoot,
+      binary: resolveGitBinary(),
+    });
   }
 
   async status(): Promise<{ current: string; modified: string[]; not_added: string[] }> {
@@ -18,6 +36,68 @@ export class GitService {
       modified: result.modified,
       not_added: result.not_added,
     };
+  }
+
+  /** Local branch + upstream tracking branch (e.g. origin/main), if any. */
+  async branchInfo(): Promise<{
+    isRepo: boolean;
+    localBranch: string | null;
+    remoteBranch: string | null;
+  }> {
+    try {
+      // Prefer rev-parse: more reliable than checkIsRepo across simple-git versions
+      // and when Electron's PATH is thinner than the login shell.
+      const inside = (
+        await this.git.raw(["rev-parse", "--is-inside-work-tree"])
+      ).trim();
+      if (inside !== "true") {
+        return { isRepo: false, localBranch: null, remoteBranch: null };
+      }
+
+      let localBranch: string | null = null;
+      try {
+        localBranch = (
+          await this.git.raw(["branch", "--show-current"])
+        ).trim() || null;
+      } catch {
+        localBranch = null;
+      }
+      if (!localBranch) {
+        try {
+          localBranch = (
+            await this.git.raw(["rev-parse", "--abbrev-ref", "HEAD"])
+          ).trim() || null;
+          if (localBranch === "HEAD") localBranch = "detached HEAD";
+        } catch {
+          localBranch = "HEAD";
+        }
+      }
+
+      let remoteBranch: string | null = null;
+      try {
+        const upstream = (
+          await this.git.raw([
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{u}",
+          ])
+        ).trim();
+        if (upstream && upstream !== "@{u}") remoteBranch = upstream;
+      } catch {
+        // No upstream configured.
+        remoteBranch = null;
+      }
+
+      return { isRepo: true, localBranch, remoteBranch };
+    } catch (error) {
+      console.warn(
+        "[git] branchInfo failed for",
+        this.workspaceRoot,
+        error instanceof Error ? error.message : error,
+      );
+      return { isRepo: false, localBranch: null, remoteBranch: null };
+    }
   }
 
   async diff(staged = false): Promise<string> {

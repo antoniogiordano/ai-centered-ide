@@ -210,14 +210,20 @@ export class OpenAiCompatibleProvider implements AiProvider {
     if (init.signal) signals.push(init.signal);
 
     const combined = AbortSignal.any(signals);
+    const headers: Record<string, string> = {
+      ...this.config.extraHeaders,
+      ...(init.headers as Record<string, string> | undefined),
+    };
+    // Local servers (Ollama, etc.) often need no key; omit Bearer when empty.
+    const key = this.config.apiKey.trim();
+    if (key) {
+      headers.Authorization = `Bearer ${key}`;
+    }
+
     return fetch(url, {
       ...init,
       signal: combined,
-      headers: {
-        Authorization: `Bearer ${this.config.apiKey}`,
-        ...this.config.extraHeaders,
-        ...(init.headers as Record<string, string> | undefined),
-      },
+      headers,
     }).finally(() => clearTimeout(timeout));
   }
 

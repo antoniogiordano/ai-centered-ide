@@ -148,11 +148,30 @@ export const SessionStateSchema = z.object({
 });
 export type SessionState = z.infer<typeof SessionStateSchema>;
 
+/**
+ * Product phase for a chat session.
+ * Today: planning | building. Later: unit_test | qa | e2e, …
+ */
+export const ProductPhaseSchema = z.enum(["planning", "building"]);
+export type ProductPhase = z.infer<typeof ProductPhaseSchema>;
+
+export function deriveProductPhase(state: {
+  mode?: string | null;
+  planStatus?: string | null;
+}): ProductPhase {
+  if (state.mode === "plan" || state.planStatus === "drafting") {
+    return "planning";
+  }
+  return "building";
+}
+
 export const SessionSummarySchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1),
   updatedAt: z.string().datetime(),
   workspaceName: z.string().nullable(),
+  /** Plan / Build (per chat). Future phases will extend ProductPhase. */
+  phase: ProductPhaseSchema.default("planning"),
 });
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;
 

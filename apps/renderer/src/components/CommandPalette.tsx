@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { getBridge } from "../bridge";
 import type { VerifyTab } from "./Cockpit";
 
 const VERIFY_TABS: { id: VerifyTab; label: string }[] = [
@@ -11,11 +12,11 @@ const VERIFY_TABS: { id: VerifyTab; label: string }[] = [
   { id: "terminal", label: "Terminal" },
 ];
 
-function composerShortcutHint(): string {
+function modHint(key: string): string {
   const isApple =
     typeof navigator !== "undefined" &&
     /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-  return isApple ? "⌘I" : "Ctrl+I";
+  return isApple ? `⌘${key}` : `Ctrl+${key}`;
 }
 
 export function CommandPalette(props: {
@@ -26,6 +27,7 @@ export function CommandPalette(props: {
   onFocusComposer: () => void;
   onSetVerifyTab: (tab: VerifyTab) => void;
   onOpenProviderSettings?: () => void;
+  planning?: boolean;
 }) {
   const {
     open,
@@ -35,6 +37,7 @@ export function CommandPalette(props: {
     onFocusComposer,
     onSetVerifyTab,
     onOpenProviderSettings,
+    planning = false,
   } = props;
 
   const inputRef = useRef<HTMLInputElement>(null);
@@ -65,16 +68,25 @@ export function CommandPalette(props: {
     {
       id: "workspace",
       label: "Open workspace",
-      hint: "Choose project folder",
+      hint: modHint("O"),
       run: () => {
         onOpenWorkspace();
         onClose();
       },
     },
     {
+      id: "new-chat",
+      label: "New chat",
+      hint: modHint("N"),
+      run: () => {
+        void getBridge()?.session.create();
+        onClose();
+      },
+    },
+    {
       id: "composer",
       label: "Focus composer",
-      hint: composerShortcutHint(),
+      hint: modHint("I"),
       run: () => {
         onFocusComposer();
         onClose();
@@ -85,7 +97,7 @@ export function CommandPalette(props: {
           {
             id: "provider",
             label: "Provider settings",
-            hint: "Base URL, API key, model",
+            hint: modHint("P"),
             run: () => {
               onOpenProviderSettings();
               onClose();
@@ -93,15 +105,19 @@ export function CommandPalette(props: {
           },
         ]
       : []),
-    ...VERIFY_TABS.map((tab) => ({
-      id: `tab-${tab.id}`,
-      label: `Open ${tab.label}`,
-      ...(tab.id === currentVerifyTab ? { hint: "Current tab" as const } : {}),
-      run: () => {
-        onSetVerifyTab(tab.id);
-        onClose();
-      },
-    })),
+    ...(planning
+      ? []
+      : VERIFY_TABS.map((tab) => ({
+          id: `tab-${tab.id}`,
+          label: `Open ${tab.label}`,
+          ...(tab.id === currentVerifyTab
+            ? { hint: "Current tab" as const }
+            : {}),
+          run: () => {
+            onSetVerifyTab(tab.id);
+            onClose();
+          },
+        }))),
   ];
 
   const filtered = q

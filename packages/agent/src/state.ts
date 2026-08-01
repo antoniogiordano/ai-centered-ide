@@ -82,11 +82,18 @@ function formatPlanForPrompt(state: SessionState): string {
   if (state.planPhases.length === 0) {
     return "Current plan: (empty — call upsert_plan with draft phases + open questions).";
   }
+  const planning = productPhaseForState(state) === "planning";
   const lines = state.planPhases.map((phase, i) => {
     const checks = phase.checklist
-      .map((c) => `    - [${c.done ? "x" : " "}] ${c.text}`)
+      .map((c) =>
+        planning
+          ? `    - ${c.text}`
+          : `    - [${c.done ? "x" : " "}] ${c.text}`,
+      )
       .join("\n");
-    return `${i + 1}. [${phase.status}] ${phase.title}\n${checks || "    (no checklist items yet)"}`;
+    return planning
+      ? `${i + 1}. ${phase.title}\n${checks || "    (no checklist items yet)"}`
+      : `${i + 1}. [${phase.status}] ${phase.title}\n${checks || "    (no checklist items yet)"}`;
   });
   const questions =
     state.planQuestions.length === 0
@@ -132,20 +139,25 @@ export function buildSystemPrompt(state: SessionState): string {
       ];
 
   const planningRules = [
-    "PHASE: PLANNING (Q&A — not execution)",
+    "PHASE: PLANNING — the plan is being created (not executed).",
     "Available tools: list_dir, read_file, search_text, upsert_plan, finalize_plan.",
     "Unavailable: write_file, git_*, run_command, checkpoint_restore.",
     "",
+    "Plan structure (CRUD only — no progress tracking yet):",
+    "- Use upsert_plan to create/update/remove phases and checklist item texts.",
+    "- Do NOT mark checklist items done. Do NOT set phase status to completed/failed/skipped. Progress smarking starts only after development begins.",
+    "- Checklist items are a draft outline of work, not a live todo board.",
+    "",
     "Clarifying questions (critical — UI dialog; USER answers, never you):",
+    "- Questions exist only to refine the plan with necessary details.",
     "- ALWAYS put open questions in upsert_plan.questions (never only in chat prose).",
     "- EVERY question MUST include selection: \"single\" OR \"multiple\", plus 2–8 concrete options[{id,label}].",
-    "- single = mutually exclusive choices (UI keys A–Z). multiple = multi-select (UI keys 1–9).",
-    "- Leave status=\"open\". Do NOT set answer, selectedOptionIds, or status=\"answered\" — the user answers in a dialog; inventing answers is forbidden.",
-    "- Prefer 1–3 open questions per turn. Keep previously user-answered questions with their existing answers when you re-upsert.",
+    "- Leave status=\"open\". Do NOT invent answers.",
+    "- Prefer 1–3 open questions per turn.",
     "",
     "Turn discipline (critical):",
-    "1) First broad request: lightly explore the repo, then upsert_plan with draft phases + checklist + open choice questions (unanswered). Do NOT dump a full analysis essay. Do NOT call finalize_plan.",
-    "2) Subsequent turns: ONLY after the user answered via the dialog/message, update upsert_plan. Ask the next unanswered questions. Never answer on the user's behalf.",
+    "1) First broad request: lightly explore the repo, then upsert_plan with draft phases + checklist texts + open questions. Do NOT dump a full analysis essay. Do NOT call finalize_plan.",
+    "2) After user answers: reshape phases/checklist via upsert_plan; ask remaining questions if needed.",
     "3) Never implement, rewrite files, or pretend development has started.",
     "4) Only when the plan is solid AND open questions are answered by the user, ask: \"Is this plan ready to start development?\"",
     "5) Call finalize_plan(confirmed=true) ONLY after the user's latest message clearly confirms starting development (e.g. yes, start building / confermo / iniziamo lo sviluppo). An analysis request is NOT confirmation.",
@@ -153,9 +165,9 @@ export function buildSystemPrompt(state: SessionState): string {
   ];
 
   const buildRules = [
-    "PHASE: DEVELOPMENT",
-    "The plan is locked. Implement it phase by phase using tools (including write/git/commands).",
-    "After meaningful progress, call upsert_plan to mark checklist items done and update phase status.",
+    "PHASE: DEVELOPMENT — now you may mark checklist progress.",
+    "The plan structure was agreed in planning. Implement it phase by phase using tools (including write/git/commands).",
+    "After meaningful progress, call upsert_plan to mark checklist items done=true and update phase status.",
     "Keep the plan truthful: only mark items done when the work is actually done.",
     "When all phases are completed, say so clearly.",
     formatPlanForPrompt(state),
@@ -249,10 +261,15 @@ export function applyUpsertPlan(
     };
   }
 
+  const planning = productPhaseForState(state) === "planning";
+
   const phases: PlanPhase[] = rawPhases.map((raw, index) => {
     const p = (raw ?? {}) as Record<string, unknown>;
     const checklistRaw = Array.isArray(p.checklist) ? p.checklist : [];
-    const status = normalizePhaseStatus(p.status, index === 0);
+    // Planning: structure only — no execution progress.
+    const status = planning
+      ? "pending"
+      : normalizePhaseStatus(p.status, index === 0);
     return {
       id: typeof p.id === "string" && p.id ? p.id : randomUUID(),
       title:
@@ -268,7 +285,7 @@ export function applyUpsertPlan(
             typeof c.text === "string" && c.text.trim()
               ? c.text.trim()
               : `Item ${itemIndex + 1}`,
-          done: Boolean(c.done),
+          done: planning ? false : Boolean(c.done),
         };
       }),
     };

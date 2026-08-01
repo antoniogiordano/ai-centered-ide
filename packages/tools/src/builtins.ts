@@ -72,7 +72,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "upsert_plan",
     description:
-      "Create or replace the delivery plan and open clarifying questions. During planning: draft phases + questions for a Q&A. During building: update checklist progress. Always pass the full phases array.",
+      "Create or replace the delivery plan. Planning: CRUD phases + checklist texts + clarifying questions (no done/progress). Building: mark checklist done and phase status. Always pass the full phases array.",
     riskLevel: "safe",
     phases: PLANNING_AND_BUILDING,
     argsSchema: z.object({
@@ -84,7 +84,8 @@ export function registerStarterTools(registry: ToolRegistry): void {
       properties: {
         phases: {
           type: "array",
-          description: "Ordered delivery phases.",
+          description:
+            "Ordered delivery phases. In planning only title+checklist text matter (done/status ignored). In building, set done and status for progress.",
           items: {
             type: "object",
             properties: {
@@ -99,6 +100,8 @@ export function registerStarterTools(registry: ToolRegistry): void {
                   "skipped",
                   "failed",
                 ],
+                description:
+                  "Building only. Ignored while planning (forced pending).",
               },
               checklist: {
                 type: "array",
@@ -107,7 +110,11 @@ export function registerStarterTools(registry: ToolRegistry): void {
                   properties: {
                     id: { type: "string" },
                     text: { type: "string" },
-                    done: { type: "boolean" },
+                    done: {
+                      type: "boolean",
+                      description:
+                        "Building only. Ignored while planning (forced false).",
+                    },
                   },
                   required: ["text"],
                 },
