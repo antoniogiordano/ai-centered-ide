@@ -189,18 +189,29 @@ function LiveToolRow(props: {
   );
 }
 
+function modEnterHint(): string {
+  const isApple =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  return isApple ? "⌘↵" : "Ctrl+Enter";
+}
+
 function PlanBoard(props: {
   state: SessionState | null;
   onOpenQa?: (() => void) | undefined;
+  onConfirmPlan?: (() => void) | undefined;
   planning?: boolean;
 }) {
   const phases = props.state?.planPhases ?? [];
   const questions = props.state?.planQuestions ?? [];
   const planStatus = props.state?.planStatus ?? "drafting";
   const mode = props.state?.mode ?? "plan";
+  const proposal = props.state?.planReadyProposal ?? null;
   const planning =
     props.planning ??
     (mode === "plan" || planStatus === "drafting");
+  const showReadyCta =
+    planning && Boolean(proposal) && typeof props.onConfirmPlan === "function";
 
   if (phases.length === 0) {
     return (
@@ -223,124 +234,151 @@ function PlanBoard(props: {
   const openQuestions = questions.filter((q) => q.status === "open");
 
   return (
-    <div className={`plan-board ${planning ? "plan-board-drafting" : ""}`}>
-      <div className="plan-board-header">
-        <div>
-          <strong>{planning ? "Draft plan" : "Executing"}</strong>
-          <p className="verify-hint">
-            {planning
-              ? `${phases.length} phase${phases.length === 1 ? "" : "s"} · ${totalCount} checklist item${totalCount === 1 ? "" : "s"}`
-              : `${doneCount}/${totalCount} checklist · ${phases.length} phase${phases.length === 1 ? "" : "s"}`}
-            {questions.length
-              ? ` · ${openQuestions.length} open question${openQuestions.length === 1 ? "" : "s"}`
-              : ""}
-          </p>
+    <div
+      className={`plan-board ${planning ? "plan-board-drafting" : ""} ${showReadyCta ? "plan-board-ready" : ""}`}
+    >
+      <div className="plan-board-scroll">
+        <div className="plan-board-header">
+          <div>
+            <strong>{planning ? "Draft plan" : "Executing"}</strong>
+            <p className="verify-hint">
+              {planning
+                ? `${phases.length} phase${phases.length === 1 ? "" : "s"} · ${totalCount} checklist item${totalCount === 1 ? "" : "s"}`
+                : `${doneCount}/${totalCount} checklist · ${phases.length} phase${phases.length === 1 ? "" : "s"}`}
+              {questions.length
+                ? ` · ${openQuestions.length} open question${openQuestions.length === 1 ? "" : "s"}`
+                : ""}
+            </p>
+          </div>
+          {openQuestions.length > 0 && props.onOpenQa ? (
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={props.onOpenQa}
+            >
+              Answer Q&A
+            </button>
+          ) : null}
         </div>
-        {openQuestions.length > 0 && props.onOpenQa ? (
-          <button
-            type="button"
-            className="btn btn-secondary btn-sm"
-            onClick={props.onOpenQa}
-          >
-            Answer Q&A
-          </button>
-        ) : null}
-      </div>
 
-      {questions.length > 0 ? (
-        <div className="plan-questions">
-          <div className="plan-questions-title">Clarifying questions</div>
-          <ul className="plan-questions-list">
-            {questions.map((q, index) => (
-              <li
-                key={q.id}
-                className={`plan-question plan-question-${q.status}`}
-              >
-                <span className="plan-question-index">Q{index + 1}</span>
-                <div className="plan-question-body">
-                  <div className="plan-question-text">
-                    {q.text}
-                    <span
-                      className={`plan-question-kind plan-question-kind-${q.selection ?? "single"}`}
-                    >
-                      {(q.selection ?? "single") === "multiple"
-                        ? "Multi"
-                        : "Single"}
-                    </span>
-                  </div>
-                  {(q.options ?? []).length > 0 ? (
-                    <div className="plan-question-options">
-                      {(q.options ?? []).map((opt, optIndex) => {
-                        const key =
-                          (q.selection ?? "single") === "multiple"
-                            ? String(optIndex + 1)
-                            : String.fromCharCode(65 + optIndex);
-                        const picked = q.selectedOptionIds?.includes(opt.id);
-                        return (
-                          <span
-                            key={opt.id}
-                            className={`plan-question-option ${picked ? "is-picked" : ""}`}
-                          >
-                            <span className="plan-question-option-key">{key}</span>
-                            {opt.label}
-                          </span>
-                        );
-                      })}
-                    </div>
-                  ) : null}
-                  {q.answer ? (
-                    <div className="plan-question-answer">{q.answer}</div>
-                  ) : (
-                    <div className="plan-question-answer muted">
-                      Waiting for answer in Q&A dialog…
-                    </div>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
-      <ol className="plan-phase-list">
-        {phases.map((phase, index) => (
-          <li
-            key={phase.id}
-            className={`plan-phase ${planning ? "plan-phase-draft" : `plan-phase-${phase.status}`}`}
-            aria-current={
-              !planning && phase.status === "in_progress" ? "step" : undefined
-            }
-          >
-            <div className="plan-phase-header">
-              <span className="plan-phase-index">{index + 1}</span>
-              <span className="plan-phase-title">{phase.title}</span>
-              {!planning ? (
-                <span className="plan-phase-status">
-                  {PHASE_STATUS_LABEL[phase.status]}
-                </span>
-              ) : null}
-            </div>
-            <ul className="plan-checklist">
-              {phase.checklist.map((item) => (
+        {questions.length > 0 ? (
+          <div className="plan-questions">
+            <div className="plan-questions-title">Clarifying questions</div>
+            <ul className="plan-questions-list">
+              {questions.map((q, index) => (
                 <li
-                  key={item.id}
-                  className={`plan-check ${
-                    !planning && item.done ? "plan-check-done" : ""
-                  }`}
+                  key={q.id}
+                  className={`plan-question plan-question-${q.status}`}
                 >
-                  <span className="plan-check-mark" aria-hidden>
-                    {planning ? "·" : item.done ? "✓" : "○"}
-                  </span>
-                  <span>{item.text}</span>
+                  <span className="plan-question-index">Q{index + 1}</span>
+                  <div className="plan-question-body">
+                    <div className="plan-question-text">
+                      {q.text}
+                      <span
+                        className={`plan-question-kind plan-question-kind-${q.selection ?? "single"}`}
+                      >
+                        {(q.selection ?? "single") === "multiple"
+                          ? "Multi"
+                          : "Single"}
+                      </span>
+                    </div>
+                    {(q.options ?? []).length > 0 ? (
+                      <div className="plan-question-options">
+                        {(q.options ?? []).map((opt, optIndex) => {
+                          const key =
+                            (q.selection ?? "single") === "multiple"
+                              ? String(optIndex + 1)
+                              : String.fromCharCode(65 + optIndex);
+                          const picked = q.selectedOptionIds?.includes(opt.id);
+                          return (
+                            <span
+                              key={opt.id}
+                              className={`plan-question-option ${picked ? "is-picked" : ""}`}
+                            >
+                              <span className="plan-question-option-key">
+                                {key}
+                              </span>
+                              {opt.label}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                    {q.answer ? (
+                      <div className="plan-question-answer">{q.answer}</div>
+                    ) : (
+                      <div className="plan-question-answer muted">
+                        Waiting for answer in Q&A dialog…
+                      </div>
+                    )}
+                  </div>
                 </li>
               ))}
-              {phase.checklist.length === 0 ? (
-                <li className="plan-check muted">No checklist items yet</li>
-              ) : null}
             </ul>
-          </li>
-        ))}
-      </ol>
+          </div>
+        ) : null}
+
+        <ol className="plan-phase-list">
+          {phases.map((phase, index) => (
+            <li
+              key={phase.id}
+              className={`plan-phase ${planning ? "plan-phase-draft" : `plan-phase-${phase.status}`}`}
+              aria-current={
+                !planning && phase.status === "in_progress" ? "step" : undefined
+              }
+            >
+              <div className="plan-phase-header">
+                <span className="plan-phase-index">{index + 1}</span>
+                <span className="plan-phase-title">{phase.title}</span>
+                {!planning ? (
+                  <span className="plan-phase-status">
+                    {PHASE_STATUS_LABEL[phase.status]}
+                  </span>
+                ) : null}
+              </div>
+              <ul className="plan-checklist">
+                {phase.checklist.map((item) => (
+                  <li
+                    key={item.id}
+                    className={`plan-check ${
+                      !planning && item.done ? "plan-check-done" : ""
+                    }`}
+                  >
+                    <span className="plan-check-mark" aria-hidden>
+                      {planning ? "·" : item.done ? "✓" : "○"}
+                    </span>
+                    <span>{item.text}</span>
+                  </li>
+                ))}
+                {phase.checklist.length === 0 ? (
+                  <li className="plan-check muted">No checklist items yet</li>
+                ) : null}
+              </ul>
+            </li>
+          ))}
+        </ol>
+      </div>
+
+      {showReadyCta && proposal ? (
+        <div className="plan-board-cta">
+          <div className="plan-board-cta-copy">
+            <strong>Plan ready</strong>
+            <span className="muted">
+              {proposal.summary?.trim()
+                ? proposal.summary
+                : `Suggested branch ${proposal.suggestedBranch}`}
+            </span>
+          </div>
+          <button
+            type="button"
+            className="btn btn-primary plan-board-cta-btn"
+            onClick={props.onConfirmPlan}
+            title={`Confirm plan (${modEnterHint()})`}
+          >
+            Start building · {modEnterHint()}
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -636,9 +674,10 @@ function VerifyTabPanel(props: {
   tab: VerifyTab;
   state: SessionState | null;
   onOpenQa?: (() => void) | undefined;
+  onConfirmPlan?: (() => void) | undefined;
   planning?: boolean;
 }) {
-  const { tab, state, onOpenQa, planning } = props;
+  const { tab, state, onOpenQa, onConfirmPlan, planning } = props;
   const turns = state?.turns ?? [];
 
   const fileChanges = useMemo(() => extractFileChanges(turns), [turns]);
@@ -650,6 +689,7 @@ function VerifyTabPanel(props: {
         <PlanBoard
           state={state}
           onOpenQa={onOpenQa}
+          onConfirmPlan={onConfirmPlan}
           planning={Boolean(planning)}
         />
       );
@@ -757,14 +797,27 @@ export function VerifyPane(props: {
   activeTab: VerifyTab;
   onTabChange: (tab: VerifyTab) => void;
   onOpenQa?: (() => void) | undefined;
+  onConfirmPlan?: (() => void) | undefined;
   planning?: boolean;
 }) {
-  const { state, activeTab, onTabChange, onOpenQa, planning = false } = props;
+  const {
+    state,
+    activeTab,
+    onTabChange,
+    onOpenQa,
+    onConfirmPlan,
+    planning = false,
+  } = props;
 
   if (planning) {
     return (
       <div className="pane-body plan-side-pane" role="region" aria-label="Plan">
-        <PlanBoard state={state} onOpenQa={onOpenQa} planning />
+        <PlanBoard
+          state={state}
+          onOpenQa={onOpenQa}
+          onConfirmPlan={onConfirmPlan}
+          planning
+        />
       </div>
     );
   }

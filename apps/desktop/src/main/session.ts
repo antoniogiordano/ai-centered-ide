@@ -12,6 +12,8 @@ import type { ProjectStorage } from "@ai-ide/storage";
 import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
 import {
   applyPlanAnswers,
+  applyStartBuilding,
+  normalizeFeatBranchName,
   normalizePlanQuestions,
   runAgentTurn,
   tryParsePartialJson,
@@ -126,6 +128,7 @@ export class SessionManager {
         planPhases: [],
         planStatus: "drafting",
         planQuestions: [],
+        planReadyProposal: null,
         approvalGrants: [],
         createdAt: now,
         updatedAt: now,
@@ -147,6 +150,7 @@ export class SessionManager {
     planPhases: SessionState["planPhases"];
     planStatus: SessionState["planStatus"];
     planQuestions: SessionState["planQuestions"];
+    planReadyProposal: SessionState["planReadyProposal"];
     approvalGrants: SessionState["approvalGrants"];
     createdAt: string;
   }): { state: SessionState; createdAt: string } {
@@ -160,6 +164,7 @@ export class SessionManager {
       planPhases: row.planPhases,
       planStatus: row.planStatus,
       planQuestions: normalizePlanQuestions(row.planQuestions),
+      planReadyProposal: row.planReadyProposal ?? null,
       approvalGrants: row.approvalGrants,
       turns,
       status: "idle",
@@ -225,6 +230,7 @@ export class SessionManager {
       planPhases: this.state.planPhases,
       planStatus: this.state.planStatus,
       planQuestions: this.state.planQuestions,
+      planReadyProposal: this.state.planReadyProposal,
       approvalGrants: this.state.approvalGrants,
       createdAt: this.createdAt,
       updatedAt: now,
@@ -470,6 +476,124 @@ export class SessionManager {
     this.state = { ...this.state, mode };
     this.persist();
     this.push();
+  }
+
+  /**
+   * User confirmed the draft plan in the UI. Optionally create/checkout a feat/* branch,
+   * then switch this chat to Build mode.
+   */
+  async confirmPlan(input: {
+    createBranch: boolean;
+    branchName?: string;
+  }): Promise<{
+    ok: boolean;
+    state?: SessionState;
+    branch?: string | null;
+    error?: { code: "VALIDATION_ERROR"; userMessage: string; technicalDetail: string };
+  }> {
+    if (isBusy(this.state.status)) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Wait for the current turn to finish before starting build.",
+          technicalDetail: `status=${this.state.status}`,
+        },
+      };
+    }
+
+    let createdBranch: string | null = null;
+    if (input.createBranch) {
+      const normalized = normalizeFeatBranchName(input.branchName ?? "");
+      if (!normalized) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: "Enter a valid feat/kebab-case branch name.",
+            technicalDetail: "empty or invalid branch",
+          },
+        };
+      }
+      const root = this.state.workspace?.resolvedRootPath;
+      if (!root) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: "Open a workspace before creating a branch.",
+            technicalDetail: "no workspace",
+          },
+        };
+      }
+      const git = new GitService(root);
+      const info = await git.branchInfo();
+      if (!info.isRepo) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: "Workspace is not a git repository.",
+            technicalDetail: root,
+          },
+        };
+      }
+      if (await git.branchNameTaken(normalized)) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: `Branch "${normalized}" already exists. Choose another name.`,
+            technicalDetail: "branch collision",
+          },
+        };
+      }
+      try {
+        await git.createAndCheckoutBranch(normalized);
+        createdBranch = normalized;
+      } catch (error) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: "Could not create the branch.",
+            technicalDetail:
+              error instanceof Error ? error.message : String(error),
+          },
+        };
+      }
+    }
+
+    const started = applyStartBuilding(this.state);
+    if (started.error) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: started.error,
+          technicalDetail: started.error,
+        },
+      };
+    }
+
+    const notice = {
+      id: randomUUID(),
+      role: "assistant" as const,
+      content: createdBranch
+        ? `Plan confirmed. Switched to **Build** on \`${createdBranch}\`.`
+        : "Plan confirmed. Switched to **Build** (current branch).",
+      createdAt: new Date().toISOString(),
+    };
+
+    this.state = {
+      ...started.state,
+      turns: [...started.state.turns, notice],
+      status: "idle",
+      error: null,
+    };
+    this.persist();
+    this.push(true);
+    return { ok: true, state: this.state, branch: createdBranch };
   }
 
   openWorkspace(rootPath: string): WorkspaceRef {

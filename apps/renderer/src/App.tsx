@@ -11,6 +11,7 @@ import {
   PlanQaDialog,
   type PlanQaAnswer,
 } from "./components/PlanQaDialog";
+import { StartBuildDialog } from "./components/StartBuildDialog";
 
 const ONBOARDING_KEY = "ai-ide-onboarding-complete";
 
@@ -48,6 +49,7 @@ export function App() {
   const [qaOpen, setQaOpen] = useState(false);
   const [qaFocusRequestId, setQaFocusRequestId] = useState(0);
   const [qaDismissedKey, setQaDismissedKey] = useState<string | null>(null);
+  const [startBuildOpen, setStartBuildOpen] = useState(false);
   const [gitStatus, setGitStatus] = useState<{
     isRepo: boolean;
     localBranch: string | null;
@@ -85,7 +87,35 @@ export function App() {
   useEffect(() => {
     setQaDismissedKey(null);
     setQaOpen(false);
+    setStartBuildOpen(false);
   }, [activeSessionId]);
+
+  const planReady = Boolean(state?.planReadyProposal);
+  const openStartBuild = useCallback(() => {
+    if (!state?.planReadyProposal) return;
+    setStartBuildOpen(true);
+  }, [state?.planReadyProposal]);
+
+  useEffect(() => {
+    if (!planning || !planReady || startBuildOpen || qaOpen || providerOpen) {
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key !== "Enter") return;
+      e.preventDefault();
+      e.stopPropagation();
+      openStartBuild();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [
+    planning,
+    planReady,
+    startBuildOpen,
+    qaOpen,
+    providerOpen,
+    openStartBuild,
+  ]);
 
   useEffect(() => {
     if (!qaEligible) {
@@ -358,6 +388,7 @@ export function App() {
               setQaDismissedKey(null);
               setQaOpen(true);
             }}
+            onConfirmPlan={openStartBuild}
           />
         </section>
       </main>
@@ -377,7 +408,7 @@ export function App() {
       />
 
       <PlanQaDialog
-        open={qaOpen && qaEligible && !providerOpen}
+        open={qaOpen && qaEligible && !providerOpen && !startBuildOpen}
         questions={openPlanQuestions}
         focusRequestId={qaFocusRequestId}
         onClose={() => {
@@ -385,6 +416,21 @@ export function App() {
           setQaDismissedKey(openQuestionKey);
         }}
         onSubmit={submitPlanAnswers}
+      />
+
+      <StartBuildDialog
+        open={startBuildOpen && planReady && !providerOpen}
+        suggestedBranch={
+          state?.planReadyProposal?.suggestedBranch ?? "feat/plan"
+        }
+        summary={state?.planReadyProposal?.summary}
+        onClose={() => setStartBuildOpen(false)}
+        onConfirmed={() => {
+          setStartBuildOpen(false);
+          void getBridge()?.workspace.gitStatus().then((info) => {
+            if (info) setGitStatus(info);
+          });
+        }}
       />
 
       <OnboardingWizard

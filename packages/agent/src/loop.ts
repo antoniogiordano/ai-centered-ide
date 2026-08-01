@@ -13,6 +13,7 @@ import {
 } from "@ai-ide/tools";
 import {
   applyFinalizePlan,
+  applyProposePlanReady,
   applyUpsertPlan,
   buildContext,
   bumpSessionSequence,
@@ -47,7 +48,11 @@ export type AgentProgressEvent =
       type: "session_patch";
       patch: Pick<
         SessionState,
-        "planPhases" | "planQuestions" | "planStatus" | "mode"
+        | "planPhases"
+        | "planQuestions"
+        | "planStatus"
+        | "mode"
+        | "planReadyProposal"
       >;
       /** Live draft while tool args stream — do not persist. */
       provisional?: boolean;
@@ -196,6 +201,7 @@ export async function runAgentTurn(
                         planQuestions: draft.state.planQuestions,
                         planStatus: draft.state.planStatus,
                         mode: draft.state.mode,
+                        planReadyProposal: draft.state.planReadyProposal,
                       },
                     });
                   }
@@ -262,9 +268,11 @@ export async function runAgentTurn(
 
       if (isPlanMutationTool(call.name)) {
         const applied =
-          call.name === "finalize_plan"
-            ? applyFinalizePlan(workingState, call.arguments, { userMessage })
-            : applyUpsertPlan(workingState, call.arguments);
+          call.name === "propose_plan_ready"
+            ? applyProposePlanReady(workingState, call.arguments)
+            : call.name === "finalize_plan"
+              ? applyFinalizePlan(workingState, call.arguments, { userMessage })
+              : applyUpsertPlan(workingState, call.arguments);
 
         // Keep the model-facing call id aligned with the tool message.
         const result: ToolResult = { ...applied.result, callId: call.id };
@@ -277,6 +285,7 @@ export async function runAgentTurn(
             planQuestions: workingState.planQuestions,
             planStatus: workingState.planStatus,
             mode: workingState.mode,
+            planReadyProposal: workingState.planReadyProposal,
           },
         });
         emit({
@@ -448,6 +457,8 @@ function toolActivityLabel(call: ToolCall): string {
       return "Running command…";
     case "upsert_plan":
       return "Updating plan…";
+    case "propose_plan_ready":
+      return "Marking plan ready…";
     case "finalize_plan":
       return "Finalizing plan…";
     default:

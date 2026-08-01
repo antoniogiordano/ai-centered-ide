@@ -9,11 +9,12 @@ import {
   GitService,
 } from "@ai-ide/workspace";
 import {
-  applyFinalizePlan,
+  applyProposePlanReady,
+  applyStartBuilding,
   applyUpsertPlan,
-  looksLikeBuildConfirmation,
   mergePlanQuestionFromAgent,
   newSession,
+  normalizeFeatBranchName,
   runAgentTurn,
   tryParsePartialJson,
   TurnStateMachine,
@@ -137,9 +138,12 @@ describe("agent runtime", () => {
         if (round === 2) {
           yield {
             type: "tool_call" as const,
-            id: "call_fin",
-            name: "finalize_plan",
-            argumentsDelta: JSON.stringify({ confirmed: true }),
+            id: "call_ready",
+            name: "propose_plan_ready",
+            argumentsDelta: JSON.stringify({
+              suggestedBranch: "feat/foundation",
+              summary: "Ready for confirmation",
+            }),
             index: 0,
           };
           yield { type: "done" as const, finishReason: "tool_calls" };
@@ -147,7 +151,7 @@ describe("agent runtime", () => {
         }
         yield {
           type: "content" as const,
-          delta: "Plan locked. Ready to build.",
+          delta: "Plan is ready — confirm in the IDE to start building.",
         };
         yield { type: "done" as const, finishReason: "stop" };
       },
@@ -155,7 +159,7 @@ describe("agent runtime", () => {
 
     const session = newSession("s-plan", "plan");
     const patches: string[] = [];
-    const result = await runAgentTurn(session, "start building", {
+    const result = await runAgentTurn(session, "please draft a plan", {
       provider,
       onProgress: (e) => {
         if (e.type === "session_patch") patches.push(e.patch.planStatus);
@@ -164,10 +168,13 @@ describe("agent runtime", () => {
 
     expect(result.state.planPhases).toHaveLength(1);
     expect(result.state.planPhases[0]?.title).toBe("Foundation");
-    expect(result.state.mode).toBe("agent");
-    expect(result.state.planStatus).toBe("executing");
+    expect(result.state.mode).toBe("plan");
+    expect(result.state.planStatus).toBe("finalized");
+    expect(result.state.planReadyProposal?.suggestedBranch).toBe(
+      "feat/foundation",
+    );
     expect(patches).toContain("drafting");
-    expect(patches).toContain("executing");
+    expect(patches).toContain("finalized");
   });
 
   it("ignores checklist done flags while planning", () => {
@@ -321,7 +328,7 @@ describe("agent runtime", () => {
     expect(result.state.planQuestions[0]?.answer).toBeUndefined();
   });
 
-  it("blocks finalize without clear user confirmation", () => {
+  it("propose_plan_ready then applyStartBuilding switches to build", () => {
     const session = {
       ...newSession("s-fin", "plan"),
       planPhases: [
@@ -334,13 +341,20 @@ describe("agent runtime", () => {
       ],
       planQuestions: [],
     };
-    const blocked = applyFinalizePlan(
-      session,
-      { confirmed: true },
-      { userMessage: "vorrei un'analisi completa del progetto" },
+    const proposed = applyProposePlanReady(session, {
+      suggestedBranch: "User Auth Flow",
+    });
+    expect(proposed.result.success).toBe(true);
+    expect(proposed.state.planReadyProposal?.suggestedBranch).toBe(
+      "feat/user-auth-flow",
     );
-    expect(blocked.result.success).toBe(false);
-    expect(looksLikeBuildConfirmation("start building")).toBe(true);
+    expect(normalizeFeatBranchName("feat/ok")).toBe("feat/ok");
+
+    const started = applyStartBuilding(proposed.state);
+    expect(started.error).toBeUndefined();
+    expect(started.state.mode).toBe("agent");
+    expect(started.state.planStatus).toBe("executing");
+    expect(started.state.planReadyProposal).toBeNull();
   });
 
   it("stops after max iterations", () => {

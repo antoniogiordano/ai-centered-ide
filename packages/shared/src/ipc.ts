@@ -23,6 +23,8 @@ export const IPC_CHANNELS = {
   WORKSPACE_OPEN: "workspace:open",
   WORKSPACE_LIST_RECENT: "workspace:list-recent",
   WORKSPACE_GIT_STATUS: "workspace:git-status",
+  WORKSPACE_LIST_BRANCHES: "workspace:list-branches",
+  SESSION_CONFIRM_PLAN: "session:confirm-plan",
   PROVIDER_VERIFY: "provider:verify",
   PROVIDER_LIST_MODELS: "provider:list-models",
   PROVIDER_SAVE_CONFIG: "provider:save-config",
@@ -191,6 +193,38 @@ export type WorkspaceGitStatusResponse = z.infer<
   typeof WorkspaceGitStatusResponseSchema
 >;
 
+export const WorkspaceListBranchesRequestSchema = z.object({});
+export type WorkspaceListBranchesRequest = z.infer<
+  typeof WorkspaceListBranchesRequestSchema
+>;
+
+export const WorkspaceListBranchesResponseSchema = z.object({
+  isRepo: z.boolean(),
+  branches: z.array(z.string()),
+  current: z.string().nullable(),
+});
+export type WorkspaceListBranchesResponse = z.infer<
+  typeof WorkspaceListBranchesResponseSchema
+>;
+
+export const SessionConfirmPlanRequestSchema = z.object({
+  createBranch: z.boolean(),
+  branchName: z.string().min(1).max(80).optional(),
+});
+export type SessionConfirmPlanRequest = z.infer<
+  typeof SessionConfirmPlanRequestSchema
+>;
+
+export const SessionConfirmPlanResponseSchema = z.object({
+  ok: z.boolean(),
+  state: SessionStateSchema.optional(),
+  error: AppErrorPayloadSchema.optional(),
+  branch: z.string().nullable().optional(),
+});
+export type SessionConfirmPlanResponse = z.infer<
+  typeof SessionConfirmPlanResponseSchema
+>;
+
 export const ProviderVerifyRequestSchema = z.object({
   baseUrl: z.string().url(),
   /** Optional for local OpenAI-compatible servers (e.g. Ollama). */
@@ -268,6 +302,8 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.SESSION_CLOSE]: SessionCloseRequestSchema,
   [IPC_CHANNELS.WORKSPACE_OPEN]: WorkspaceOpenRequestSchema,
   [IPC_CHANNELS.WORKSPACE_GIT_STATUS]: WorkspaceGitStatusRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_LIST_BRANCHES]: WorkspaceListBranchesRequestSchema,
+  [IPC_CHANNELS.SESSION_CONFIRM_PLAN]: SessionConfirmPlanRequestSchema,
   [IPC_CHANNELS.PROVIDER_VERIFY]: ProviderVerifyRequestSchema,
   [IPC_CHANNELS.PROVIDER_LIST_MODELS]: ProviderListModelsRequestSchema,
   [IPC_CHANNELS.PROVIDER_SAVE_CONFIG]: ProviderSaveConfigRequestSchema,

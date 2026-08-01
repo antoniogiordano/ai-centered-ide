@@ -122,6 +122,57 @@ export class GitService {
     const result = await this.git.commit(message);
     return result.commit;
   }
+
+  /** Local branch short names (refs/heads). */
+  async listLocalBranches(): Promise<string[]> {
+    try {
+      const out = await this.git.raw([
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/heads",
+      ]);
+      return out
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Names that must not be reused for a new local branch:
+   * local heads + remote-tracking short names (origin/feat/x → feat/x).
+   */
+  async listTakenBranchNames(): Promise<string[]> {
+    const taken = new Set(await this.listLocalBranches());
+    try {
+      const remotes = await this.git.raw([
+        "for-each-ref",
+        "--format=%(refname:short)",
+        "refs/remotes",
+      ]);
+      for (const line of remotes.split("\n")) {
+        const ref = line.trim();
+        if (!ref) continue;
+        const slash = ref.indexOf("/");
+        if (slash < 0) continue;
+        taken.add(ref.slice(slash + 1));
+      }
+    } catch {
+      /* ignore */
+    }
+    return [...taken];
+  }
+
+  async branchNameTaken(name: string): Promise<boolean> {
+    const taken = await this.listTakenBranchNames();
+    return taken.includes(name);
+  }
+
+  async createAndCheckoutBranch(name: string): Promise<void> {
+    await this.git.checkoutLocalBranch(name);
+  }
 }
 
 export type CheckpointRecord = {

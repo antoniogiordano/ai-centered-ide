@@ -110,11 +110,16 @@ function formatPlanForPrompt(state: SessionState): string {
             return `${i + 1}. [${q.status}] [${kind}] ${q.text}${opts}${ans}`;
           }),
         ].join("\n");
+  const ready = state.planReadyProposal
+    ? `User confirmation pending for branch ${state.planReadyProposal.suggestedBranch}. Do not call propose_plan_ready again unless the plan changes.`
+    : null;
+
   return [
     `Plan status: ${state.planStatus}`,
     "Current plan:",
     ...lines,
     questions,
+    ...(ready ? [ready] : []),
   ].join("\n");
 }
 
@@ -140,12 +145,12 @@ export function buildSystemPrompt(state: SessionState): string {
 
   const planningRules = [
     "PHASE: PLANNING — the plan is being created (not executed).",
-    "Available tools: list_dir, read_file, search_text, upsert_plan, finalize_plan.",
+    "Available tools: list_dir, read_file, search_text, upsert_plan, propose_plan_ready.",
     "Unavailable: write_file, git_*, run_command, checkpoint_restore.",
     "",
     "Plan structure (CRUD only — no progress tracking yet):",
     "- Use upsert_plan to create/update/remove phases and checklist item texts.",
-    "- Do NOT mark checklist items done. Do NOT set phase status to completed/failed/skipped. Progress smarking starts only after development begins.",
+    "- Do NOT mark checklist items done. Do NOT set phase status to completed/failed/skipped. Progress marking starts only after development begins.",
     "- Checklist items are a draft outline of work, not a live todo board.",
     "",
     "Clarifying questions (critical — UI dialog; USER answers, never you):",
@@ -156,11 +161,11 @@ export function buildSystemPrompt(state: SessionState): string {
     "- Prefer 1–3 open questions per turn.",
     "",
     "Turn discipline (critical):",
-    "1) First broad request: lightly explore the repo, then upsert_plan with draft phases + checklist texts + open questions. Do NOT dump a full analysis essay. Do NOT call finalize_plan.",
+    "1) First broad request: lightly explore the repo, then upsert_plan with draft phases + checklist texts + open questions. Do NOT dump a full analysis essay.",
     "2) After user answers: reshape phases/checklist via upsert_plan; ask remaining questions if needed.",
     "3) Never implement, rewrite files, or pretend development has started.",
-    "4) Only when the plan is solid AND open questions are answered by the user, ask: \"Is this plan ready to start development?\"",
-    "5) Call finalize_plan(confirmed=true) ONLY after the user's latest message clearly confirms starting development (e.g. yes, start building / confermo / iniziamo lo sviluppo). An analysis request is NOT confirmation.",
+    "4) When the plan is solid AND all open questions are answered, call propose_plan_ready with a short suggestedBranch (feat/kebab-case, not too long) derived from the plan. The IDE will ask the user to confirm and optionally create that branch — do NOT start building yourself.",
+    "5) Do NOT call propose_plan_ready while questions remain open or the plan is still thin.",
     formatPlanForPrompt(state),
   ];
 
@@ -328,39 +333,27 @@ export function applyUpsertPlan(
   };
 }
 
-const BUILD_CONFIRM_RE =
-  /\b(start (building|development|dev)|ready to (build|start|develop)|go ahead( and build)?|proceed with (the )?plan|iniziamo( lo sviluppo)?|procedi( con lo sviluppo)?|confermo( il piano)?|passa allo sviluppo|inizia( lo sviluppo)?)\b/i;
+const FEAT_PREFIX = "feat/";
+const MAX_BRANCH_SLUG = 40;
 
-export function looksLikeBuildConfirmation(userMessage: string): boolean {
-  const text = userMessage.trim();
-  if (!text) return false;
-  if (BUILD_CONFIRM_RE.test(text)) return true;
-  // Short affirmative only after a plan exists is handled by caller context;
-  // bare "yes"/"ok"/"sì" count when the message is short.
-  return /^(yes|yep|yeah|ok|okay|sure|sì|si|confermo|vai|proceed)\.?$/i.test(
-    text,
-  );
+/** Normalize to `feat/<kebab>` (short). Returns null if empty after cleanup. */
+export function normalizeFeatBranchName(raw: string): string | null {
+  let slug = raw.trim().toLowerCase();
+  if (slug.startsWith(FEAT_PREFIX)) slug = slug.slice(FEAT_PREFIX.length);
+  slug = slug
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, MAX_BRANCH_SLUG)
+    .replace(/-+$/g, "");
+  if (!slug) return null;
+  return `${FEAT_PREFIX}${slug}`;
 }
 
-export function applyFinalizePlan(
+export function applyProposePlanReady(
   state: SessionState,
   args: Record<string, unknown>,
-  opts?: { userMessage?: string },
 ): { state: SessionState; result: ToolResult; callId: string } {
   const callId = randomUUID();
-  if (args.confirmed !== true) {
-    return {
-      callId,
-      state,
-      result: {
-        callId,
-        success: false,
-        summary:
-          "finalize_plan requires confirmed=true after the user explicitly agrees to start building.",
-        error: "Not confirmed",
-      },
-    };
-  }
   if (state.planPhases.length === 0) {
     return {
       callId,
@@ -368,7 +361,7 @@ export function applyFinalizePlan(
       result: {
         callId,
         success: false,
-        summary: "Cannot finalize an empty plan. Call upsert_plan first.",
+        summary: "Cannot propose readiness on an empty plan. Call upsert_plan first.",
         error: "Empty plan",
       },
     };
@@ -382,15 +375,17 @@ export function applyFinalizePlan(
       result: {
         callId,
         success: false,
-        summary: `Cannot finalize yet: ${openQuestions.length} open question(s) remain. Continue the Q&A and update upsert_plan.`,
+        summary: `Cannot propose readiness yet: ${openQuestions.length} open question(s) remain.`,
         error: "Open questions remain",
         output: { openQuestions },
       },
     };
   }
 
-  const userMessage = opts?.userMessage ?? "";
-  if (!looksLikeBuildConfirmation(userMessage)) {
+  const branchRaw =
+    typeof args.suggestedBranch === "string" ? args.suggestedBranch : "";
+  const suggestedBranch = normalizeFeatBranchName(branchRaw);
+  if (!suggestedBranch) {
     return {
       callId,
       state,
@@ -398,9 +393,63 @@ export function applyFinalizePlan(
         callId,
         success: false,
         summary:
-          "User has not clearly confirmed starting development. Ask: \"Is this plan ready to start development?\" and wait for an explicit yes.",
-        error: "No user confirmation",
+          "suggestedBranch is required (feat/kebab-case, e.g. feat/user-auth). Keep it short.",
+        error: "Invalid branch name",
       },
+    };
+  }
+
+  const summary =
+    typeof args.summary === "string" && args.summary.trim()
+      ? args.summary.trim().slice(0, 500)
+      : undefined;
+
+  const proposal = {
+    suggestedBranch,
+    ...(summary ? { summary } : {}),
+    proposedAt: new Date().toISOString(),
+  };
+
+  const next: SessionState = {
+    ...state,
+    planStatus: "finalized",
+    planReadyProposal: proposal,
+  };
+
+  return {
+    callId,
+    state: next,
+    result: {
+      callId,
+      success: true,
+      summary: `Plan marked ready for user confirmation. Suggested branch: ${suggestedBranch}. Wait — the user confirms in the IDE.`,
+      output: {
+        planReadyProposal: proposal,
+        planStatus: next.planStatus,
+        mode: next.mode,
+      },
+    },
+  };
+}
+
+/** IDE-only: user confirmed → Build mode. */
+export function applyStartBuilding(
+  state: SessionState,
+): { state: SessionState; error?: string } {
+  if (state.planPhases.length === 0) {
+    return { state, error: "Cannot start building with an empty plan." };
+  }
+  const openQuestions = state.planQuestions.filter((q) => q.status === "open");
+  if (openQuestions.length > 0) {
+    return {
+      state,
+      error: `Cannot start building: ${openQuestions.length} open question(s) remain.`,
+    };
+  }
+  if (!state.planReadyProposal) {
+    return {
+      state,
+      error: "Agent has not proposed plan readiness yet.",
     };
   }
 
@@ -414,25 +463,34 @@ export function applyFinalizePlan(
           : ("pending" as const),
   }));
 
-  const next: SessionState = {
-    ...state,
-    mode: "agent",
-    planStatus: "executing",
-    planPhases: phases,
+  return {
+    state: {
+      ...state,
+      mode: "agent",
+      planStatus: "executing",
+      planPhases: phases,
+      planReadyProposal: null,
+    },
   };
+}
 
+/** @deprecated Prefer propose_plan_ready + applyStartBuilding. */
+export function applyFinalizePlan(
+  state: SessionState,
+  args: Record<string, unknown>,
+  _opts?: { userMessage?: string },
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
   return {
     callId,
-    state: next,
+    state,
     result: {
       callId,
-      success: true,
-      summary: "Plan finalized. Switched to development mode.",
-      output: {
-        mode: next.mode,
-        planStatus: next.planStatus,
-        planPhases: phases,
-      },
+      success: false,
+      summary:
+        "finalize_plan is retired. Call propose_plan_ready so the user can confirm in the IDE.",
+      error: "Use propose_plan_ready",
+      output: { confirmed: args.confirmed },
     },
   };
 }
@@ -649,7 +707,11 @@ export function applyPlanAnswers(
 }
 
 export function isPlanMutationTool(name: string): boolean {
-  return name === "upsert_plan" || name === "finalize_plan";
+  return (
+    name === "upsert_plan" ||
+    name === "propose_plan_ready" ||
+    name === "finalize_plan"
+  );
 }
 
 export type PlanMutationPatch = {
@@ -657,6 +719,7 @@ export type PlanMutationPatch = {
   planQuestions: PlanQuestion[];
   planStatus: PlanStatus;
   mode: AgentMode;
+  planReadyProposal: SessionState["planReadyProposal"];
 };
 
 export function productPhaseForState(

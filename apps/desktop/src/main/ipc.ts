@@ -73,6 +73,14 @@ export function registerIpcHandlers(
     return { state: session.getState() };
   });
 
+  ipcMain.handle(IPC_CHANNELS.SESSION_CONFIRM_PLAN, async (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.SESSION_CONFIRM_PLAN, payload);
+    return session.confirmPlan({
+      createBranch: req.createBranch,
+      ...(req.branchName !== undefined ? { branchName: req.branchName } : {}),
+    });
+  });
+
   ipcMain.handle(IPC_CHANNELS.SESSION_SEND_MESSAGE, async (_event, payload) => {
     const req = safeValidate(IPC_CHANNELS.SESSION_SEND_MESSAGE, payload);
     const planAnswers = req.planAnswers?.map((a) => ({
@@ -142,6 +150,25 @@ export function registerIpcHandlers(
       console.warn("[workspace:git-status] not a repo (or git failed) at", root);
     }
     return info;
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_LIST_BRANCHES, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.WORKSPACE_LIST_BRANCHES, payload ?? {});
+    const root = session.getState().workspace?.resolvedRootPath;
+    if (!root) {
+      return { isRepo: false, branches: [], current: null };
+    }
+    const git = new GitService(root);
+    const info = await git.branchInfo();
+    if (!info.isRepo) {
+      return { isRepo: false, branches: [], current: null };
+    }
+    const branches = await git.listTakenBranchNames();
+    return {
+      isRepo: true,
+      branches,
+      current: info.localBranch,
+    };
   });
 
   ipcMain.handle(IPC_CHANNELS.PROVIDER_VERIFY, async (_event, payload) => {

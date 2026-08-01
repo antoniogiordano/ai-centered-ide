@@ -46,6 +46,14 @@ export type PlanPhase = z.infer<typeof PlanPhaseSchema>;
 export const PlanStatusSchema = z.enum(["drafting", "finalized", "executing"]);
 export type PlanStatus = z.infer<typeof PlanStatusSchema>;
 
+/** Agent proposes the plan is ready; user confirms in UI before Build mode. */
+export const PlanReadyProposalSchema = z.object({
+  suggestedBranch: z.string().min(1),
+  summary: z.string().max(500).optional(),
+  proposedAt: z.string().datetime(),
+});
+export type PlanReadyProposal = z.infer<typeof PlanReadyProposalSchema>;
+
 export const PlanQuestionOptionSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
@@ -111,6 +119,8 @@ export const SessionStateSchema = z.object({
   planPhases: z.array(PlanPhaseSchema).default([]),
   planStatus: PlanStatusSchema.default("drafting"),
   planQuestions: z.array(PlanQuestionSchema).default([]),
+  /** Set when the agent calls propose_plan_ready; cleared on start build. */
+  planReadyProposal: PlanReadyProposalSchema.nullable().default(null),
   pendingApprovals: z.array(
     z.object({
       id: z.string().min(1),
@@ -229,6 +239,7 @@ export function createEmptySessionState(sessionId: string): SessionState {
     planPhases: [],
     planStatus: "drafting",
     planQuestions: [],
+    planReadyProposal: null,
     pendingApprovals: [],
     approvalGrants: [],
     activeToolCallId: null,

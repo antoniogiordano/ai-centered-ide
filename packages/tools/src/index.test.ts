@@ -73,7 +73,7 @@ describe("phase tool gating", () => {
         "read_file",
         "search_text",
         "upsert_plan",
-        "finalize_plan",
+        "propose_plan_ready",
       ]),
     );
     expect(names).not.toContain("write_file");
@@ -92,6 +92,6 @@ describe("phase tool gating", () => {
         "upsert_plan",
       ]),
     );
-    expect(names).not.toContain("finalize_plan");
+    expect(names).not.toContain("propose_plan_ready");
   });
 });

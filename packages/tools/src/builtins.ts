@@ -170,27 +170,33 @@ export function registerStarterTools(registry: ToolRegistry): void {
   });
 
   registry.register({
-    name: "finalize_plan",
+    name: "propose_plan_ready",
     description:
-      "Lock the plan and switch to development. ONLY after the user explicitly confirmed they want to start building (not after an analysis request). All open questions must be answered first.",
+      "Signal that the draft plan is ready for the user to confirm. Pass a short feat/kebab-case suggestedBranch derived from the plan. Does NOT start development — the IDE asks the user and may create the branch. All open questions must already be answered.",
     riskLevel: "safe",
     phases: PLANNING_ONLY,
     argsSchema: z.object({
-      confirmed: z.boolean(),
+      suggestedBranch: z.string().min(1).max(80),
+      summary: z.string().max(500).optional(),
     }) as z.ZodType<Record<string, unknown>>,
     parameters: {
       type: "object",
       properties: {
-        confirmed: {
-          type: "boolean",
-          description: "Must be true after explicit user confirmation to start building.",
+        suggestedBranch: {
+          type: "string",
+          description:
+            "Short git branch suggestion, e.g. feat/user-auth or user-auth (feat/ is added). kebab-case, not too long.",
+        },
+        summary: {
+          type: "string",
+          description: "Optional one-line note shown near the confirm CTA.",
         },
       },
-      required: ["confirmed"],
+      required: ["suggestedBranch"],
       additionalProperties: false,
     },
     execute: async () => ({
-      summary: "Plan finalization is handled by the agent runtime.",
+      summary: "Plan readiness is handled by the agent runtime.",
     }),
   });
 }

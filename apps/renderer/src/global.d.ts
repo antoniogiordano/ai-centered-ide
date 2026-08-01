@@ -4,6 +4,7 @@ import type {
   ProviderSaveConfigResponse,
   ProviderVerifyResponse,
   SessionCloseResponse,
+  SessionConfirmPlanResponse,
   SessionCreateResponse,
   SessionGetResponse,
   SessionListResponse,
@@ -12,6 +13,7 @@ import type {
   SessionSwitchResponse,
   SessionUpdateEvent,
   WorkspaceGitStatusResponse,
+  WorkspaceListBranchesResponse,
   WorkspaceListRecentResponse,
   WorkspaceOpenResponse,
 } from "@ai-ide/shared";
@@ -35,6 +37,10 @@ export type DesktopBridge = {
       },
     ) => Promise<SessionSendMessageResponse>;
     setMode: (mode: string) => Promise<SessionSetModeResponse>;
+    confirmPlan: (input: {
+      createBranch: boolean;
+      branchName?: string;
+    }) => Promise<SessionConfirmPlanResponse>;
     approve: (approvalId: string, grantCategory?: boolean) => Promise<void>;
     reject: (approvalId: string, reason?: string) => Promise<void>;
     cancel?: () => Promise<void>;
@@ -44,6 +50,7 @@ export type DesktopBridge = {
     open: (path?: string) => Promise<WorkspaceOpenResponse>;
     listRecent: () => Promise<WorkspaceListRecentResponse>;
     gitStatus: () => Promise<WorkspaceGitStatusResponse>;
+    listBranches: () => Promise<WorkspaceListBranchesResponse>;
   };
   provider: {
     getConfig: () => Promise<ProviderGetConfigResponse>;

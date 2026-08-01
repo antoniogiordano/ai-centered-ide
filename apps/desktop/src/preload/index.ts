@@ -10,10 +10,12 @@ import {
   type SessionGetResponse,
   type SessionListResponse,
   type SessionSendMessageResponse,
+  type SessionConfirmPlanResponse,
   type SessionSetModeResponse,
   type SessionSwitchResponse,
   type SessionUpdateEvent,
   type WorkspaceGitStatusResponse,
+  type WorkspaceListBranchesResponse,
   type WorkspaceListRecentResponse,
   type WorkspaceOpenResponse,
 } from "@ai-ide/shared";
@@ -37,6 +39,10 @@ export type DesktopBridge = {
       },
     ) => Promise<SessionSendMessageResponse>;
     setMode: (mode: string) => Promise<SessionSetModeResponse>;
+    confirmPlan: (input: {
+      createBranch: boolean;
+      branchName?: string;
+    }) => Promise<SessionConfirmPlanResponse>;
     approve: (approvalId: string, grantCategory?: boolean) => Promise<void>;
     reject: (approvalId: string, reason?: string) => Promise<void>;
     cancel: () => Promise<void>;
@@ -46,6 +52,7 @@ export type DesktopBridge = {
     open: (path?: string) => Promise<WorkspaceOpenResponse>;
     listRecent: () => Promise<WorkspaceListRecentResponse>;
     gitStatus: () => Promise<WorkspaceGitStatusResponse>;
+    listBranches: () => Promise<WorkspaceListBranchesResponse>;
   };
   provider: {
     getConfig: () => Promise<ProviderGetConfigResponse>;
@@ -110,6 +117,8 @@ const bridge: DesktopBridge = {
       }),
     setMode: (mode) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_SET_MODE, { mode }),
+    confirmPlan: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_CONFIRM_PLAN, input),
     approve: (approvalId, grantCategory = false) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_APPROVE, {
         approvalId,
@@ -127,6 +136,8 @@ const bridge: DesktopBridge = {
     listRecent: () => ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_RECENT),
     gitStatus: () =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_STATUS, {}),
+    listBranches: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_BRANCHES, {}),
   },
   provider: {
     getConfig: () =>

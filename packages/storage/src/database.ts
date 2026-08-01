@@ -7,6 +7,7 @@ import type {
   ApprovalGrant,
   PlanPhase,
   PlanQuestion,
+  PlanReadyProposal,
   PlanStatus,
   PlanStep,
   Turn,
@@ -216,6 +217,7 @@ export class ProjectStorage {
     planPhases: PlanPhase[];
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
+    planReadyProposal: PlanReadyProposal | null;
     approvalGrants: ApprovalGrant[];
     createdAt: string;
     updatedAt: string;
@@ -246,6 +248,7 @@ export class ProjectStorage {
           planPhases: row.planPhases,
           planStatus: row.planStatus,
           planQuestions: row.planQuestions,
+          planReadyProposal: row.planReadyProposal,
           approvalGrants: row.approvalGrants,
         }),
       );
@@ -261,6 +264,7 @@ export class ProjectStorage {
     planPhases: PlanPhase[];
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
+    planReadyProposal: PlanReadyProposal | null;
     approvalGrants: ApprovalGrant[];
     createdAt: string;
     updatedAt: string;
@@ -293,6 +297,7 @@ export class ProjectStorage {
             planPhases?: PlanPhase[];
             planStatus?: PlanStatus;
             planQuestions?: PlanQuestion[];
+            planReadyProposal?: PlanReadyProposal | null;
             approvalGrants?: ApprovalGrant[];
           })
         : {};
@@ -308,6 +313,7 @@ export class ProjectStorage {
         planPhases: meta.planPhases ?? [],
         planStatus: meta.planStatus ?? "drafting",
         planQuestions: meta.planQuestions ?? [],
+        planReadyProposal: meta.planReadyProposal ?? null,
         approvalGrants: meta.approvalGrants ?? [],
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
@@ -325,6 +331,7 @@ export class ProjectStorage {
     planPhases: PlanPhase[];
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
+    planReadyProposal: PlanReadyProposal | null;
     approvalGrants: ApprovalGrant[];
     createdAt: string;
     updatedAt: string;
