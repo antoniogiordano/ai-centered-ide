@@ -85,6 +85,7 @@ describe("database migrations", () => {
       planStatus: "drafting",
       planQuestions: [],
       planReadyProposal: null,
+      sessionKind: "delivery",
       approvalGrants: [],
       createdAt: now,
       updatedAt: now,

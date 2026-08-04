@@ -1,16 +1,34 @@
 ---
-description: Every interactive UI action must expose a keyboard shortcut
+description: Every UI button/action MUST show and wire a keyboard shortcut (SC)
 alwaysApply: true
 ---
 
-# Keyboard shortcuts (SC)
+# Keyboard shortcuts (SC) — mandatory
 
-When building or changing UI in this IDE:
+**Non-negotiable:** every user-facing button or primary control must have a keyboard shortcut. No exceptions for “secondary” actions (Choose, Refresh, Log out, Back, etc.).
 
-1. **Every button / primary action must have a keyboard shortcut**, shown in the label or hint (e.g. `Cancel · Esc`, `Continue · Enter`).
-2. **Submit / continue / confirm / save** → **Enter** (not Shift+Enter unless multiline intentionally allows it).
-3. **Cancel / dismiss / close overlay** → **Esc**.
-4. **Back** (wizard / multi-step) → **Backspace** when not editing text, or a dedicated chord documented on the button.
-5. Wire shortcuts in a `keydown` handler (capture when needed so editors do not swallow them). Disable conflicting shortcuts while the user is typing in a field unless the key is Enter/Esc as specified.
-6. Prefer the same pattern as existing surfaces (Plan Q&A dialog, app menu accelerators, command palette hints).
-7. Do not ship unlabeled icon-only actions without a tooltip that includes the shortcut.
+## Required on every button
+
+1. **Visible SC in the label** using the `Label · Shortcut` pattern (e.g. `Cancel · Esc`, `Choose · ⌘O`, `Skip · 1`).
+2. **Wire the key** in a `keydown` handler (use capture when overlays/editors might swallow keys).
+3. **Do not ship** a button whose only activation is mouse click.
+
+## Defaults
+
+| Action | Shortcut |
+| --- | --- |
+| Confirm / Continue / Save / Send | **Enter** |
+| Cancel / Close overlay | **Esc** |
+| Back (wizard step) | **Backspace** when not typing in a field |
+| Open / Choose folder (in dialogs) | **⌘O** / **Ctrl+O** (intercept while dialog is open) |
+| Mutually exclusive create options | Digit or letter keys shown on each option (`· 1`, `· 2`, …) |
+
+## Checklist before finishing UI work
+
+- [ ] Every `<button>` in the changed surface shows an SC in its label
+- [ ] Matching `keydown` (or form submit) actually runs that action
+- [ ] While typing in inputs, only Enter/Esc (and explicitly allowed chords like ⌘O) fire; bare letter shortcuts do not type-steal unless intended
+- [ ] No trailing `…` ellipsis on action button labels (use clear verbs)
+- [ ] UI copy in **English**
+
+If you add a button and leave it without an SC, the change is incomplete — fix it before moving on.

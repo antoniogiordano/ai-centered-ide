@@ -17,11 +17,13 @@ import type {
 } from "@ai-ide/shared";
 import { getBridge } from "../bridge";
 import { MonacoEditor } from "./MonacoEditor";
+import { ArchitectureSummary } from "./ArchitectureSummary";
 import {
   CollapsibleUserText,
   MarkdownMessage,
   TranscriptLabel,
 } from "./TranscriptMessages";
+import { LiveTerminalPane } from "./LiveTerminalPane";
 
 const SCROLL_STICK_THRESHOLD_PX = 96;
 
@@ -194,6 +196,91 @@ function modEnterHint(): string {
     typeof navigator !== "undefined" &&
     /Mac|iPhone|iPad|iPod/.test(navigator.platform);
   return isApple ? "⌘↵" : "Ctrl+Enter";
+}
+
+function modShiftHint(key: string): string {
+  const isApple =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  return isApple ? `⌘⇧${key}` : `Ctrl+Shift+${key}`;
+}
+
+function roleHeading(role: Turn["role"]): string {
+  if (role === "user") return "You";
+  if (role === "assistant") return "Agent";
+  if (role === "system") return "System";
+  return "Tool";
+}
+
+/** Plain-text export of the open chat for the clipboard. */
+export function formatChatForClipboard(
+  turns: Turn[],
+  meta?: { title?: string | null; workspaceName?: string | null },
+): string {
+  const lines: string[] = [];
+  const title = meta?.title?.trim() || "Chat";
+  lines.push(`# ${title}`);
+  if (meta?.workspaceName?.trim()) {
+    lines.push(`Workspace: ${meta.workspaceName.trim()}`);
+  }
+  lines.push("");
+
+  for (const turn of turns) {
+    lines.push(`## ${roleHeading(turn.role)}`);
+    const body = turn.content.trim();
+    if (body) lines.push(body);
+
+    for (const result of turn.toolResults ?? []) {
+      const call = turn.toolCalls?.find((c) => c.id === result.callId);
+      const name = call?.name ?? "tool";
+      const status = result.success ? "ok" : "failed";
+      lines.push("");
+      lines.push(`### ${actionLabel(name)} · ${name} (${status})`);
+      if (result.summary?.trim()) {
+        lines.push(result.summary.trim());
+      }
+      if (result.error?.trim()) {
+        lines.push("");
+        lines.push(`Error: ${result.error.trim()}`);
+      }
+      if (call?.arguments && Object.keys(call.arguments).length > 0) {
+        lines.push("");
+        lines.push("Arguments:");
+        lines.push("```json");
+        lines.push(JSON.stringify(call.arguments, null, 2));
+        lines.push("```");
+      }
+      if (result.output !== undefined) {
+        lines.push("");
+        lines.push("Output:");
+        if (typeof result.output === "string") {
+          lines.push(result.output);
+        } else {
+          lines.push("```json");
+          lines.push(JSON.stringify(result.output, null, 2));
+          lines.push("```");
+        }
+      }
+    }
+
+    // Tool calls without a matching result (rare / in-flight after cancel).
+    for (const call of turn.toolCalls ?? []) {
+      const hasResult = (turn.toolResults ?? []).some((r) => r.callId === call.id);
+      if (hasResult) continue;
+      lines.push("");
+      lines.push(`### ${actionLabel(call.name)} · ${call.name} (no result)`);
+      if (call.arguments && Object.keys(call.arguments).length > 0) {
+        lines.push("Arguments:");
+        lines.push("```json");
+        lines.push(JSON.stringify(call.arguments, null, 2));
+        lines.push("```");
+      }
+    }
+
+    lines.push("");
+  }
+
+  return lines.join("\n").trimEnd() + "\n";
 }
 
 function PlanBoard(props: {
@@ -423,6 +510,73 @@ export function ConversationPane(props: {
     busy &&
     (state?.status === "thinking" || state?.status === "running") &&
     !state?.partialAssistantText;
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle",
+  );
+  const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const tabSessions =
+    sessions.length > 0
+      ? sessions
+      : activeSessionId
+        ? [
+            {
+              id: activeSessionId,
+              title: "New chat",
+              updatedAt: new Date().toISOString(),
+              workspaceName: state?.workspace?.name ?? null,
+              phase:
+                state?.mode === "plan" || state?.planStatus === "drafting"
+                  ? ("planning" as const)
+                  : ("building" as const),
+            },
+          ]
+        : [];
+
+  const activeTabTitle =
+    tabSessions.find((s) => s.id === activeSessionId)?.title ?? "Chat";
+
+  async function copyChat() {
+    if (turns.length === 0) return;
+    const text = formatChatForClipboard(turns, {
+      title: activeTabTitle,
+      workspaceName: state?.workspace?.name ?? null,
+    });
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyState("copied");
+    } catch {
+      setCopyState("failed");
+    }
+    if (copyResetRef.current) clearTimeout(copyResetRef.current);
+    copyResetRef.current = setTimeout(() => setCopyState("idle"), 1600);
+  }
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!(e.metaKey || e.ctrlKey) || !e.shiftKey) return;
+      if (e.key.toLowerCase() !== "c") return;
+      if (turns.length === 0) return;
+      e.preventDefault();
+      void copyChat();
+    }
+    function onCopyEvent() {
+      void copyChat();
+    }
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("aifi:copy-open-chat", onCopyEvent);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("aifi:copy-open-chat", onCopyEvent);
+    };
+    // copyChat closes over latest turns/title; rebind when transcript changes.
+  }, [turns, activeTabTitle, state?.workspace?.name]);
+
+  useEffect(() => {
+    return () => {
+      if (copyResetRef.current) clearTimeout(copyResetRef.current);
+    };
+  }, []);
 
   function handleTranscriptScroll(event: UIEvent<HTMLDivElement>) {
     const el = event.currentTarget;
@@ -463,23 +617,22 @@ export function ConversationPane(props: {
     showThinking,
   ]);
 
-  const tabSessions =
-    sessions.length > 0
-      ? sessions
-      : activeSessionId
-        ? [
-            {
-              id: activeSessionId,
-              title: "New chat",
-              updatedAt: new Date().toISOString(),
-              workspaceName: state?.workspace?.name ?? null,
-              phase:
-                state?.mode === "plan" || state?.planStatus === "drafting"
-                  ? ("planning" as const)
-                  : ("building" as const),
-            },
-          ]
-        : [];
+  function phaseLetter(phase: string | undefined): string {
+    if (phase === "building") return "B";
+    return "P";
+  }
+
+  function phaseTitle(phase: string | undefined): string {
+    if (phase === "building") return "Build";
+    return "Plan";
+  }
+
+  const copyLabel =
+    copyState === "copied"
+      ? "Copied"
+      : copyState === "failed"
+        ? "Copy failed"
+        : `Copy · ${modShiftHint("C")}`;
 
   return (
     <>
@@ -497,14 +650,14 @@ export function ConversationPane(props: {
                 <button
                   type="button"
                   className="session-tab-main"
-                  title={`${session.title} · ${session.phase === "building" ? "Build" : "Plan"}`}
+                  title={`${session.title} · ${phaseTitle(session.phase)}`}
                   onClick={() => void switchSession(session.id)}
                 >
                   <span
                     className={`session-tab-phase session-tab-phase-${session.phase ?? "planning"}`}
                     aria-hidden
                   >
-                    {(session.phase ?? "planning") === "building" ? "B" : "P"}
+                    {phaseLetter(session.phase)}
                   </span>
                   <span className="session-tab-title">{session.title}</span>
                 </button>
@@ -520,6 +673,16 @@ export function ConversationPane(props: {
             );
           })}
         </div>
+        <button
+          type="button"
+          className="session-tab-copy"
+          title="Copy entire open chat"
+          aria-label="Copy entire open chat"
+          disabled={turns.length === 0}
+          onClick={() => void copyChat()}
+        >
+          {copyLabel}
+        </button>
         <button
           type="button"
           className="session-tab-add"
@@ -632,41 +795,121 @@ export function ConversationPane(props: {
         </div>
 
         {(state?.pendingApprovals ?? []).map((approval) => (
-          <div key={approval.id} className="approval-card">
-            <strong>Approval required</strong>
-            <p>{approval.description}</p>
-            <p className="approval-meta">
-              Tool: {approval.toolCall.name} · Risk: {approval.riskLevel}
-            </p>
-            <div className="approval-actions">
-              <button
-                type="button"
-                className="btn"
-                onClick={() => void getBridge()?.session.approve(approval.id)}
-              >
-                Approve once
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                onClick={() =>
-                  void getBridge()?.session.approve(approval.id, true)
-                }
-              >
-                Approve for session category
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary"
-                onClick={() => void getBridge()?.session.reject(approval.id)}
-              >
-                Reject
-              </button>
-            </div>
-          </div>
+          <ApprovalCard key={approval.id} approval={approval} />
         ))}
       </div>
     </>
+  );
+}
+
+function formatApprovalArgs(toolCall: ToolCall): string | null {
+  const args = toolCall.arguments ?? {};
+  if (toolCall.name === "run_command" && typeof args.command === "string") {
+    return args.command;
+  }
+  if (toolCall.name === "git_commit" && typeof args.message === "string") {
+    return args.message;
+  }
+  if (toolCall.name === "write_file" && typeof args.path === "string") {
+    const content =
+      typeof args.content === "string"
+        ? args.content.slice(0, 400)
+        : undefined;
+    return content ? `${args.path}\n\n${content}` : args.path;
+  }
+  try {
+    const json = JSON.stringify(args, null, 2);
+    return json === "{}" ? null : json.slice(0, 2000);
+  } catch {
+    return null;
+  }
+}
+
+function ApprovalCard(props: {
+  approval: {
+    id: string;
+    description: string;
+    riskLevel: string;
+    toolCall: ToolCall;
+  };
+}) {
+  const { approval } = props;
+  const argsPreview = formatApprovalArgs(approval.toolCall);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const typing =
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable);
+      if (typing) return;
+
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        void getBridge()?.session.reject(approval.id);
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        void getBridge()?.session.approve(approval.id);
+        return;
+      }
+      if (e.key === "1" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        void getBridge()?.session.approve(approval.id);
+        return;
+      }
+      if (e.key === "2" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        void getBridge()?.session.approve(approval.id, true);
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [approval.id]);
+
+  return (
+    <div className="approval-card" role="dialog" aria-label="Approval required">
+      <strong>Approval required</strong>
+      <p>{approval.description}</p>
+      <p className="approval-meta">
+        Tool: {approval.toolCall.name} · Risk: {approval.riskLevel}
+      </p>
+      {argsPreview ? (
+        <pre className="approval-command" tabIndex={0}>
+          {argsPreview}
+        </pre>
+      ) : null}
+      <div className="approval-actions">
+        <button
+          type="button"
+          className="btn"
+          onClick={() => void getBridge()?.session.approve(approval.id)}
+        >
+          Approve once · Enter
+        </button>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          onClick={() => void getBridge()?.session.approve(approval.id, true)}
+        >
+          Approve for session · 2
+        </button>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          onClick={() => void getBridge()?.session.reject(approval.id)}
+        >
+          Reject · Esc
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -764,30 +1007,8 @@ function VerifyTabPanel(props: {
       );
 
     case "terminal":
-      if (commandHistory.length === 0) {
-        return (
-          <div className="empty-state verify-empty">
-            <strong>Command history</strong>
-            <p>Commands executed by the agent appear here with exit codes and output summaries.</p>
-          </div>
-        );
-      }
       return (
-        <ul className="verify-list">
-          {commandHistory.map((entry, i) => (
-            <li key={`${entry.command}-${i}`} className="verify-list-item verify-list-terminal">
-              <span
-                className={`verify-exit-code ${
-                  entry.exitCode === 0 ? "ok" : entry.exitCode === null ? "unknown" : "fail"
-                }`}
-              >
-                {entry.exitCode === null ? "?" : entry.exitCode}
-              </span>
-              <code className="verify-list-primary">{entry.command}</code>
-              <span className="verify-list-secondary">{entry.summary}</span>
-            </li>
-          ))}
-        </ul>
+        <LiveTerminalPane state={state} commandHistory={commandHistory} />
       );
   }
 }
@@ -798,6 +1019,7 @@ export function VerifyPane(props: {
   onTabChange: (tab: VerifyTab) => void;
   onOpenQa?: (() => void) | undefined;
   onConfirmPlan?: (() => void) | undefined;
+  onOpenArchitecture?: (() => void) | undefined;
   planning?: boolean;
 }) {
   const {
@@ -806,12 +1028,18 @@ export function VerifyPane(props: {
     onTabChange,
     onOpenQa,
     onConfirmPlan,
+    onOpenArchitecture,
     planning = false,
   } = props;
 
   if (planning) {
     return (
       <div className="pane-body plan-side-pane" role="region" aria-label="Plan">
+        <ArchitectureSummary
+          workspaceRoot={state?.workspace?.resolvedRootPath}
+          planning
+          onOpenArchitecture={onOpenArchitecture}
+        />
         <PlanBoard
           state={state}
           onOpenQa={onOpenQa}

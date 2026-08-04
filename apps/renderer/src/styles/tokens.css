@@ -145,6 +145,47 @@ textarea {
   background: transparent;
 }
 
+.app-shell-architecture {
+  background-color: #0c1414;
+  background-image:
+    radial-gradient(
+      ellipse 120% 95% at 18% -12%,
+      rgba(45, 212, 191, 0.26),
+      transparent 55%
+    ),
+    radial-gradient(
+      ellipse 95% 75% at 92% 12%,
+      rgba(20, 184, 166, 0.14),
+      transparent 50%
+    ),
+    radial-gradient(
+      ellipse 70% 50% at 50% 100%,
+      rgba(45, 212, 191, 0.08),
+      transparent 55%
+    );
+}
+
+.app-shell-architecture .chrome {
+  background: rgba(12, 20, 20, 0.52);
+  border-bottom-color: rgba(45, 212, 191, 0.28);
+}
+
+.app-shell-architecture .topbar,
+.app-shell-architecture .workspace-bar,
+.app-shell-architecture .git-bar,
+.app-shell-architecture .session-tabs {
+  border-color: rgba(45, 212, 191, 0.18);
+}
+
+.app-shell-architecture .pane {
+  background: rgba(12, 20, 20, 0.38);
+  border-right-color: rgba(45, 212, 191, 0.16);
+}
+
+.app-shell-architecture .pane-body {
+  background: transparent;
+}
+
 .chrome {
   display: flex;
   flex-direction: column;
@@ -242,20 +283,136 @@ textarea {
 
 .workspace-bar-action {
   white-space: nowrap;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
 }
 
-.workspace-bar-action kbd {
-  font-family: var(--font-mono);
+.workspace-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.workspace-bar-action-active {
+  border-color: rgba(61, 139, 253, 0.55);
+  color: #9ec5ff;
+  background: rgba(61, 139, 253, 0.12);
+}
+
+.arch-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: transparent;
+}
+
+.arch-pane-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.arch-pane-kicker {
   font-size: 11px;
-  font-weight: 600;
-  padding: 1px 5px;
-  border-radius: 4px;
-  border: 1px solid var(--border-subtle);
-  background: rgba(255, 255, 255, 0.06);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.arch-pane-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.arch-pane-path {
+  margin: 4px 0 0;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.arch-pane-header-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.arch-pane-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.arch-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.arch-section-title {
+  margin: 0;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.arch-grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.arch-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.arch-field-span {
+  grid-column: 1 / -1;
+}
+
+.arch-input {
+  font-size: 13px;
+}
+
+.arch-pane-footer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  padding-top: var(--space-3);
+  background: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgba(15, 18, 24, 0.92) 35%
+  );
+}
+
+.arch-pane-saved {
+  margin: 0;
+  font-size: 12px;
+  color: #9ec5ff;
+}
+
+@media (max-width: 900px) {
+  .arch-grid-2 {
+    grid-template-columns: 1fr;
+  }
 }
 
 .git-bar {
@@ -461,6 +618,12 @@ textarea {
   border: 1px solid rgba(62, 207, 142, 0.4);
 }
 
+.session-tab-phase-architecture {
+  color: #5eead4;
+  background: rgba(45, 212, 191, 0.14);
+  border: 1px solid rgba(45, 212, 191, 0.45);
+}
+
 .session-tab-title {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -505,6 +668,30 @@ textarea {
 .session-tab-add:hover {
   background: var(--bg-elevated);
   color: var(--text-primary);
+}
+
+.session-tab-copy {
+  flex-shrink: 0;
+  border: none;
+  border-left: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+
+.session-tab-copy:hover:not(:disabled) {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+
+.session-tab-copy:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .pane-body {
@@ -1068,6 +1255,22 @@ textarea {
   gap: var(--space-2);
 }
 
+.approval-command {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  max-height: 180px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+}
+
 .running-banner {
   display: flex;
   align-items: center;
@@ -1510,11 +1713,15 @@ textarea {
   color: var(--text-muted);
 }
 
+.overlay,
 .palette-overlay {
   position: fixed;
   inset: 0;
   z-index: 100;
-  background: rgba(8, 10, 14, 0.72);
+  /* Dim the IDE chrome so dialog shortcuts read as scoped to the modal. */
+  background: rgba(4, 6, 10, 0.88);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -1591,9 +1798,11 @@ textarea {
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.65);
   display: flex;
   flex-direction: column;
+  position: relative;
+  z-index: 1;
 }
 
 .qa-dialog-header {
@@ -1780,6 +1989,24 @@ textarea {
   border-radius: 4px;
   border: 1px solid var(--border-subtle);
   background: rgba(255, 255, 255, 0.04);
+}
+
+.new-project-path-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.new-project-path-row .start-build-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.new-project-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
 }
 
 .qa-recap-list {
@@ -2020,6 +2247,74 @@ textarea {
   background: rgba(61, 139, 253, 0.14);
 }
 
+.arch-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+  border: 1px solid rgba(236, 214, 150, 0.22);
+  border-radius: var(--radius-md);
+  background: rgba(18, 20, 15, 0.45);
+  flex-shrink: 0;
+}
+
+.arch-summary-draft {
+  border-color: rgba(61, 139, 253, 0.35);
+}
+
+.arch-summary-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.arch-summary-header strong {
+  display: block;
+  font-size: 13px;
+}
+
+.arch-summary-status {
+  display: block;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.arch-summary-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.arch-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.arch-chip {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary, var(--text-primary));
+}
+
+.arch-summary-hint,
+.arch-summary-empty .muted {
+  margin: 0;
+  font-size: 12px;
+}
+
+.arch-summary-error {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger, #ff7b72);
+}
+
 .plan-side-pane {
   display: flex;
   flex-direction: column;
@@ -2089,4 +2384,199 @@ textarea {
 .plan-board-drafting .plan-check-mark {
   color: rgba(236, 214, 150, 0.65);
   font-weight: 700;
+}
+
+/* Hybrid interactive terminals */
+.terminal-confirm-bar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  width: min(640px, calc(100vw - 32px));
+  z-index: 140;
+  background: var(--bg-panel);
+  border: 1px solid rgba(61, 139, 253, 0.35);
+  border-radius: var(--radius-md);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+
+.terminal-confirm-progress {
+  height: 3px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.terminal-confirm-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 32ms linear;
+}
+
+.terminal-confirm-header {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-3) var(--space-2);
+}
+
+.terminal-confirm-kicker {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+
+.terminal-confirm-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.terminal-confirm-text {
+  display: block;
+  width: calc(100% - 24px);
+  margin: 0 var(--space-3);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text);
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  resize: vertical;
+}
+
+.terminal-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding: var(--space-3);
+}
+
+.terminal-ask-text-label {
+  display: block;
+  margin: var(--space-3) 0 var(--space-2);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.live-terminal-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-height: 0;
+  height: 100%;
+}
+
+.live-terminal-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.live-terminal-tab {
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.live-terminal-tab.is-active {
+  color: var(--text);
+  border-color: rgba(61, 139, 253, 0.45);
+  background: var(--accent-soft);
+}
+
+.live-terminal-tab-meta {
+  margin-left: 6px;
+  opacity: 0.7;
+}
+
+.live-terminal-output {
+  flex: 1;
+  min-height: 220px;
+  max-height: min(520px, 55vh);
+  margin: 0;
+  padding: var(--space-3);
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  color: var(--text);
+}
+
+.live-terminal-input-row {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.live-terminal-input-row input {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.live-terminal-history-title {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: var(--space-2);
+}
+
+/* Codebase memory engine banner */
+.engine-banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(61, 139, 253, 0.08);
+}
+
+.engine-banner-muted {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.engine-banner-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.engine-banner-body p {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.engine-banner-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.engine-banner-progress {
+  margin-top: var(--space-2);
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  max-width: 420px;
+}
+
+.engine-banner-progress-fill {
+  height: 100%;
+  background: var(--accent);
 }

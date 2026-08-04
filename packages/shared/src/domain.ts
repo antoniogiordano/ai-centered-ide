@@ -3,6 +3,11 @@ import { z } from "zod";
 export const AgentModeSchema = z.enum(["ask", "plan", "agent", "autonomous"]);
 export type AgentMode = z.infer<typeof AgentModeSchema>;
 
+/** delivery = plan/build chats; architecture = stack profile chat */
+/** delivery chats follow plan→build. Legacy "architecture" chats coerce to delivery. */
+export const SessionKindSchema = z.enum(["delivery", "architecture"]);
+export type SessionKind = z.infer<typeof SessionKindSchema>;
+
 export const RiskLevelSchema = z.enum([
   "safe",
   "reversible",
@@ -108,11 +113,55 @@ export const TurnSchema = z.object({
 });
 export type Turn = z.infer<typeof TurnSchema>;
 
+export const LiveTerminalSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  status: z.enum(["running", "exited"]),
+  pid: z.number().int().nullable(),
+  cwd: z.string().min(1),
+  /** Tail of output for UI preview (full stream via terminal:subscribe). */
+  lastOutput: z.string().default(""),
+  exitCode: z.number().int().nullable().default(null),
+});
+export type LiveTerminal = z.infer<typeof LiveTerminalSchema>;
+
+export const PendingTerminalConfirmSchema = z.object({
+  id: z.string().min(1),
+  terminalId: z.string().min(1),
+  /** Exact text that will be written if approved (may still append newline). */
+  text: z.string(),
+  appendNewline: z.boolean().default(true),
+  deadlineAt: z.string().datetime(),
+  durationMs: z.number().int().positive().default(3000),
+});
+export type PendingTerminalConfirm = z.infer<typeof PendingTerminalConfirmSchema>;
+
+export const PendingTerminalAskSchema = z.object({
+  id: z.string().min(1),
+  terminalId: z.string().min(1),
+  prompt: z.string().min(1),
+  options: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+      }),
+    )
+    .min(2)
+    .max(8),
+  suggestedText: z.string().default(""),
+  writeToTerminal: z.boolean().default(true),
+  appendNewline: z.boolean().default(true),
+});
+export type PendingTerminalAsk = z.infer<typeof PendingTerminalAskSchema>;
+
 export const SessionStateSchema = z.object({
   sessionId: z.string().min(1),
   sequence: z.number().int().nonnegative(),
   workspace: WorkspaceRefSchema.nullable(),
   mode: AgentModeSchema,
+  /** delivery chats follow plan→build; architecture is a dedicated stack chat. */
+  sessionKind: SessionKindSchema.default("delivery"),
   turns: z.array(TurnSchema),
   /** @deprecated Prefer planPhases — kept for older persisted sessions. */
   planSteps: z.array(PlanStepSchema).default([]),
@@ -154,13 +203,19 @@ export const SessionStateSchema = z.object({
       summary: z.string().optional(),
     }),
   ),
+  /** Interactive PTY sessions owned by the app (not persisted). */
+  liveTerminals: z.array(LiveTerminalSchema).default([]),
+  /** Soft-confirm for agent→terminal stdin (3s auto-approve). */
+  pendingTerminalConfirm: PendingTerminalConfirmSchema.nullable().default(null),
+  /** Exclusive Q&A when the agent needs a human decision for the terminal. */
+  pendingTerminalAsk: PendingTerminalAskSchema.nullable().default(null),
   error: z.string().nullable(),
 });
 export type SessionState = z.infer<typeof SessionStateSchema>;
 
 /**
  * Product phase for a chat session.
- * Today: planning | building. Later: unit_test | qa | e2e, …
+ * planning | building (later: unit_test | qa | e2e, …)
  */
 export const ProductPhaseSchema = z.enum(["planning", "building"]);
 export type ProductPhase = z.infer<typeof ProductPhaseSchema>;
@@ -168,7 +223,9 @@ export type ProductPhase = z.infer<typeof ProductPhaseSchema>;
 export function deriveProductPhase(state: {
   mode?: string | null;
   planStatus?: string | null;
+  sessionKind?: string | null;
 }): ProductPhase {
+  void state.sessionKind;
   if (state.mode === "plan" || state.planStatus === "drafting") {
     return "planning";
   }
@@ -234,6 +291,7 @@ export function createEmptySessionState(sessionId: string): SessionState {
     sequence: 0,
     workspace: null,
     mode: "plan",
+    sessionKind: "delivery",
     turns: [],
     planSteps: [],
     planPhases: [],
@@ -247,6 +305,9 @@ export function createEmptySessionState(sessionId: string): SessionState {
     partialAssistantText: null,
     activityLabel: null,
     liveTools: [],
+    liveTerminals: [],
+    pendingTerminalConfirm: null,
+    pendingTerminalAsk: null,
     error: null,
   };
 }

@@ -14,13 +14,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 let mainWindow: BrowserWindow | null = null;
 let appStorage: ProjectStorage | null = null;
+let appSession: SessionManager | null = null;
 let persistMainWindowState: (() => void) | null = null;
 
 const UI_FOCUS_COMPOSER = "ui:focus-composer";
 const UI_TOGGLE_PALETTE = "ui:toggle-palette";
 const UI_OPEN_WORKSPACE = "ui:open-workspace";
+const UI_NEW_PROJECT = "ui:new-project";
 const UI_NEW_SESSION = "ui:new-session";
 const UI_OPEN_PROVIDER = "ui:open-provider";
+const UI_TOGGLE_ARCHITECTURE = "ui:toggle-architecture";
 
 type WindowState = {
   x?: number;
@@ -178,14 +181,24 @@ function installAppMenu(): void {
           click: () => send(UI_NEW_SESSION),
         },
         {
-          label: "Open Workspace…",
+          label: "New Project",
+          accelerator: "CommandOrControl+Shift+N",
+          click: () => send(UI_NEW_PROJECT),
+        },
+        {
+          label: "Open Workspace",
           accelerator: "CommandOrControl+O",
           click: () => send(UI_OPEN_WORKSPACE),
         },
         {
-          label: "Provider Settings…",
+          label: "Provider Settings",
           accelerator: "CommandOrControl+P",
           click: () => send(UI_OPEN_PROVIDER),
+        },
+        {
+          label: "Architecture Settings",
+          accelerator: "CommandOrControl+Shift+A",
+          click: () => send(UI_TOGGLE_ARCHITECTURE),
         },
         { type: "separator" },
         {
@@ -328,8 +341,21 @@ export function createMainWindow(_storage: ProjectStorage): BrowserWindow {
   win.webContents.on("before-input-event", (event, input) => {
     if (input.type !== "keyDown") return;
     const mod = input.meta || input.control;
-    if (!mod || input.alt || input.shift) return;
+    if (!mod || input.alt) return;
     const key = input.key.toLowerCase();
+
+    if (input.shift && key === "a") {
+      event.preventDefault();
+      win.webContents.send(UI_TOGGLE_ARCHITECTURE);
+      return;
+    }
+    if (input.shift && key === "n") {
+      event.preventDefault();
+      win.webContents.send(UI_NEW_PROJECT);
+      return;
+    }
+    if (input.shift) return;
+
     const channel =
       key === "i"
         ? UI_FOCUS_COMPOSER
@@ -392,6 +418,7 @@ app.whenReady().then(async () => {
   const storage = new ProjectStorage(openDatabase(dbPath));
   appStorage = storage;
   const session = new SessionManager(storage);
+  appSession = session;
   const credentials = await createKeytarCredentialStore();
   session.setCredentials(credentials);
   registerIpcHandlers(session, credentials, storage);
@@ -413,6 +440,7 @@ app.on("second-instance", () => {
 
 function flushWindowStateAndQuit(): void {
   persistMainWindowState?.();
+  void appSession?.dispose();
 }
 
 app.on("before-quit", flushWindowStateAndQuit);

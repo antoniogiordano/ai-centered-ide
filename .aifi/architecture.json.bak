@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "name": "ai-first-ide",
+  "repo": {
+    "shape": "monorepo",
+    "packageManager": "pnpm"
+  },
+  "runtimes": [
+    {
+      "id": "node",
+      "version": ">=22"
+    }
+  ],
+  "backend": {
+    "language": "typescript",
+    "frameworks": [
+      "electron"
+    ],
+    "roots": [
+      "apps/desktop"
+    ]
+  },
+  "testing": {
+    "unit": {
+      "lib": "vitest",
+      "command": "pnpm test"
+    }
+  },
+  "quality": {
+    "lint": "pnpm lint",
+    "typecheck": "pnpm typecheck"
+  },
+  "meta": {
+    "updatedAt": "2026-08-03T08:42:54.775Z",
+    "sources": {
+      "name": "user_confirmed",
+      "repo.shape": "user_confirmed",
+      "repo.packageManager": "user_confirmed",
+      "runtimes": "user_confirmed",
+      "backend": "user_confirmed",
+      "testing": "user_confirmed",
+      "quality": "user_confirmed",
+      "repo": "user_confirmed"
+    }
+  }
+}

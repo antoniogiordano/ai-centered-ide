@@ -1,6 +1,11 @@
 import { contextBridge, ipcRenderer } from "electron";
 import {
   IPC_CHANNELS,
+  type GithubStatusResponse,
+  type GithubLogoutResponse,
+  type GithubLoginWebResponse,
+  type GithubLoginTokenResponse,
+  type GithubLoginCancelResponse,
   type ProviderGetConfigResponse,
   type ProviderListModelsResponse,
   type ProviderSaveConfigResponse,
@@ -14,10 +19,19 @@ import {
   type SessionSetModeResponse,
   type SessionSwitchResponse,
   type SessionUpdateEvent,
+  type TerminalDataEvent,
+  type TerminalListResponse,
+  type EngineStatus,
+  type WorkspaceCreateProjectRequest,
+  type WorkspaceCreateProjectResponse,
   type WorkspaceGitStatusResponse,
   type WorkspaceListBranchesResponse,
+  type WorkspaceArchitectureGetResponse,
+  type WorkspaceArchitectureDetectResponse,
+  type WorkspaceArchitectureSaveResponse,
   type WorkspaceListRecentResponse,
   type WorkspaceOpenResponse,
+  type WorkspacePickDirectoryResponse,
 } from "@ai-ide/shared";
 
 export type DesktopBridge = {
@@ -45,14 +59,59 @@ export type DesktopBridge = {
     }) => Promise<SessionConfirmPlanResponse>;
     approve: (approvalId: string, grantCategory?: boolean) => Promise<void>;
     reject: (approvalId: string, reason?: string) => Promise<void>;
+    terminalConfirm: (
+      confirmId: string,
+      action: "approve" | "cancel",
+      text?: string,
+    ) => Promise<void>;
+    terminalConfirmEdit: (confirmId: string, text: string) => Promise<void>;
+    terminalAsk: (input: {
+      askId: string;
+      selectedOptionId?: string | null;
+      text: string;
+      cancelled?: boolean;
+    }) => Promise<void>;
     cancel: () => Promise<void>;
     exportDiagnostics: () => Promise<unknown>;
   };
+  terminal: {
+    list: () => Promise<TerminalListResponse>;
+    subscribe: (cb: (event: TerminalDataEvent) => void) => () => void;
+    writeUser: (terminalId: string, text: string) => Promise<void>;
+    resize: (terminalId: string, cols: number, rows: number) => Promise<void>;
+  };
+  engine: {
+    status: () => Promise<EngineStatus>;
+    subscribe: (cb: (status: EngineStatus) => void) => () => void;
+    ensure: () => Promise<{ ok: boolean; status: EngineStatus }>;
+    index: (mode?: string) => Promise<{ ok: boolean; status: EngineStatus }>;
+    indexCancel: () => Promise<{ status: EngineStatus }>;
+    indexRefresh: () => Promise<{ ok: boolean; status: EngineStatus }>;
+    stderr: () => Promise<{ stderr: string }>;
+  };
   workspace: {
     open: (path?: string) => Promise<WorkspaceOpenResponse>;
+    pickDirectory: () => Promise<WorkspacePickDirectoryResponse>;
+    createProject: (
+      input: WorkspaceCreateProjectRequest,
+    ) => Promise<WorkspaceCreateProjectResponse>;
     listRecent: () => Promise<WorkspaceListRecentResponse>;
     gitStatus: () => Promise<WorkspaceGitStatusResponse>;
     listBranches: () => Promise<WorkspaceListBranchesResponse>;
+    architectureGet: () => Promise<WorkspaceArchitectureGetResponse>;
+    architectureDetect: () => Promise<WorkspaceArchitectureDetectResponse>;
+    architectureSave: (input: {
+      profile?: WorkspaceArchitectureGetResponse["profile"];
+      patch?: Record<string, unknown>;
+      confirm?: boolean;
+    }) => Promise<WorkspaceArchitectureSaveResponse>;
+  };
+  github: {
+    status: () => Promise<GithubStatusResponse>;
+    logout: (user?: string) => Promise<GithubLogoutResponse>;
+    loginWeb: () => Promise<GithubLoginWebResponse>;
+    loginToken: (token: string) => Promise<GithubLoginTokenResponse>;
+    loginCancel: () => Promise<GithubLoginCancelResponse>;
   };
   provider: {
     getConfig: () => Promise<ProviderGetConfigResponse>;
@@ -75,16 +134,20 @@ export type DesktopBridge = {
     onFocusComposer: (cb: () => void) => () => void;
     onTogglePalette: (cb: () => void) => () => void;
     onOpenWorkspace: (cb: () => void) => () => void;
+    onNewProject: (cb: () => void) => () => void;
     onNewSession: (cb: () => void) => () => void;
     onOpenProvider: (cb: () => void) => () => void;
+    onToggleArchitecture: (cb: () => void) => () => void;
   };
 };
 
 const UI_FOCUS_COMPOSER = "ui:focus-composer";
 const UI_TOGGLE_PALETTE = "ui:toggle-palette";
 const UI_OPEN_WORKSPACE = "ui:open-workspace";
+const UI_NEW_PROJECT = "ui:new-project";
 const UI_NEW_SESSION = "ui:new-session";
 const UI_OPEN_PROVIDER = "ui:open-provider";
+const UI_TOGGLE_ARCHITECTURE = "ui:toggle-architecture";
 
 function onUiEvent(channel: string, cb: () => void): () => void {
   const handler = () => cb();
@@ -126,18 +189,95 @@ const bridge: DesktopBridge = {
       }),
     reject: (approvalId, reason) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_REJECT, { approvalId, reason }),
+    terminalConfirm: (confirmId, action, text) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_TERMINAL_CONFIRM, {
+        confirmId,
+        action,
+        ...(text !== undefined ? { text } : {}),
+      }),
+    terminalConfirmEdit: (confirmId, text) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_TERMINAL_CONFIRM_EDIT, {
+        confirmId,
+        text,
+      }),
+    terminalAsk: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_TERMINAL_ASK, {
+        askId: input.askId,
+        selectedOptionId: input.selectedOptionId ?? null,
+        text: input.text,
+        cancelled: Boolean(input.cancelled),
+      }),
     cancel: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_CANCEL, {}),
     exportDiagnostics: () =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_EXPORT_DIAGNOSTICS, {}),
   },
+  terminal: {
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_LIST, {}),
+    subscribe: (cb) => {
+      const channel = `${IPC_CHANNELS.TERMINAL_SUBSCRIBE}:data`;
+      const handler = (_: unknown, event: TerminalDataEvent) => cb(event);
+      ipcRenderer.on(channel, handler);
+      ipcRenderer.send(IPC_CHANNELS.TERMINAL_SUBSCRIBE);
+      return () => ipcRenderer.removeListener(channel, handler);
+    },
+    writeUser: (terminalId, text) =>
+      ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_WRITE_USER, { terminalId, text }),
+    resize: (terminalId, cols, rows) =>
+      ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_RESIZE, {
+        terminalId,
+        cols,
+        rows,
+      }),
+  },
+  engine: {
+    status: () => ipcRenderer.invoke(IPC_CHANNELS.ENGINE_STATUS, {}),
+    subscribe: (cb) => {
+      const channel = `${IPC_CHANNELS.ENGINE_SUBSCRIBE}:update`;
+      const handler = (_: unknown, status: EngineStatus) => cb(status);
+      ipcRenderer.on(channel, handler);
+      ipcRenderer.send(IPC_CHANNELS.ENGINE_SUBSCRIBE);
+      return () => ipcRenderer.removeListener(channel, handler);
+    },
+    ensure: () => ipcRenderer.invoke(IPC_CHANNELS.ENGINE_ENSURE, {}),
+    index: (mode) =>
+      ipcRenderer.invoke(IPC_CHANNELS.ENGINE_INDEX, mode ? { mode } : {}),
+    indexCancel: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.ENGINE_INDEX_CANCEL, {}),
+    indexRefresh: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.ENGINE_INDEX_REFRESH, {}),
+    stderr: () => ipcRenderer.invoke(IPC_CHANNELS.ENGINE_STDERR, {}),
+  },
   workspace: {
     open: (path) =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_OPEN, path ? { path } : {}),
+    pickDirectory: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_PICK_DIRECTORY, {}),
+    createProject: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_CREATE_PROJECT, input),
     listRecent: () => ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_RECENT),
     gitStatus: () =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_STATUS, {}),
     listBranches: () =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_BRANCHES, {}),
+    architectureGet: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_GET, {}),
+    architectureDetect: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_DETECT, {}),
+    architectureSave: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_SAVE, input),
+  },
+  github: {
+    status: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_STATUS, {}),
+    logout: (user) =>
+      ipcRenderer.invoke(
+        IPC_CHANNELS.GITHUB_LOGOUT,
+        user ? { user } : {},
+      ),
+    loginWeb: () => ipcRenderer.invoke(IPC_CHANNELS.GITHUB_LOGIN_WEB, {}),
+    loginToken: (token) =>
+      ipcRenderer.invoke(IPC_CHANNELS.GITHUB_LOGIN_TOKEN, { token }),
+    loginCancel: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.GITHUB_LOGIN_CANCEL, {}),
   },
   provider: {
     getConfig: () =>
@@ -152,8 +292,10 @@ const bridge: DesktopBridge = {
     onFocusComposer: (cb) => onUiEvent(UI_FOCUS_COMPOSER, cb),
     onTogglePalette: (cb) => onUiEvent(UI_TOGGLE_PALETTE, cb),
     onOpenWorkspace: (cb) => onUiEvent(UI_OPEN_WORKSPACE, cb),
+    onNewProject: (cb) => onUiEvent(UI_NEW_PROJECT, cb),
     onNewSession: (cb) => onUiEvent(UI_NEW_SESSION, cb),
     onOpenProvider: (cb) => onUiEvent(UI_OPEN_PROVIDER, cb),
+    onToggleArchitecture: (cb) => onUiEvent(UI_TOGGLE_ARCHITECTURE, cb),
   },
 };
 

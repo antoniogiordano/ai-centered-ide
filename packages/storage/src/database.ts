@@ -10,6 +10,7 @@ import type {
   PlanReadyProposal,
   PlanStatus,
   PlanStep,
+  SessionKind,
   Turn,
   WorkspaceRef,
 } from "@ai-ide/shared";
@@ -218,6 +219,7 @@ export class ProjectStorage {
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
+    sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     createdAt: string;
     updatedAt: string;
@@ -249,6 +251,7 @@ export class ProjectStorage {
           planStatus: row.planStatus,
           planQuestions: row.planQuestions,
           planReadyProposal: row.planReadyProposal,
+          sessionKind: row.sessionKind,
           approvalGrants: row.approvalGrants,
         }),
       );
@@ -265,6 +268,7 @@ export class ProjectStorage {
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
+    sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     createdAt: string;
     updatedAt: string;
@@ -298,6 +302,7 @@ export class ProjectStorage {
             planStatus?: PlanStatus;
             planQuestions?: PlanQuestion[];
             planReadyProposal?: PlanReadyProposal | null;
+            sessionKind?: SessionKind;
             approvalGrants?: ApprovalGrant[];
           })
         : {};
@@ -314,6 +319,7 @@ export class ProjectStorage {
         planStatus: meta.planStatus ?? "drafting",
         planQuestions: meta.planQuestions ?? [],
         planReadyProposal: meta.planReadyProposal ?? null,
+        sessionKind: meta.sessionKind ?? "delivery",
         approvalGrants: meta.approvalGrants ?? [],
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
@@ -332,6 +338,7 @@ export class ProjectStorage {
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
+    sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     createdAt: string;
     updatedAt: string;

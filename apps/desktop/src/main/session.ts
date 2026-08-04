@@ -16,18 +16,36 @@ import {
   normalizeFeatBranchName,
   normalizePlanQuestions,
   runAgentTurn,
+  resumeAgentTurn,
   tryParsePartialJson,
   type AgentProgressEvent,
   type PlanAnswerInput,
+  type PausedAgentTurn,
 } from "@ai-ide/agent";
 import {
   CheckpointService,
   FilesystemService,
   GitService,
 } from "@ai-ide/workspace";
+import type { TerminalHost } from "@ai-ide/tools";
 import { app } from "electron";
 import type { CredentialStore } from "@ai-ide/storage";
 import { CREDENTIAL_SERVICE } from "@ai-ide/storage";
+import { TerminalManager } from "./terminals.js";
+import { CbmEngine } from "./engine/cbm-engine.js";
+import type { CbmHost } from "@ai-ide/tools";
+
+const TERMINAL_CONFIRM_MS = 3000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withNewline(text: string, appendNewline: boolean): string {
+  if (!appendNewline) return text;
+  if (text.endsWith("\n") || text.endsWith("\r")) return text;
+  return `${text}\n`;
+}
 
 type RecentWorkspace = {
   projectId: string;
@@ -104,11 +122,372 @@ export class SessionManager {
   private abort: AbortController | null = null;
   private credentials: CredentialStore | null = null;
   private tokenFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly terminals = new TerminalManager();
+  private terminalHost: TerminalHost;
+  private readonly engine = new CbmEngine();
+  private cbmHost: CbmHost;
+  private confirmWaiters = new Map<
+    string,
+    {
+      resolve: (value: { approved: boolean; text: string }) => void;
+      timer: ReturnType<typeof setTimeout>;
+      onAbort: () => void;
+    }
+  >();
+  private askWaiters = new Map<
+    string,
+    {
+      resolve: (value: {
+        selectedOptionId: string | null;
+        text: string;
+        cancelled: boolean;
+      }) => void;
+    }
+  >();
+  private terminalChunkListeners = new Set<
+    (event: { terminalId: string; data: string; sequence: number }) => void
+  >();
+  private liveSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  private pausedTurn: PausedAgentTurn | null = null;
 
   constructor(private readonly storage: ProjectStorage) {
     const boot = this.bootstrap();
     this.state = boot.state;
     this.createdAt = boot.createdAt;
+    this.terminalHost = this.createTerminalHost();
+    this.cbmHost = this.createCbmHost();
+    this.terminals.onChange(() => this.scheduleLiveTerminalSync());
+    this.terminals.onChunk((event) => {
+      for (const listener of this.terminalChunkListeners) listener(event);
+    });
+    void this.engine.refreshBinaryFlag();
+    const bootRoot = this.state.workspace?.resolvedRootPath;
+    if (bootRoot) {
+      void this.engine.attachWorkspace(bootRoot);
+    }
+  }
+
+  getEngine(): CbmEngine {
+    return this.engine;
+  }
+
+  private createCbmHost(): CbmHost {
+    return {
+      isIndexed: () => this.engine.isIndexed(),
+      callTool: (name, args) => this.engine.callModelTool(name, args),
+      architecturePreseed: () => this.engine.architecturePreseed(),
+    };
+  }
+
+  private scheduleLiveTerminalSync(): void {
+    if (this.liveSyncTimer) return;
+    this.liveSyncTimer = setTimeout(() => {
+      this.liveSyncTimer = null;
+      const next = this.terminals.list();
+      const prev = this.state.liveTerminals;
+      if (JSON.stringify(prev) === JSON.stringify(next)) return;
+      this.state = { ...this.state, liveTerminals: next };
+      this.push();
+    }, 80);
+  }
+
+  private syncLiveTerminals(): void {
+    this.state = { ...this.state, liveTerminals: this.terminals.list() };
+  }
+
+  subscribeTerminalChunks(
+    listener: (event: {
+      terminalId: string;
+      data: string;
+      sequence: number;
+    }) => void,
+  ): () => void {
+    this.terminalChunkListeners.add(listener);
+    return () => this.terminalChunkListeners.delete(listener);
+  }
+
+  listLiveTerminals() {
+    return this.terminals.list();
+  }
+
+  writeUserTerminal(terminalId: string, text: string): void {
+    this.terminals.writeRaw(terminalId, text);
+  }
+
+  resizeTerminal(terminalId: string, cols: number, rows: number): void {
+    this.terminals.resize(terminalId, cols, rows);
+  }
+
+  private clearTerminalWaiters(reason: "cancel" | "dispose"): void {
+    for (const [id, waiter] of this.confirmWaiters) {
+      clearTimeout(waiter.timer);
+      this.abort?.signal.removeEventListener("abort", waiter.onAbort);
+      waiter.resolve({ approved: false, text: "" });
+      this.confirmWaiters.delete(id);
+    }
+    for (const [id, waiter] of this.askWaiters) {
+      waiter.resolve({ selectedOptionId: null, text: "", cancelled: true });
+      this.askWaiters.delete(id);
+    }
+    if (
+      this.state.pendingTerminalConfirm ||
+      this.state.pendingTerminalAsk ||
+      reason === "dispose"
+    ) {
+      this.state = {
+        ...this.state,
+        pendingTerminalConfirm: null,
+        pendingTerminalAsk: null,
+      };
+    }
+  }
+
+  private waitTerminalConfirm(
+    terminalId: string,
+    text: string,
+    appendNewline: boolean,
+  ): Promise<{ approved: boolean; text: string }> {
+    const id = randomUUID();
+    const durationMs = TERMINAL_CONFIRM_MS;
+    const deadlineAt = new Date(Date.now() + durationMs).toISOString();
+    this.state = {
+      ...this.state,
+      pendingTerminalConfirm: {
+        id,
+        terminalId,
+        text,
+        appendNewline,
+        deadlineAt,
+        durationMs,
+      },
+      activityLabel: "Confirm terminal input…",
+    };
+    this.push();
+
+    return new Promise((resolve) => {
+      const finish = (approved: boolean, finalText: string) => {
+        const waiter = this.confirmWaiters.get(id);
+        if (!waiter) return;
+        clearTimeout(waiter.timer);
+        this.abort?.signal.removeEventListener("abort", waiter.onAbort);
+        this.confirmWaiters.delete(id);
+        if (this.state.pendingTerminalConfirm?.id === id) {
+          this.state = {
+            ...this.state,
+            pendingTerminalConfirm: null,
+          };
+          this.push();
+        }
+        resolve({ approved, text: finalText });
+      };
+      const onAbort = () => finish(false, text);
+      const timer = setTimeout(() => {
+        const pending = this.state.pendingTerminalConfirm;
+        const finalText = pending?.id === id ? pending.text : text;
+        finish(true, finalText);
+      }, durationMs);
+      this.confirmWaiters.set(id, { resolve, timer, onAbort });
+      if (this.abort?.signal.aborted) {
+        finish(false, text);
+        return;
+      }
+      this.abort?.signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  resolveTerminalConfirm(
+    confirmId: string,
+    action: "approve" | "cancel",
+    text?: string,
+  ): void {
+    const pending = this.state.pendingTerminalConfirm;
+    if (!pending || pending.id !== confirmId) return;
+    const waiter = this.confirmWaiters.get(confirmId);
+    if (!waiter) return;
+    clearTimeout(waiter.timer);
+    this.abort?.signal.removeEventListener("abort", waiter.onAbort);
+    this.confirmWaiters.delete(confirmId);
+    const finalText = text !== undefined ? text : pending.text;
+    this.state = {
+      ...this.state,
+      pendingTerminalConfirm: null,
+    };
+    this.push();
+    waiter.resolve({ approved: action === "approve", text: finalText });
+  }
+
+  editTerminalConfirm(confirmId: string, text: string): void {
+    const pending = this.state.pendingTerminalConfirm;
+    if (!pending || pending.id !== confirmId) return;
+    this.state = {
+      ...this.state,
+      pendingTerminalConfirm: { ...pending, text },
+    };
+    this.push();
+  }
+
+  private waitTerminalAsk(params: {
+    terminalId: string;
+    prompt: string;
+    options: Array<{ id: string; label: string }>;
+    suggestedText: string;
+    writeToTerminal: boolean;
+    appendNewline: boolean;
+  }): Promise<{
+    selectedOptionId: string | null;
+    text: string;
+    cancelled: boolean;
+  }> {
+    const id = randomUUID();
+    this.state = {
+      ...this.state,
+      pendingTerminalAsk: {
+        id,
+        terminalId: params.terminalId,
+        prompt: params.prompt,
+        options: params.options,
+        suggestedText: params.suggestedText,
+        writeToTerminal: params.writeToTerminal,
+        appendNewline: params.appendNewline,
+      },
+      activityLabel: "Waiting for terminal decision…",
+    };
+    this.push();
+    return new Promise((resolve) => {
+      this.askWaiters.set(id, { resolve });
+    });
+  }
+
+  resolveTerminalAsk(input: {
+    askId: string;
+    selectedOptionId?: string | null;
+    text: string;
+    cancelled?: boolean;
+  }): void {
+    const pending = this.state.pendingTerminalAsk;
+    if (!pending || pending.id !== input.askId) return;
+    const waiter = this.askWaiters.get(input.askId);
+    if (!waiter) return;
+    this.askWaiters.delete(input.askId);
+    this.state = {
+      ...this.state,
+      pendingTerminalAsk: null,
+    };
+    this.push();
+    waiter.resolve({
+      selectedOptionId: input.selectedOptionId ?? null,
+      text: input.text,
+      cancelled: Boolean(input.cancelled),
+    });
+  }
+
+  private createTerminalHost(): TerminalHost {
+    return {
+      open: async (opts) => {
+        const root = this.state.workspace?.resolvedRootPath;
+        if (!root) throw new Error("Open a workspace first.");
+        const cwd = this.terminals.resolveCwd(root, opts?.cwd);
+        const live = this.terminals.open({
+          cwd,
+          ...(opts?.title ? { title: opts.title } : {}),
+        });
+        this.syncLiveTerminals();
+        this.push();
+        return {
+          id: live.id,
+          title: live.title,
+          status: live.status,
+          pid: live.pid,
+          cwd: live.cwd,
+          exitCode: live.exitCode,
+        };
+      },
+      list: () =>
+        this.terminals.list().map((t) => ({
+          id: t.id,
+          title: t.title,
+          status: t.status,
+          pid: t.pid,
+          cwd: t.cwd,
+          exitCode: t.exitCode,
+        })),
+      read: (id, opts) => this.terminals.read(id, opts?.maxChars),
+      write: async (id, text, opts) => {
+        const appendNewline = opts?.appendNewline !== false;
+        const decision = await this.waitTerminalConfirm(id, text, appendNewline);
+        const snapshot = this.terminals.read(id);
+        if (!decision.approved) {
+          return {
+            written: false,
+            cancelled: true,
+            text: withNewline(decision.text || text, appendNewline),
+            output: snapshot.output,
+            status: snapshot.status,
+            exitCode: snapshot.exitCode,
+          };
+        }
+        const payload = withNewline(decision.text, appendNewline);
+        this.terminals.writeRaw(id, payload);
+        await sleep(opts?.settleMs ?? 500);
+        const after = this.terminals.read(id);
+        this.syncLiveTerminals();
+        this.push();
+        return {
+          written: true,
+          cancelled: false,
+          text: payload,
+          output: after.output,
+          status: after.status,
+          exitCode: after.exitCode,
+        };
+      },
+      ask: async (params) => {
+        const decision = await this.waitTerminalAsk({
+          terminalId: params.terminalId,
+          prompt: params.prompt,
+          options: params.options,
+          suggestedText: params.suggestedText ?? "",
+          writeToTerminal: params.writeToTerminal !== false,
+          appendNewline: params.appendNewline !== false,
+        });
+        const appendNewline = params.appendNewline !== false;
+        const writeToTerminal = params.writeToTerminal !== false;
+        if (decision.cancelled) {
+          const snap = this.terminals.read(params.terminalId);
+          return {
+            selectedOptionId: null,
+            text: decision.text,
+            written: false,
+            cancelled: true,
+            output: snap.output,
+          };
+        }
+        let written = false;
+        let payload = decision.text;
+        if (writeToTerminal && payload.length > 0) {
+          payload = withNewline(payload, appendNewline);
+          this.terminals.writeRaw(params.terminalId, payload);
+          written = true;
+          await sleep(400);
+        }
+        const after = this.terminals.read(params.terminalId);
+        this.syncLiveTerminals();
+        this.push();
+        return {
+          selectedOptionId: decision.selectedOptionId,
+          text: payload,
+          written,
+          cancelled: false,
+          output: after.output,
+        };
+      },
+      close: async (id) => {
+        const closed = this.terminals.close(id);
+        this.syncLiveTerminals();
+        this.push();
+        return { closed };
+      },
+    };
   }
 
   private bootstrap(): { state: SessionState; createdAt: string } {
@@ -129,6 +508,7 @@ export class SessionManager {
         planStatus: "drafting",
         planQuestions: [],
         planReadyProposal: null,
+        sessionKind: "delivery",
         approvalGrants: [],
         createdAt: now,
         updatedAt: now,
@@ -151,14 +531,19 @@ export class SessionManager {
     planStatus: SessionState["planStatus"];
     planQuestions: SessionState["planQuestions"];
     planReadyProposal: SessionState["planReadyProposal"];
+    sessionKind?: SessionState["sessionKind"];
     approvalGrants: SessionState["approvalGrants"];
     createdAt: string;
   }): { state: SessionState; createdAt: string } {
     const turns = this.storage.loadTurns(row.id);
     const mode = row.mode === "ask" ? "plan" : row.mode;
+    const sessionKindRaw = row.sessionKind ?? "delivery";
+    const sessionKind =
+      sessionKindRaw === "architecture" ? "delivery" : sessionKindRaw;
     const state: SessionState = {
       ...createEmptySessionState(row.id),
       mode,
+      sessionKind,
       workspace: row.workspace,
       planSteps: row.planSteps,
       planPhases: row.planPhases,
@@ -186,13 +571,25 @@ export class SessionManager {
   }
 
   listSessionSummaries(): SessionSummary[] {
-    return this.storage.listConversations().map((c) => ({
+    const root = this.state.workspace?.resolvedRootPath ?? null;
+    return this.conversationsForWorkspace(root).map((c) => ({
       id: c.id,
       title: c.title,
       updatedAt: c.updatedAt,
       workspaceName: c.workspace?.name ?? null,
-      phase: deriveProductPhase({ mode: c.mode, planStatus: c.planStatus }),
+      phase: deriveProductPhase({
+        mode: c.mode,
+        planStatus: c.planStatus,
+        sessionKind: c.sessionKind,
+      }),
     }));
+  }
+
+  private conversationsForWorkspace(root: string | null) {
+    return this.storage.listConversations().filter((c) => {
+      const path = c.workspace?.resolvedRootPath ?? null;
+      return path === root;
+    });
   }
 
   subscribe(listener: SessionListener): () => void {
@@ -220,10 +617,11 @@ export class SessionManager {
 
   private persist(): void {
     const now = new Date().toISOString();
+    const title = titleFromTurns(this.state.turns);
     this.storage.upsertConversation({
       id: this.state.sessionId,
       projectId: this.state.workspace?.projectId ?? "global",
-      title: titleFromTurns(this.state.turns),
+      title,
       mode: this.state.mode,
       workspace: this.state.workspace,
       planSteps: this.state.planSteps,
@@ -231,6 +629,7 @@ export class SessionManager {
       planStatus: this.state.planStatus,
       planQuestions: this.state.planQuestions,
       planReadyProposal: this.state.planReadyProposal,
+      sessionKind: this.state.sessionKind,
       approvalGrants: this.state.approvalGrants,
       createdAt: this.createdAt,
       updatedAt: now,
@@ -390,6 +789,7 @@ export class SessionManager {
       ...createEmptySessionState(id),
       workspace,
       mode: "plan",
+      sessionKind: "delivery",
       planStatus: "drafting",
       planPhases: [],
       planQuestions: [],
@@ -430,16 +830,21 @@ export class SessionManager {
   }
 
   closeSession(sessionId: string): SessionState {
-    const all = this.storage.listConversations();
-    if (all.length <= 1 && all[0]?.id === sessionId) {
-      // Always keep one session — reset it instead of deleting.
+    const root = this.state.workspace?.resolvedRootPath ?? null;
+    const scoped = this.conversationsForWorkspace(root);
+    if (scoped.length <= 1 && scoped[0]?.id === sessionId) {
+      // Always keep one session in this workspace — reset it instead of deleting.
       if (sessionId === this.state.sessionId && isBusy(this.state.status)) {
         this.cancel();
       }
+      const workspace = this.state.workspace;
       const id = randomUUID();
       const now = new Date().toISOString();
       this.storage.deleteConversation(sessionId);
-      this.state = createEmptySessionState(id);
+      this.state = {
+        ...createEmptySessionState(id),
+        workspace,
+      };
       this.createdAt = now;
       this.persist();
       this.push(true);
@@ -460,9 +865,9 @@ export class SessionManager {
       return this.state;
     }
 
-    // Closing active: pick another, then delete.
+    // Closing active: pick another in the same workspace, then delete.
     this.persist();
-    const remaining = all.filter((c) => c.id !== sessionId);
+    const remaining = scoped.filter((c) => c.id !== sessionId);
     const next = remaining[0]!;
     this.storage.deleteConversation(sessionId);
     const hydrated = this.hydrateFromRow(next);
@@ -593,33 +998,92 @@ export class SessionManager {
     };
     this.persist();
     this.push(true);
+
+    // Start Build used to leave the session idle until the user typed again —
+    // kick off execution immediately (fire-and-forget; do not block confirmPlan).
+    void this.sendMessage(
+      [
+        "Build mode is active. Begin executing the plan now.",
+        "Start with the first incomplete checklist item(s) using tools.",
+        "For short setup commands (e.g. npm init -y), use run_command immediately.",
+        "Do not wait for another instruction before taking the first action.",
+      ].join(" "),
+    );
+
     return { ok: true, state: this.state, branch: createdBranch };
   }
 
   openWorkspace(rootPath: string): WorkspaceRef {
+    if (isBusy(this.state.status)) {
+      this.cancel();
+    }
+    // Persist the current chat under its existing workspace — do not retarget it.
+    this.persist();
+    this.clearTerminalWaiters("dispose");
+    this.terminals.disposeAll();
+    void this.engine.detachWorkspace();
+
     const resolved = realpathSync(rootPath);
+    const recentMatch = this.listRecent().find((w) => {
+      try {
+        return realpathSync(w.rootPath) === resolved;
+      } catch {
+        return w.rootPath === rootPath || w.rootPath === resolved;
+      }
+    });
     const workspace: WorkspaceRef = {
-      projectId: randomUUID(),
+      projectId: recentMatch?.projectId ?? randomUUID(),
       rootPath,
       resolvedRootPath: resolved,
       name: basename(resolved),
     };
-    const notice = {
-      id: randomUUID(),
-      role: "assistant" as const,
-      content: `Workspace opened: **${workspace.name}**\n\`${workspace.resolvedRootPath}\`\n\nYou can describe a goal in the composer. Mode is currently **${this.state.mode}**.`,
-      createdAt: new Date().toISOString(),
-    };
-    this.state = {
-      ...this.state,
-      workspace,
-      status: "idle",
-      error: null,
-      turns: [...this.state.turns, notice],
-    };
+
+    const sameWorkspace = this.storage
+      .listConversations()
+      .filter((c) => c.workspace?.resolvedRootPath === resolved)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const delivery =
+      sameWorkspace.find((c) => (c.sessionKind ?? "delivery") !== "architecture") ??
+      null;
+
+    if (delivery) {
+      const hydrated = this.hydrateFromRow(delivery);
+      this.state = {
+        ...hydrated.state,
+        workspace,
+        status: "idle",
+        error: null,
+        liveTerminals: [],
+        pendingTerminalConfirm: null,
+        pendingTerminalAsk: null,
+      };
+      this.createdAt = hydrated.createdAt;
+    } else {
+      const id = randomUUID();
+      const now = new Date().toISOString();
+      const notice = {
+        id: randomUUID(),
+        role: "assistant" as const,
+        content: `Workspace opened: **${workspace.name}**\n\`${workspace.resolvedRootPath}\`\n\nYou can describe a goal in the composer. Mode is currently **plan**.`,
+        createdAt: now,
+      };
+      this.state = {
+        ...createEmptySessionState(id),
+        workspace,
+        mode: "plan",
+        sessionKind: "delivery",
+        turns: [notice],
+        liveTerminals: [],
+        pendingTerminalConfirm: null,
+        pendingTerminalAsk: null,
+      };
+      this.createdAt = now;
+    }
+
     this.recordRecent(workspace);
     this.persist();
     this.push(true);
+    void this.engine.attachWorkspace(workspace.resolvedRootPath);
     return workspace;
   }
 
@@ -646,6 +1110,8 @@ export class SessionManager {
     this.abort?.abort();
     this.abort = null;
     this.clearTokenFlush();
+    this.clearTerminalWaiters("cancel");
+    this.pausedTurn = null;
     this.state = {
       ...this.state,
       status: "idle",
@@ -654,6 +1120,8 @@ export class SessionManager {
       activityLabel: null,
       activeToolCallId: null,
       liveTools: [],
+      pendingTerminalConfirm: null,
+      pendingTerminalAsk: null,
     };
     this.persist();
     this.push();
@@ -666,6 +1134,7 @@ export class SessionManager {
     this.abort?.abort();
     this.abort = new AbortController();
     this.clearTokenFlush();
+    this.pausedTurn = null;
 
     const withAnswers = options?.planAnswers?.length
       ? applyPlanAnswers(this.state, options.planAnswers)
@@ -711,6 +1180,8 @@ export class SessionManager {
                 fs: new FilesystemService(root),
                 git: new GitService(root),
                 checkpoint: new CheckpointService(root, checkpointRoot),
+                terminals: this.terminalHost,
+                cbm: this.cbmHost,
                 audit: (entry: {
                   toolName: string;
                   action: string;
@@ -731,6 +1202,11 @@ export class SessionManager {
       });
 
       this.clearTokenFlush();
+      if (result.pause) {
+        this.pausedTurn = result.pause;
+      } else {
+        this.pausedTurn = null;
+      }
       this.state = {
         ...result.state,
         sequence: Math.max(this.state.sequence, result.state.sequence),
@@ -745,6 +1221,7 @@ export class SessionManager {
       this.push();
     } catch (error) {
       this.clearTokenFlush();
+      this.pausedTurn = null;
       this.state = {
         ...this.state,
         status: "error",
@@ -786,29 +1263,125 @@ export class SessionManager {
     });
   }
 
-  approve(approvalId: string, grantCategory: boolean): void {
+  async approve(approvalId: string, grantCategory: boolean): Promise<void> {
     const pending = this.state.pendingApprovals.find((a) => a.id === approvalId);
     if (!pending) return;
     const grants = [...this.state.approvalGrants];
     if (grantCategory) {
+      const name = pending.toolCall.name;
+      const category =
+        name === "git_commit"
+          ? "git_commit"
+          : name === "write_file"
+            ? "env_write"
+            : "command";
       grants.push({
         id: randomUUID(),
-        category: pending.toolCall.name,
+        category,
         grantedAt: new Date().toISOString(),
       });
     }
+
+    const pause =
+      this.pausedTurn && this.pausedTurn.approvalId === approvalId
+        ? this.pausedTurn
+        : null;
+    this.pausedTurn = null;
+
     this.state = {
       ...this.state,
       pendingApprovals: this.state.pendingApprovals.filter((a) => a.id !== approvalId),
       approvalGrants: grants,
-      status: "idle",
-      activityLabel: null,
+      status: pause ? "tool" : "idle",
+      activityLabel: pause ? "Running approved tool…" : null,
     };
     this.persist();
     this.push();
+
+    if (!pause) return;
+
+    this.abort?.abort();
+    this.abort = new AbortController();
+    try {
+      const provider = await this.createProvider();
+      const root = this.state.workspace?.resolvedRootPath;
+      const checkpointRoot = join(
+        app.getPath("userData"),
+        "checkpoints",
+        this.state.workspace?.projectId ?? "none",
+      );
+      const result = await resumeAgentTurn(this.state, pause, {
+        provider,
+        signal: this.abort.signal,
+        onProgress: (event) => this.handleProgress(event),
+        approvedCallId: pending.toolCall.id,
+        ...(root
+          ? {
+              toolCtx: {
+                workspaceRoot: root,
+                fs: new FilesystemService(root),
+                git: new GitService(root),
+                checkpoint: new CheckpointService(root, checkpointRoot),
+                terminals: this.terminalHost,
+                cbm: this.cbmHost,
+                audit: (entry: {
+                  toolName: string;
+                  action: string;
+                  payload?: unknown;
+                }) => {
+                  this.storage.insertAudit({
+                    id: randomUUID(),
+                    projectId: this.state.workspace?.projectId ?? "global",
+                    toolName: entry.toolName,
+                    action: entry.action,
+                    payload: entry.payload,
+                    createdAt: new Date().toISOString(),
+                  });
+                },
+              },
+            }
+          : {}),
+      });
+
+      this.clearTokenFlush();
+      if (result.pause) {
+        this.pausedTurn = result.pause;
+      } else {
+        this.pausedTurn = null;
+      }
+      this.state = {
+        ...result.state,
+        sequence: Math.max(this.state.sequence, result.state.sequence),
+        liveTools: [],
+        partialAssistantText: null,
+        activityLabel:
+          result.state.status === "awaiting_approval"
+            ? result.state.activityLabel
+            : null,
+      };
+      this.persist();
+      this.push();
+    } catch (error) {
+      this.clearTokenFlush();
+      this.pausedTurn = null;
+      this.state = {
+        ...this.state,
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+        partialAssistantText: null,
+        activityLabel: null,
+        activeToolCallId: null,
+        liveTools: [],
+      };
+      this.persist();
+      this.push();
+    }
   }
 
   reject(approvalId: string): void {
+    if (this.pausedTurn?.approvalId === approvalId) {
+      this.pausedTurn = null;
+    }
     this.state = {
       ...this.state,
       pendingApprovals: this.state.pendingApprovals.filter((a) => a.id !== approvalId),
@@ -839,5 +1412,12 @@ export class SessionManager {
       audit,
       note: "Secrets redacted. Share only with trusted support.",
     };
+  }
+
+  async dispose(): Promise<void> {
+    this.abort?.abort();
+    this.clearTerminalWaiters("dispose");
+    this.terminals.disposeAll();
+    await this.engine.detachWorkspace();
   }
 }

@@ -12,6 +12,14 @@ import {
   type PlanQaAnswer,
 } from "./components/PlanQaDialog";
 import { StartBuildDialog } from "./components/StartBuildDialog";
+import { NewProjectDialog } from "./components/NewProjectDialog";
+import {
+  ArchitecturePane,
+  modShiftHint,
+} from "./components/ArchitecturePane";
+import { TerminalConfirmBar } from "./components/TerminalConfirmBar";
+import { TerminalAskDialog } from "./components/TerminalAskDialog";
+import { EngineBanner } from "./components/EngineBanner";
 
 const ONBOARDING_KEY = "ai-ide-onboarding-complete";
 
@@ -50,13 +58,24 @@ export function App() {
   const [qaFocusRequestId, setQaFocusRequestId] = useState(0);
   const [qaDismissedKey, setQaDismissedKey] = useState<string | null>(null);
   const [startBuildOpen, setStartBuildOpen] = useState(false);
+  const [startBuildDismissedKey, setStartBuildDismissedKey] = useState<
+    string | null
+  >(null);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const [architecturePaneOpen, setArchitecturePaneOpen] = useState(false);
   const [gitStatus, setGitStatus] = useState<{
     isRepo: boolean;
     localBranch: string | null;
     remoteBranch: string | null;
+    hasRemote: boolean;
   } | null>(null);
   const composerRef = useRef<HTMLInputElement>(null);
   const lastAutoFocus = useRef<string | null>(null);
+
+  const liveTerminalCount = state?.liveTerminals?.length ?? 0;
+  useEffect(() => {
+    if (liveTerminalCount > 0) setVerifyTab("terminal");
+  }, [liveTerminalCount]);
 
   const openPlanQuestions = useMemo(
     () => (state?.planQuestions ?? []).filter((q) => q.status === "open"),
@@ -84,17 +103,51 @@ export function App() {
     setProviderOpen(true);
   }, []);
 
+  const openArchitecturePane = useCallback(() => {
+    setArchitecturePaneOpen(true);
+  }, []);
+
+  const closeArchitecturePane = useCallback(() => {
+    setArchitecturePaneOpen(false);
+  }, []);
+
+  const toggleArchitecturePane = useCallback(() => {
+    setArchitecturePaneOpen((open) => !open);
+  }, []);
   useEffect(() => {
     setQaDismissedKey(null);
     setQaOpen(false);
     setStartBuildOpen(false);
+    setStartBuildDismissedKey(null);
   }, [activeSessionId]);
 
   const planReady = Boolean(state?.planReadyProposal);
+  const planReadyKey = state?.planReadyProposal
+    ? `${state.sessionId}:${state.planReadyProposal.suggestedBranch}:${state.planReadyProposal.summary ?? ""}`
+    : null;
   const openStartBuild = useCallback(() => {
     if (!state?.planReadyProposal) return;
     setStartBuildOpen(true);
   }, [state?.planReadyProposal]);
+
+  // Auto-open Start Build when the agent proposes plan ready (same pattern as Plan Q&A).
+  useEffect(() => {
+    if (!planning || !planReady || !planReadyKey) {
+      if (!planReady) setStartBuildOpen(false);
+      return;
+    }
+    if (startBuildDismissedKey === planReadyKey) return;
+    if (qaOpen || providerOpen || newProjectOpen) return;
+    setStartBuildOpen(true);
+  }, [
+    planning,
+    planReady,
+    planReadyKey,
+    startBuildDismissedKey,
+    qaOpen,
+    providerOpen,
+    newProjectOpen,
+  ]);
 
   useEffect(() => {
     if (!planning || !planReady || startBuildOpen || qaOpen || providerOpen) {
@@ -146,7 +199,28 @@ export function App() {
 
   const createSession = useCallback(async () => {
     await getBridge()?.session.create();
+    requestAnimationFrame(() => {
+      const el = composerRef.current;
+      if (!el) return;
+      el.focus();
+      const len = el.value.length;
+      el.setSelectionRange(len, len);
+    });
   }, []);
+
+  // Focus composer whenever the active chat changes (new / switch).
+  useEffect(() => {
+    if (!activeSessionId) return;
+    const t = window.setTimeout(() => {
+      if (qaOpen) return;
+      const el = composerRef.current;
+      if (!el) return;
+      el.focus();
+      const len = el.value.length;
+      el.setSelectionRange(len, len);
+    }, 0);
+    return () => window.clearTimeout(t);
+  }, [activeSessionId, qaOpen]);
 
   useEffect(() => {
     function focusComposer() {
@@ -166,14 +240,22 @@ export function App() {
       ui?.onFocusComposer(focusComposer),
       ui?.onTogglePalette(() => setPaletteOpen((open) => !open)),
       ui?.onOpenWorkspace(() => void openWorkspace()),
+      ui?.onNewProject(() => setNewProjectOpen(true)),
       ui?.onNewSession(() => void createSession()),
       ui?.onOpenProvider(openProviderSettings),
+      ui?.onToggleArchitecture(toggleArchitecturePane),
     ];
 
     return () => {
       for (const unsub of unsubs) unsub?.();
     };
-  }, [qaOpen, openWorkspace, createSession, openProviderSettings]);
+  }, [
+    qaOpen,
+    openWorkspace,
+    createSession,
+    openProviderSettings,
+    toggleArchitecturePane,
+  ]);
 
   async function submitPlanAnswers(answers: PlanQaAnswer[]) {
     const content = formatPlanAnswersMessage(openPlanQuestions, answers);
@@ -230,6 +312,7 @@ export function App() {
             isRepo: false,
             localBranch: null,
             remoteBranch: null,
+            hasRemote: false,
           });
         }
       }
@@ -254,31 +337,19 @@ export function App() {
   const phase = state
     ? deriveProductPhase(state)
     : ("planning" as const);
+  const showArchitecturePane = architecturePaneOpen;
 
   return (
     <div
-      className={`app-shell ${phase === "planning" ? "app-shell-planning" : "app-shell-building"}`}
+      className={`app-shell ${
+        phase === "planning" ? "app-shell-planning" : "app-shell-building"
+      }`}
     >
       <header className="chrome">
         <div className="topbar">
           <div className="topbar-left">
             <strong className="brand">AI-First IDE</strong>
             <span className="status-pill">{state?.status ?? "idle"}</span>
-            {phase === "planning" ? (
-              <span
-                className="phase-banner phase-banner-planning"
-                title="Phase for this chat — plan is being created"
-              >
-                Plan mode · this chat
-              </span>
-            ) : (
-              <span
-                className="phase-banner phase-banner-building"
-                title="Phase for this chat — executing the agreed plan"
-              >
-                Build mode · this chat
-              </span>
-            )}
           </div>
           <div className="topbar-right">
             <button
@@ -287,7 +358,7 @@ export function App() {
               onClick={openProviderSettings}
               title={`Provider settings (${modShortcutHint("P")})`}
             >
-              Provider
+              Provider · {modShortcutHint("P")}
             </button>
             <button
               type="button"
@@ -295,7 +366,7 @@ export function App() {
               onClick={() => setPaletteOpen(true)}
               title={`Command palette (${modShortcutHint("K")})`}
             >
-              {modShortcutHint("K")}
+              Palette · {modShortcutHint("K")}
             </button>
           </div>
         </div>
@@ -315,21 +386,39 @@ export function App() {
             </div>
           ) : (
             <div className="workspace-bar-main">
-              <div className="workspace-bar-name muted">Nessun workspace aperto</div>
+              <div className="workspace-bar-name muted">No workspace open</div>
               <div className="workspace-bar-path">
-                Apri una cartella progetto per far operare l’agent nel perimetro corretto.
+                Open a project folder so the agent stays inside the correct perimeter.
               </div>
             </div>
           )}
-          <button
-            type="button"
-            className="btn workspace-bar-action"
-            title={`Open or change workspace (${modShortcutHint("O")})`}
-            onClick={() => void openWorkspace()}
-          >
-            {state?.workspace ? "Cambia…" : "Apri workspace"}{" "}
-            <kbd>{modShortcutHint("O")}</kbd>
-          </button>
+          <div className="workspace-bar-actions">
+            <button
+              type="button"
+              className={`btn workspace-bar-action ${showArchitecturePane ? "workspace-bar-action-active" : ""}`}
+              title={`Architecture settings (${modShiftHint("A")})`}
+              aria-pressed={showArchitecturePane}
+              onClick={toggleArchitecturePane}
+            >
+              Settings · {modShiftHint("A")}
+            </button>
+            <button
+              type="button"
+              className="btn workspace-bar-action"
+              title={`New project (${modShiftHint("N")})`}
+              onClick={() => setNewProjectOpen(true)}
+            >
+              New · {modShiftHint("N")}
+            </button>
+            <button
+              type="button"
+              className="btn workspace-bar-action"
+              title={`Open or change workspace (${modShortcutHint("O")})`}
+              onClick={() => void openWorkspace()}
+            >
+              {state?.workspace ? "Change" : "Open"} · {modShortcutHint("O")}
+            </button>
+          </div>
         </div>
 
         <div
@@ -359,8 +448,18 @@ export function App() {
                 <span className="git-bar-key">remote</span>
                 <span
                   className={`git-bar-value ${gitStatus.remoteBranch ? "" : "muted"}`}
+                  title={
+                    gitStatus.remoteBranch
+                      ? undefined
+                      : gitStatus.hasRemote
+                        ? "origin is set; upstream tracking appears after the first push"
+                        : "No git remote configured"
+                  }
                 >
-                  {gitStatus.remoteBranch ?? "not tracking"}
+                  {gitStatus.remoteBranch ??
+                    (gitStatus.hasRemote
+                      ? "push after first commit"
+                      : "no remote")}
                 </span>
               </span>
             </div>
@@ -369,6 +468,8 @@ export function App() {
 
         <ComposerBar state={state} inputRef={composerRef} />
       </header>
+
+      <EngineBanner hasWorkspace={Boolean(state?.workspace)} />
 
       <main className="cockpit">
         <section className="pane">
@@ -379,17 +480,25 @@ export function App() {
           />
         </section>
         <section className="pane">
-          <VerifyPane
-            state={state}
-            activeTab={verifyTab}
-            onTabChange={setVerifyTab}
-            planning={phase === "planning"}
-            onOpenQa={() => {
-              setQaDismissedKey(null);
-              setQaOpen(true);
-            }}
-            onConfirmPlan={openStartBuild}
-          />
+          {showArchitecturePane ? (
+            <ArchitecturePane
+              workspaceRoot={state?.workspace?.resolvedRootPath}
+              onClose={closeArchitecturePane}
+            />
+          ) : (
+            <VerifyPane
+              state={state}
+              activeTab={verifyTab}
+              onTabChange={setVerifyTab}
+              planning={phase === "planning"}
+              onOpenQa={() => {
+                setQaDismissedKey(null);
+                setQaOpen(true);
+              }}
+              onConfirmPlan={openStartBuild}
+              onOpenArchitecture={openArchitecturePane}
+            />
+          )}
         </section>
       </main>
 
@@ -399,16 +508,24 @@ export function App() {
         currentVerifyTab={verifyTab}
         planning={phase === "planning"}
         onOpenWorkspace={() => void openWorkspace()}
+        onNewProject={() => setNewProjectOpen(true)}
         onFocusComposer={() => {
           if (qaOpen) setQaFocusRequestId((n) => n + 1);
           else composerRef.current?.focus();
         }}
         onSetVerifyTab={setVerifyTab}
         onOpenProviderSettings={openProviderSettings}
+        onOpenArchitecture={openArchitecturePane}
       />
 
       <PlanQaDialog
-        open={qaOpen && qaEligible && !providerOpen && !startBuildOpen}
+        open={
+          qaOpen &&
+          qaEligible &&
+          !providerOpen &&
+          !startBuildOpen &&
+          !newProjectOpen
+        }
         questions={openPlanQuestions}
         focusRequestId={qaFocusRequestId}
         onClose={() => {
@@ -419,12 +536,15 @@ export function App() {
       />
 
       <StartBuildDialog
-        open={startBuildOpen && planReady && !providerOpen}
+        open={startBuildOpen && planReady && !providerOpen && !newProjectOpen}
         suggestedBranch={
           state?.planReadyProposal?.suggestedBranch ?? "feat/plan"
         }
         summary={state?.planReadyProposal?.summary}
-        onClose={() => setStartBuildOpen(false)}
+        onClose={() => {
+          setStartBuildOpen(false);
+          if (planReadyKey) setStartBuildDismissedKey(planReadyKey);
+        }}
         onConfirmed={() => {
           setStartBuildOpen(false);
           void getBridge()?.workspace.gitStatus().then((info) => {
@@ -432,6 +552,26 @@ export function App() {
           });
         }}
       />
+
+      <NewProjectDialog
+        open={newProjectOpen && !providerOpen}
+        onClose={() => setNewProjectOpen(false)}
+        onCreated={() => {
+          setNewProjectOpen(false);
+          setArchitecturePaneOpen(true);
+        }}
+      />
+
+      {state?.pendingTerminalConfirm ? (
+        <TerminalConfirmBar pending={state.pendingTerminalConfirm} />
+      ) : null}
+
+      {state?.pendingTerminalAsk &&
+      !state.pendingTerminalConfirm &&
+      !providerOpen &&
+      !newProjectOpen ? (
+        <TerminalAskDialog pending={state.pendingTerminalAsk} />
+      ) : null}
 
       <OnboardingWizard
         open={providerOpen || !onboarded}

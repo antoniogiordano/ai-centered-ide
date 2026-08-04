@@ -131,7 +131,7 @@ export function StartBuildDialog(props: Props) {
 
   return (
     <div
-      className="overlay qa-overlay start-build-overlay"
+      className="overlay palette-overlay qa-overlay start-build-overlay"
       role="presentation"
       onMouseDown={(e) => {
         if (e.target === e.currentTarget && !busy) onClose();

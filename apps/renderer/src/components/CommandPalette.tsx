@@ -19,14 +19,23 @@ function modHint(key: string): string {
   return isApple ? `⌘${key}` : `Ctrl+${key}`;
 }
 
+function modShiftHint(key: string): string {
+  const isApple =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  return isApple ? `⌘⇧${key}` : `Ctrl+Shift+${key}`;
+}
+
 export function CommandPalette(props: {
   open: boolean;
   onClose: () => void;
   currentVerifyTab: VerifyTab;
   onOpenWorkspace: () => void;
+  onNewProject?: () => void;
   onFocusComposer: () => void;
   onSetVerifyTab: (tab: VerifyTab) => void;
   onOpenProviderSettings?: () => void;
+  onOpenArchitecture?: () => void;
   planning?: boolean;
 }) {
   const {
@@ -34,9 +43,11 @@ export function CommandPalette(props: {
     onClose,
     currentVerifyTab,
     onOpenWorkspace,
+    onNewProject,
     onFocusComposer,
     onSetVerifyTab,
     onOpenProviderSettings,
+    onOpenArchitecture,
     planning = false,
   } = props;
 
@@ -74,12 +85,34 @@ export function CommandPalette(props: {
         onClose();
       },
     },
+    ...(onNewProject
+      ? [
+          {
+            id: "new-project",
+            label: "New project",
+            hint: modShiftHint("N"),
+            run: () => {
+              onNewProject();
+              onClose();
+            },
+          },
+        ]
+      : []),
     {
       id: "new-chat",
       label: "New chat",
       hint: modHint("N"),
       run: () => {
         void getBridge()?.session.create();
+        onClose();
+      },
+    },
+    {
+      id: "copy-chat",
+      label: "Copy open chat",
+      hint: modShiftHint("C"),
+      run: () => {
+        window.dispatchEvent(new CustomEvent("aifi:copy-open-chat"));
         onClose();
       },
     },
@@ -100,6 +133,19 @@ export function CommandPalette(props: {
             hint: modHint("P"),
             run: () => {
               onOpenProviderSettings();
+              onClose();
+            },
+          },
+        ]
+      : []),
+    ...(onOpenArchitecture
+      ? [
+          {
+            id: "architecture",
+            label: "Architecture settings",
+            hint: modShiftHint("A"),
+            run: () => {
+              onOpenArchitecture();
               onClose();
             },
           },

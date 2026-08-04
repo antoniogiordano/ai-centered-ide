@@ -19,7 +19,8 @@
   },
   "dependencies": {
     "@ai-ide/shared": "workspace:*",
-    "simple-git": "^3.27.0"
+    "simple-git": "^3.27.0",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "typescript": "^5.8.3",

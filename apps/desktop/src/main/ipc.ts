@@ -1,5 +1,6 @@
-import { ipcMain } from "electron";
+import { ipcMain, dialog, shell } from "electron";
 import {
+  AppError,
   IPC_CHANNELS,
   validateIpcRequest,
   type IpcRequestChannel,
@@ -12,17 +13,70 @@ import {
 import type { CredentialStore } from "@ai-ide/storage";
 import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
 import { assertHttpsForRemote } from "@ai-ide/provider";
-import { GitService } from "@ai-ide/workspace";
-import { dialog } from "electron";
+import {
+  GitService,
+  ArchitectureStore,
+  createEmptyProject,
+  GhCli,
+  validateProjectName,
+} from "@ai-ide/workspace";
+import { ARCHITECTURE_FILE_PATH } from "@ai-ide/shared";
 import type { SessionManager } from "./session.js";
 
 let invalidMessageCount = 0;
+
+function errorPayload(error: unknown): {
+  code:
+    | "VALIDATION_ERROR"
+    | "NOT_FOUND"
+    | "PERMISSION_DENIED"
+    | "PROVIDER_ERROR"
+    | "PROVIDER_TIMEOUT"
+    | "INTERNAL_ERROR"
+    | "KEYCHAIN_UNAVAILABLE";
+  userMessage: string;
+  technicalDetail: string;
+} {
+  if (error instanceof AppError) {
+    return {
+      code: error.code as
+        | "VALIDATION_ERROR"
+        | "NOT_FOUND"
+        | "PERMISSION_DENIED"
+        | "PROVIDER_ERROR"
+        | "PROVIDER_TIMEOUT"
+        | "INTERNAL_ERROR"
+        | "KEYCHAIN_UNAVAILABLE",
+      userMessage: error.userMessage,
+      technicalDetail: error.technicalDetail,
+    };
+  }
+  return {
+    code: "INTERNAL_ERROR",
+    userMessage: "Something went wrong.",
+    technicalDetail: error instanceof Error ? error.message : String(error),
+  };
+}
 
 export function registerIpcHandlers(
   session: SessionManager,
   credentials: CredentialStore,
   storage: ProjectStorage,
 ): void {
+  const gh = new GhCli({
+    openUrl: (url) => shell.openExternal(url),
+  });
+  let githubLoginAbort: AbortController | null = null;
+
+  function githubStatusPayload() {
+    return gh.status().then((status) => ({
+      installed: status.installed,
+      authenticated: status.authenticated,
+      login: status.login,
+      owners: status.owners,
+      detail: status.detail,
+    }));
+  }
   ipcMain.handle(IPC_CHANNELS.SESSION_GET, () => ({
     state: session.getState(),
     sessions: session.listSessionSummaries(),
@@ -95,9 +149,9 @@ export function registerIpcHandlers(
     return { accepted: true };
   });
 
-  ipcMain.handle(IPC_CHANNELS.SESSION_APPROVE, (_event, payload) => {
+  ipcMain.handle(IPC_CHANNELS.SESSION_APPROVE, async (_event, payload) => {
     const req = safeValidate(IPC_CHANNELS.SESSION_APPROVE, payload);
-    session.approve(req.approvalId, req.grantCategory);
+    await session.approve(req.approvalId, req.grantCategory);
     return { state: session.getState() };
   });
 
@@ -105,6 +159,53 @@ export function registerIpcHandlers(
     const req = safeValidate(IPC_CHANNELS.SESSION_REJECT, payload);
     session.reject(req.approvalId);
     return { state: session.getState() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_TERMINAL_CONFIRM, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.SESSION_TERMINAL_CONFIRM, payload);
+    session.resolveTerminalConfirm(
+      req.confirmId,
+      req.action,
+      req.text,
+    );
+    return { state: session.getState() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_TERMINAL_CONFIRM_EDIT, (_event, payload) => {
+    const req = safeValidate(
+      IPC_CHANNELS.SESSION_TERMINAL_CONFIRM_EDIT,
+      payload,
+    );
+    session.editTerminalConfirm(req.confirmId, req.text);
+    return { state: session.getState() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_TERMINAL_ASK, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.SESSION_TERMINAL_ASK, payload);
+    session.resolveTerminalAsk({
+      askId: req.askId,
+      selectedOptionId: req.selectedOptionId ?? null,
+      text: req.text,
+      cancelled: req.cancelled,
+    });
+    return { state: session.getState() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.TERMINAL_LIST, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.TERMINAL_LIST, payload ?? {});
+    return { terminals: session.listLiveTerminals() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.TERMINAL_WRITE_USER, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.TERMINAL_WRITE_USER, payload);
+    session.writeUserTerminal(req.terminalId, req.text);
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.TERMINAL_RESIZE, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.TERMINAL_RESIZE, payload);
+    session.resizeTerminal(req.terminalId, req.cols, req.rows);
+    return { ok: true };
   });
 
   ipcMain.handle(IPC_CHANNELS.SESSION_CANCEL, (_event, payload) => {
@@ -135,6 +236,69 @@ export function registerIpcHandlers(
     return { workspace, canceled: false };
   });
 
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_PICK_DIRECTORY, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.WORKSPACE_PICK_DIRECTORY, payload ?? {});
+    const result = await dialog.showOpenDialog({
+      properties: ["openDirectory", "createDirectory"],
+    });
+    if (result.canceled || !result.filePaths[0]) {
+      return { path: null, canceled: true };
+    }
+    return { path: result.filePaths[0], canceled: false };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_CREATE_PROJECT, async (_event, payload) => {
+    try {
+      const req = safeValidate(IPC_CHANNELS.WORKSPACE_CREATE_PROJECT, payload);
+      validateProjectName(req.name);
+      const projectPath = await createEmptyProject(req.parentPath, req.name);
+      const git = new GitService(projectPath);
+      const mode = req.github?.mode ?? "skip";
+      let githubRepoUrl: string | undefined;
+
+      if (mode === "remote_url") {
+        const url = req.github?.remoteUrl?.trim();
+        if (!url) {
+          throw new AppError({
+            code: "VALIDATION_ERROR",
+            userMessage: "Remote URL is required.",
+            technicalDetail: "missing remoteUrl",
+          });
+        }
+        await git.addRemote("origin", url);
+        githubRepoUrl = url;
+      } else if (mode === "create") {
+        const repoName = validateProjectName(
+          req.github?.repoName?.trim() || req.name,
+        );
+        const owner = req.github?.owner?.trim();
+        if (!owner) {
+          throw new AppError({
+            code: "VALIDATION_ERROR",
+            userMessage: "Choose a GitHub account or organization.",
+            technicalDetail: "missing owner",
+          });
+        }
+        const repo = await gh.createRepo({
+          cwd: projectPath,
+          name: repoName,
+          owner,
+          private: req.github?.private ?? true,
+        });
+        githubRepoUrl = repo.htmlUrl || repo.cloneUrl;
+      }
+
+      const workspace = session.openWorkspace(projectPath);
+      return {
+        ok: true,
+        workspace,
+        ...(githubRepoUrl ? { githubRepoUrl } : {}),
+      };
+    } catch (error) {
+      return { ok: false, error: errorPayload(error) };
+    }
+  });
+
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_LIST_RECENT, () => ({
     workspaces: session.listRecent(),
   }));
@@ -143,7 +307,12 @@ export function registerIpcHandlers(
     safeValidate(IPC_CHANNELS.WORKSPACE_GIT_STATUS, payload ?? {});
     const root = session.getState().workspace?.resolvedRootPath;
     if (!root) {
-      return { isRepo: false, localBranch: null, remoteBranch: null };
+      return {
+        isRepo: false,
+        localBranch: null,
+        remoteBranch: null,
+        hasRemote: false,
+      };
     }
     const info = await new GitService(root).branchInfo();
     if (!info.isRepo) {
@@ -169,6 +338,112 @@ export function registerIpcHandlers(
       branches,
       current: info.localBranch,
     };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_GET, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_GET, payload ?? {});
+    const root = session.getState().workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        path: ARCHITECTURE_FILE_PATH,
+        exists: false,
+        fromFile: false,
+        profile: null,
+      };
+    }
+    const store = new ArchitectureStore(root);
+    const view = store.loadEffective();
+    if (view.error) {
+      return {
+        path: view.path,
+        exists: view.exists,
+        fromFile: false,
+        profile: null,
+        error: view.error,
+      };
+    }
+    return {
+      path: view.path,
+      exists: view.exists,
+      fromFile: view.fromFile,
+      profile: view.effective,
+      derived: view.derived,
+      overrides: view.overrides,
+      intent: view.intent,
+      drift: view.drift,
+    };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_DETECT, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_DETECT, payload ?? {});
+    const root = session.getState().workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        path: ARCHITECTURE_FILE_PATH,
+        fromFile: false,
+        profile: {
+          version: 1 as const,
+          runtimes: [],
+          meta: { updatedAt: new Date().toISOString(), sources: {} },
+        },
+      };
+    }
+    const store = new ArchitectureStore(root);
+    const view = store.loadEffective();
+    return {
+      path: view.path,
+      fromFile: view.fromFile,
+      profile: view.derived,
+      intent: view.intent,
+      drift: view.drift,
+    };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_SAVE, (_event, payload) => {
+    try {
+      const req = safeValidate(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_SAVE, payload);
+      const root = session.getState().workspace?.resolvedRootPath;
+      if (!root) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR" as const,
+            userMessage: "Open a workspace before saving architecture.",
+            technicalDetail: "no workspace",
+          },
+        };
+      }
+      const store = new ArchitectureStore(root);
+      const source = req.confirm ? "user_confirmed" : "agent_proposed";
+      let profile;
+      if (req.profile) {
+        profile = store.save(req.profile, source, req.intent);
+      } else if (req.patch) {
+        profile = store.savePatch(req.patch, source, req.intent);
+      } else if (req.intent !== undefined) {
+        profile = store.saveIntent(req.intent, source);
+      } else {
+        const draft = store.loadOrDetect().profile;
+        profile = store.save(draft, source);
+      }
+      const view = store.loadEffective();
+      return {
+        ok: true,
+        profile,
+        intent: view.intent,
+        drift: view.drift,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR" as const,
+          userMessage: "Could not save architecture profile.",
+          technicalDetail:
+            error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
   });
 
   ipcMain.handle(IPC_CHANNELS.PROVIDER_VERIFY, async (_event, payload) => {
@@ -232,6 +507,74 @@ export function registerIpcHandlers(
     };
   });
 
+  ipcMain.handle(IPC_CHANNELS.GITHUB_STATUS, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.GITHUB_STATUS, payload ?? {});
+    return githubStatusPayload();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.GITHUB_LOGOUT, async (_event, payload) => {
+    try {
+      const req = safeValidate(IPC_CHANNELS.GITHUB_LOGOUT, payload ?? {});
+      await gh.logout(req.user ?? null);
+      return {
+        ok: true,
+        status: await githubStatusPayload(),
+      };
+    } catch (error) {
+      return { ok: false, error: errorPayload(error) };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.GITHUB_LOGIN_WEB, async (_event, payload) => {
+    try {
+      safeValidate(IPC_CHANNELS.GITHUB_LOGIN_WEB, payload ?? {});
+      if (githubLoginAbort) {
+        githubLoginAbort.abort();
+        githubLoginAbort = null;
+      }
+      githubLoginAbort = new AbortController();
+      const signal = githubLoginAbort.signal;
+      await gh.loginWeb(signal);
+      githubLoginAbort = null;
+      return {
+        ok: true,
+        status: await githubStatusPayload(),
+      };
+    } catch (error) {
+      githubLoginAbort = null;
+      return { ok: false, error: errorPayload(error) };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.GITHUB_LOGIN_TOKEN, async (_event, payload) => {
+    try {
+      const req = safeValidate(IPC_CHANNELS.GITHUB_LOGIN_TOKEN, payload);
+      if (githubLoginAbort) {
+        githubLoginAbort.abort();
+        githubLoginAbort = null;
+      }
+      githubLoginAbort = new AbortController();
+      await gh.loginWithToken(req.token, githubLoginAbort.signal);
+      githubLoginAbort = null;
+      return {
+        ok: true,
+        status: await githubStatusPayload(),
+      };
+    } catch (error) {
+      githubLoginAbort = null;
+      return { ok: false, error: errorPayload(error) };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.GITHUB_LOGIN_CANCEL, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.GITHUB_LOGIN_CANCEL, payload ?? {});
+    if (githubLoginAbort) {
+      githubLoginAbort.abort();
+      githubLoginAbort = null;
+    }
+    return { canceled: true };
+  });
+
   ipcMain.on(IPC_CHANNELS.SESSION_SUBSCRIBE, (event) => {
     const unsubscribe = session.subscribe((payload) => {
       const update: SessionUpdateEvent = {
@@ -241,6 +584,82 @@ export function registerIpcHandlers(
         activeSessionId: payload.activeSessionId,
       };
       event.sender.send(`${IPC_CHANNELS.SESSION_SUBSCRIBE}:update`, update);
+    });
+    event.sender.once("destroyed", unsubscribe);
+  });
+
+  ipcMain.on(IPC_CHANNELS.TERMINAL_SUBSCRIBE, (event) => {
+    const unsubscribe = session.subscribeTerminalChunks((chunk) => {
+      event.sender.send(`${IPC_CHANNELS.TERMINAL_SUBSCRIBE}:data`, chunk);
+    });
+    event.sender.once("destroyed", unsubscribe);
+  });
+
+  const engine = session.getEngine();
+
+  ipcMain.handle(IPC_CHANNELS.ENGINE_STATUS, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.ENGINE_STATUS, payload ?? {});
+    return engine.getStatus();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.ENGINE_ENSURE, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.ENGINE_ENSURE, payload ?? {});
+    try {
+      await engine.ensureInstalled();
+      return { ok: true, status: engine.getStatus() };
+    } catch (error) {
+      return {
+        ok: false,
+        status: engine.getStatus(),
+        error: errorPayload(error),
+      };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.ENGINE_INDEX, async (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.ENGINE_INDEX, payload ?? {});
+    try {
+      await engine.startIndexing({
+        ...(req.mode ? { mode: req.mode } : {}),
+      });
+      return { ok: true, status: engine.getStatus() };
+    } catch (error) {
+      return {
+        ok: false,
+        status: engine.getStatus(),
+        error: errorPayload(error),
+      };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.ENGINE_INDEX_CANCEL, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.ENGINE_INDEX_CANCEL, payload ?? {});
+    engine.cancelIndexing();
+    return { status: engine.getStatus() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.ENGINE_INDEX_REFRESH, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.ENGINE_INDEX_REFRESH, payload ?? {});
+    try {
+      await engine.refreshIndexState();
+      return { ok: true, status: engine.getStatus() };
+    } catch (error) {
+      return {
+        ok: false,
+        status: engine.getStatus(),
+        error: errorPayload(error),
+      };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.ENGINE_STDERR, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.ENGINE_STDERR, payload ?? {});
+    return { stderr: engine.getStderrTail() };
+  });
+
+  ipcMain.on(IPC_CHANNELS.ENGINE_SUBSCRIBE, (event) => {
+    const unsubscribe = engine.subscribe((status) => {
+      event.sender.send(`${IPC_CHANNELS.ENGINE_SUBSCRIBE}:update`, status);
     });
     event.sender.once("destroyed", unsubscribe);
   });

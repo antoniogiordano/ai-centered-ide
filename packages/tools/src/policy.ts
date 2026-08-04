@@ -27,8 +27,16 @@ const TOOL_RISK: Record<string, RiskLevel> = {
   git_status: "safe",
   git_diff: "safe",
   write_file: "reversible",
+  upsert_architecture: "safe",
+  read_architecture: "safe",
   git_commit: "sensitive",
   run_command: "sensitive",
+  terminal_open: "safe",
+  terminal_list: "safe",
+  terminal_read: "safe",
+  terminal_write: "reversible",
+  terminal_ask: "reversible",
+  terminal_close: "safe",
   checkpoint_restore: "reversible",
 };
 

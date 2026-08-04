@@ -21,7 +21,7 @@ try {
 }
 
 const force = process.argv.includes("--force");
-const stamp = `electron@${electronVersion}:better-sqlite3,keytar`;
+const stamp = `electron@${electronVersion}:better-sqlite3,keytar,node-pty`;
 
 if (!force && existsSync(stampPath) && readFileSync(stampPath, "utf8").trim() === stamp) {
   console.log(`Native modules already built for Electron ${electronVersion}`);
@@ -51,10 +51,11 @@ function rebuild(moduleDir, only) {
 
 let result = rebuild("packages/storage", "better-sqlite3");
 if (result.status !== 0) {
-  result = rebuild(".", "better-sqlite3,keytar");
+  result = rebuild(".", "better-sqlite3,keytar,node-pty");
   if (result.status !== 0) process.exit(result.status ?? 1);
 } else {
-  rebuild("apps/desktop", "keytar");
+  const desktop = rebuild("apps/desktop", "keytar,node-pty");
+  if (desktop.status !== 0) process.exit(desktop.status ?? 1);
 }
 
 mkdirSync(dirname(stampPath), { recursive: true });

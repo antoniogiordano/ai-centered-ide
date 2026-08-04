@@ -43,6 +43,7 @@ export class GitService {
     isRepo: boolean;
     localBranch: string | null;
     remoteBranch: string | null;
+    hasRemote: boolean;
   }> {
     try {
       // Prefer rev-parse: more reliable than checkIsRepo across simple-git versions
@@ -51,7 +52,12 @@ export class GitService {
         await this.git.raw(["rev-parse", "--is-inside-work-tree"])
       ).trim();
       if (inside !== "true") {
-        return { isRepo: false, localBranch: null, remoteBranch: null };
+        return {
+          isRepo: false,
+          localBranch: null,
+          remoteBranch: null,
+          hasRemote: false,
+        };
       }
 
       let localBranch: string | null = null;
@@ -73,6 +79,14 @@ export class GitService {
         }
       }
 
+      let hasRemote = false;
+      try {
+        const remotes = await this.git.getRemotes();
+        hasRemote = remotes.length > 0;
+      } catch {
+        hasRemote = false;
+      }
+
       let remoteBranch: string | null = null;
       try {
         const upstream = (
@@ -89,14 +103,19 @@ export class GitService {
         remoteBranch = null;
       }
 
-      return { isRepo: true, localBranch, remoteBranch };
+      return { isRepo: true, localBranch, remoteBranch, hasRemote };
     } catch (error) {
       console.warn(
         "[git] branchInfo failed for",
         this.workspaceRoot,
         error instanceof Error ? error.message : error,
       );
-      return { isRepo: false, localBranch: null, remoteBranch: null };
+      return {
+        isRepo: false,
+        localBranch: null,
+        remoteBranch: null,
+        hasRemote: false,
+      };
     }
   }
 
@@ -172,6 +191,28 @@ export class GitService {
 
   async createAndCheckoutBranch(name: string): Promise<void> {
     await this.git.checkoutLocalBranch(name);
+  }
+
+  /** Initialize a new repository with default branch `main`. */
+  async init(): Promise<void> {
+    await this.git.raw(["init", "-b", "main"]);
+  }
+
+  async hasRemote(name: string): Promise<boolean> {
+    const remotes = await this.git.getRemotes();
+    return remotes.some((r) => r.name === name);
+  }
+
+  async addRemote(name: string, url: string): Promise<void> {
+    if (await this.hasRemote(name)) {
+      await this.git.remote(["set-url", name, url]);
+      return;
+    }
+    await this.git.addRemote(name, url);
+  }
+
+  async setRemoteUrl(name: string, url: string): Promise<void> {
+    await this.git.remote(["set-url", name, url]);
   }
 }
 

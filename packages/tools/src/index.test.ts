@@ -74,11 +74,14 @@ describe("phase tool gating", () => {
         "search_text",
         "upsert_plan",
         "propose_plan_ready",
+        "read_architecture",
+        "upsert_architecture",
       ]),
     );
     expect(names).not.toContain("write_file");
     expect(names).not.toContain("git_status");
     expect(names).not.toContain("run_command");
+    expect(names).not.toContain("terminal_open");
   });
 
   it("building exposes implementation tools", () => {
@@ -89,7 +92,14 @@ describe("phase tool gating", () => {
         "write_file",
         "git_status",
         "run_command",
+        "terminal_open",
+        "terminal_write",
+        "terminal_ask",
+        "terminal_read",
+        "search_graph",
+        "get_code_snippet",
         "upsert_plan",
+        "read_architecture",
       ]),
     );
     expect(names).not.toContain("propose_plan_ready");

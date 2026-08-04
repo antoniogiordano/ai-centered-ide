@@ -30,7 +30,8 @@
       "better-sqlite3",
       "electron",
       "esbuild",
-      "keytar"
+      "keytar",
+      "node-pty"
     ]
   }
 }

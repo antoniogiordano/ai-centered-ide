@@ -19,7 +19,8 @@
     "@ai-ide/tools": "workspace:*",
     "@ai-ide/workspace": "workspace:*",
     "electron": "^36.4.0",
-    "keytar": "^7.9.0"
+    "keytar": "^7.9.0",
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.29",

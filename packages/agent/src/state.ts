@@ -10,6 +10,10 @@ import type {
   Turn,
 } from "@ai-ide/shared";
 import { createEmptySessionState } from "@ai-ide/shared";
+import {
+  formatArchitectureForPrompt,
+} from "@ai-ide/shared";
+import { ArchitectureStore } from "@ai-ide/workspace";
 
 export type TurnPhase =
   | "idle"
@@ -74,7 +78,7 @@ export class TurnStateMachine {
   }
 }
 
-export const MAX_ITERATIONS = 25;
+export const MAX_ITERATIONS = 12;
 export const MAX_CONSECUTIVE_TOOL_FAILURES = 3;
 export const MAX_SAME_TOOL_STREAK = 8;
 
@@ -125,7 +129,8 @@ function formatPlanForPrompt(state: SessionState): string {
 
 export function buildSystemPrompt(state: SessionState): string {
   const root = state.workspace?.resolvedRootPath ?? state.workspace?.rootPath;
-  const planning = state.mode === "plan" || state.planStatus === "drafting";
+  const phase = productPhaseForState(state);
+  const planning = phase === "planning";
 
   const identity = [
     "You are the product manager of this AI-First IDE.",
@@ -136,42 +141,75 @@ export function buildSystemPrompt(state: SessionState): string {
   const workspaceLine = root
     ? [
         `Active workspace root: ${root}`,
-        "All file tool paths are relative to that workspace root (never absolute OS paths).",
-        'Examples: list_dir with path "." ; read_file with path "README.md".',
+        "Paths are relative to the workspace root (never absolute OS paths).",
+        "When the codebase index is ready, prefer graph tools: search_graph, get_code_snippet, trace_path, get_architecture, search_code.",
+        "When the index is not ready, use list_dir / read_file / search_text as fallback.",
       ]
     : [
         "No workspace is open yet. Ask the user to open a project folder before reading files.",
       ];
 
+  const architectureBlock = (() => {
+    if (!root) return formatArchitectureForPrompt(null);
+    try {
+      const view = new ArchitectureStore(root).loadOrDetect();
+      return formatArchitectureForPrompt(view.profile, {
+        intent: view.intent,
+        drift: view.drift,
+        fromFile: view.fromFile,
+      });
+    } catch {
+      return formatArchitectureForPrompt(null);
+    }
+  })();
+
   const planningRules = [
     "PHASE: PLANNING — the plan is being created (not executed).",
-    "Available tools: list_dir, read_file, search_text, upsert_plan, propose_plan_ready.",
-    "Unavailable: write_file, git_*, run_command, checkpoint_restore.",
+    "Available tools: codebase graph tools (when indexed) OR list_dir/read_file/search_text (fallback), plus read_architecture, upsert_architecture, upsert_plan, propose_plan_ready.",
+    "Unavailable: write_file, git_*, run_command, terminal_*, checkpoint_restore.",
+    "IMPORTANT: Never tell the user you cannot run shell commands. Commands run only after Start Build. When the user asks to run npm/git/shell now, call propose_plan_ready so the IDE can switch to Build — then you will get run_command / terminal_*.",
+    "",
+    architectureBlock,
+    "",
+    "Stack & dependencies:",
+    "- Call read_architecture early for detected stack + ARCHITECTURE.md intent/overrides.",
+    "- Prefer search_graph / get_architecture over dumping whole files when the index is ready.",
+    "- Declare languages, frameworks, and packages in the plan (phases/checklist + clarifying questions). Do not invent a parallel Architecture chat.",
+    "- Do NOT install packages in planning. Installs happen in DEVELOPMENT via run_command / terminal_* after the user starts build.",
+    "- Use upsert_architecture only for sparse intent/overrides when detection is wrong — never dump the whole stack into the file.",
     "",
     "Plan structure (CRUD only — no progress tracking yet):",
     "- Use upsert_plan to create/update/remove phases and checklist item texts.",
     "- Do NOT mark checklist items done. Do NOT set phase status to completed/failed/skipped. Progress marking starts only after development begins.",
     "- Checklist items are a draft outline of work, not a live todo board.",
     "",
-    "Clarifying questions (critical — UI dialog; USER answers, never you):",
-    "- Questions exist only to refine the plan with necessary details.",
-    "- ALWAYS put open questions in upsert_plan.questions (never only in chat prose).",
+    "Clarifying questions (critical — dedicated Plan Q&A dialog; USER answers there, never you):",
+    "- ALWAYS put open questions in upsert_plan.questions. NEVER ask multiple-choice / A-B-C questions only in chat prose — the Plan Q&A UI will not open.",
     "- EVERY question MUST include selection: \"single\" OR \"multiple\", plus 2–8 concrete options[{id,label}].",
-    "- Leave status=\"open\". Do NOT invent answers.",
-    "- Prefer 1–3 open questions per turn.",
+    "- Leave status=\"open\". Do NOT invent answers. Do NOT re-ask in prose after upsert_plan.",
+    "- Prefer 1–3 open questions per turn. If the user already answered or said to skip and just run something, clear questions=[] and proceed.",
+    "- Chat may briefly say that the Plan Q&A dialog is open — do not paste the options as a numbered list in the message.",
     "",
     "Turn discipline (critical):",
-    "1) First broad request: lightly explore the repo, then upsert_plan with draft phases + checklist texts + open questions. Do NOT dump a full analysis essay.",
-    "2) After user answers: reshape phases/checklist via upsert_plan; ask remaining questions if needed.",
+    "1) First broad request: lightly explore the repo, then upsert_plan with draft phases + checklist texts + open questions if needed. Do NOT dump a full analysis essay.",
+    "2) After user answers (or says to proceed / only run a command): upsert_plan to reshape; if they want execution now, call propose_plan_ready.",
     "3) Never implement, rewrite files, or pretend development has started.",
-    "4) When the plan is solid AND all open questions are answered, call propose_plan_ready with a short suggestedBranch (feat/kebab-case, not too long) derived from the plan. The IDE will ask the user to confirm and optionally create that branch — do NOT start building yourself.",
-    "5) Do NOT call propose_plan_ready while questions remain open or the plan is still thin.",
+    "4) When the user explicitly wants to run shell/npm/git (e.g. \"npm init\", \"install\", \"just initialize\"): keep a minimal plan focused on that, set questions=[], then call propose_plan_ready immediately. Do not keep interviewing.",
+    "5) Otherwise, when the plan is solid AND all open questions are answered, call propose_plan_ready with a short suggestedBranch (feat/kebab-case). The IDE opens Start Build — do NOT start building yourself.",
+    "6) Do NOT call propose_plan_ready while upsert_plan.questions still has status=open items.",
     formatPlanForPrompt(state),
   ];
 
   const buildRules = [
-    "PHASE: DEVELOPMENT — now you may mark checklist progress.",
-    "The plan structure was agreed in planning. Implement it phase by phase using tools (including write/git/commands).",
+    "PHASE: DEVELOPMENT — now you may mark checklist progress and run commands.",
+    architectureBlock,
+    "The plan structure was agreed in planning. Implement it phase by phase using tools (including write/git/commands/terminals).",
+    "On the first build turn after Start Build: take action immediately — run tools for the first incomplete checklist item. Do not only acknowledge Build mode.",
+    "Code reading: use search_graph → get_code_snippet / trace_path when indexed; do not invent qualified_name values — take them from search results.",
+    "When the user asks to run a command: DO IT with run_command (one-shot) or terminal_open + terminal_write (interactive). Prefer run_command for npm init / short installs.",
+    "Never claim you cannot execute shell commands in this phase — you can.",
+    "One-shot commands: run_command. Interactive / long-running shells: terminal_open → terminal_write (user gets 3s confirm/edit) → terminal_read. When the user must choose interactively, use terminal_ask.",
+    "Install packages when the plan calls for them (never during planning).",
     "After meaningful progress, call upsert_plan to mark checklist items done=true and update phase status.",
     "Keep the plan truthful: only mark items done when the work is actually done.",
     "When all phases are completed, say so clearly.",
@@ -723,8 +761,9 @@ export type PlanMutationPatch = {
 };
 
 export function productPhaseForState(
-  state: Pick<SessionState, "mode" | "planStatus">,
+  state: Pick<SessionState, "mode" | "planStatus" | "sessionKind">,
 ): "planning" | "building" {
+  void state.sessionKind;
   if (state.mode === "plan" || state.planStatus === "drafting") return "planning";
   return "building";
 }

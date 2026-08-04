@@ -18,6 +18,8 @@ import {
   type ApprovalCategory,
 } from "./policy.js";
 import type { ToolRegistry } from "./registry.js";
+import type { TerminalHost } from "./terminal-host.js";
+import type { CbmHost } from "./cbm-host.js";
 
 export type ToolExecutionContext = {
   workspaceRoot: string;
@@ -33,6 +35,12 @@ export type ToolExecutionContext = {
   }) => void;
   redact: (value: unknown) => unknown;
   approvedCategories: Set<ApprovalCategory>;
+  /** Skip approval for these tool call ids (one-shot after user approve). */
+  oneShotApprovedIds?: Set<string>;
+  /** Interactive multi-PTY host (desktop). Optional in tests. */
+  terminals?: TerminalHost;
+  /** Codebase-memory-mcp host (desktop). Optional until indexed. */
+  cbm?: CbmHost;
 };
 
 export type GatewayResult =
@@ -72,6 +80,30 @@ export class ToolGateway {
     if (call.name === "write_file" && String(parsed.data.path ?? "").includes(".env")) {
       category = "env_write";
     }
+
+    const oneShot =
+      ctx.oneShotApprovedIds?.has(call.id) === true ||
+      ctx.approvedCategories.has(category);
+
+    const describeApproval = (fallback: string): string => {
+      if (call.name === "run_command") {
+        const cmd = String(parsed.data.command ?? "");
+        return `Run command:\n${cmd}`;
+      }
+      if (call.name === "git_commit") {
+        return `Create commit:\n${String(parsed.data.message ?? "")}`;
+      }
+      if (call.name === "write_file") {
+        return `Write file: ${String(parsed.data.path ?? "")}`;
+      }
+      try {
+        const args = JSON.stringify(parsed.data, null, 2);
+        return `${fallback}\n\nArguments:\n${args.slice(0, 2000)}`;
+      } catch {
+        return fallback;
+      }
+    };
+
     if (call.name === "run_command") {
       const cmd = String(parsed.data.command ?? "");
       const analysis = analyzeCommand(cmd);
@@ -82,7 +114,7 @@ export class ToolGateway {
           technicalDetail: analysis.matchedDeny ?? cmd,
         });
       }
-      if (analysis.needsApproval && !ctx.approvedCategories.has("command")) {
+      if (analysis.needsApproval && !oneShot) {
         const decision = evaluatePolicy({
           mode: ctx.mode,
           toolName: call.name,
@@ -94,7 +126,7 @@ export class ToolGateway {
           return {
             status: "approval_required",
             approvalId: randomUUID(),
-            description: decision.description,
+            description: describeApproval(decision.description),
             call: { ...call, riskLevel },
           };
         }
@@ -110,11 +142,11 @@ export class ToolGateway {
     });
 
     if ("requiresApproval" in decision && decision.requiresApproval) {
-      if (!ctx.approvedCategories.has(category)) {
+      if (!oneShot) {
         return {
           status: "approval_required",
           approvalId: randomUUID(),
-          description: decision.description,
+          description: describeApproval(decision.description),
           call: { ...call, riskLevel },
         };
       }
@@ -156,7 +188,11 @@ export class ToolGateway {
         result: {
           callId: call.id,
           success: false,
-          summary: "Tool execution failed.",
+          summary:
+            error instanceof Error
+              ? error.message.split("\n").find((l) => l.trim()) ||
+                "Tool execution failed."
+              : "Tool execution failed.",
           error: error instanceof Error ? error.message : String(error),
         },
       };
