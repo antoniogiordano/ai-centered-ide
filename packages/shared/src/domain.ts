@@ -59,6 +59,14 @@ export const PlanReadyProposalSchema = z.object({
 });
 export type PlanReadyProposal = z.infer<typeof PlanReadyProposalSchema>;
 
+/** Offer a local commit after the build checklist is fully done. */
+export const BuildCommitOfferSchema = z.object({
+  offeredAt: z.string().datetime(),
+  branch: z.string().nullable(),
+  files: z.array(z.string()).default([]),
+});
+export type BuildCommitOffer = z.infer<typeof BuildCommitOfferSchema>;
+
 export const PlanQuestionOptionSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
@@ -170,6 +178,8 @@ export const SessionStateSchema = z.object({
   planQuestions: z.array(PlanQuestionSchema).default([]),
   /** Set when the agent calls propose_plan_ready; cleared on start build. */
   planReadyProposal: PlanReadyProposalSchema.nullable().default(null),
+  /** Set when build checklist is complete; cleared on commit or dismiss. */
+  buildCommitOffer: BuildCommitOfferSchema.nullable().default(null),
   pendingApprovals: z.array(
     z.object({
       id: z.string().min(1),
@@ -231,6 +241,57 @@ export function deriveProductPhase(state: {
   }
   return "building";
 }
+
+export function planHasOpenWork(state: {
+  planPhases: Array<{
+    status: string;
+    checklist: Array<{ done: boolean }>;
+  }>;
+}): boolean {
+  if (!state.planPhases.length) return false;
+  return state.planPhases.some(
+    (phase) =>
+      phase.status === "pending" ||
+      phase.status === "in_progress" ||
+      phase.status === "failed" ||
+      phase.checklist.some((item) => !item.done),
+  );
+}
+
+/** True when an executing build plan has no remaining open work. */
+export function planBuildComplete(state: {
+  planStatus: string;
+  planPhases: Array<{
+    status: string;
+    checklist: Array<{ done: boolean }>;
+  }>;
+}): boolean {
+  if (state.planStatus !== "executing") return false;
+  if (!state.planPhases.length) return false;
+  return !planHasOpenWork(state);
+}
+
+export function planChecklistProgress(state: {
+  planPhases: Array<{ checklist: Array<{ done: boolean }> }>;
+}): { done: number; total: number } {
+  let done = 0;
+  let total = 0;
+  for (const phase of state.planPhases) {
+    for (const item of phase.checklist) {
+      total += 1;
+      if (item.done) done += 1;
+    }
+  }
+  return { done, total };
+}
+
+/** Composer / Continue button message when build stalls with open checklist. */
+export const CHECKLIST_CONTINUE_USER_MESSAGE =
+  "Continue: update the checklist (mark finished items done via upsert_plan), then implement the next open checklist item with tools. Do not only narrate.";
+
+/** Resume planning when the agent stalled without a ready proposal or open Q&A. */
+export const PLAN_CONTINUE_USER_MESSAGE =
+  "Continue planning: call upsert_plan with concrete phases + checklist items, and open clarifying questions (with options) if anything is unclear. When the plan is solid and questions are cleared, call propose_plan_ready. Do not only narrate.";
 
 export const SessionSummarySchema = z.object({
   id: z.string().min(1),
@@ -298,6 +359,7 @@ export function createEmptySessionState(sessionId: string): SessionState {
     planStatus: "drafting",
     planQuestions: [],
     planReadyProposal: null,
+    buildCommitOffer: null,
     pendingApprovals: [],
     approvalGrants: [],
     activeToolCallId: null,

@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { ensureMonacoEnvironment } from "../lib/monacoEnv";
+import { reportUiError } from "../lib/uiErrors";
 
 type Props = {
   value: string;
@@ -7,24 +9,43 @@ type Props = {
   onChange?: (value: string) => void;
 };
 
+type MonacoApi = typeof import("monaco-editor");
+type MonacoEditorInstance = import("monaco-editor").editor.IStandaloneCodeEditor;
+
 /**
  * Monaco loaded on demand (Phase 7.8). Default read-only; explicit edit mode via readOnly=false.
  */
 export function MonacoEditor(props: Props) {
   const { value, path, readOnly = true, onChange } = props;
   const hostRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<MonacoEditorInstance | null>(null);
+  const monacoRef = useRef<MonacoApi | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
     let disposed = false;
-    let editor: { dispose: () => void } | null = null;
 
     async function boot() {
       try {
+        await ensureMonacoEnvironment();
         const monaco = await import("monaco-editor");
         if (disposed || !hostRef.current) return;
-        editor = monaco.editor.create(hostRef.current, {
+        monacoRef.current = monaco;
+
+        // File preview does not need language-service diagnostics (avoids worker storms).
+        monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
+          noSemanticValidation: true,
+          noSyntaxValidation: true,
+          noSuggestionDiagnostics: true,
+        });
+        monaco.languages.typescript.javascriptDefaults.setDiagnosticsOptions({
+          noSemanticValidation: true,
+          noSyntaxValidation: true,
+          noSuggestionDiagnostics: true,
+        });
+
+        const editor = monaco.editor.create(hostRef.current, {
           value,
           language: languageFromPath(path),
           readOnly,
@@ -32,25 +53,58 @@ export function MonacoEditor(props: Props) {
           minimap: { enabled: false },
           fontSize: 13,
           automaticLayout: true,
+          wordWrap: "on",
+          scrollBeyondLastLine: false,
         });
+        editorRef.current = editor;
+
         if (!readOnly && onChange) {
-          const model = (editor as unknown as { getModel: () => { onDidChangeContent: (cb: () => void) => void; getValue: () => string } | null }).getModel();
-          model?.onDidChangeContent(() => {
-            onChange(model.getValue());
+          editor.onDidChangeModelContent(() => {
+            onChange(editor.getValue());
           });
         }
         setReady(true);
+        setError(null);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        const message = err instanceof Error ? err.message : String(err);
+        setError(message);
+        reportUiError({
+          title: "Editor failed to load",
+          message,
+          ...(err instanceof Error && err.stack
+            ? { detail: err.stack }
+            : {}),
+          source: "monaco",
+        });
       }
     }
 
     void boot();
     return () => {
       disposed = true;
-      editor?.dispose();
+      editorRef.current?.dispose();
+      editorRef.current = null;
     };
+    // Recreate when path/readOnly changes; value synced below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, readOnly]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || !ready) return;
+    if (editor.getValue() !== value) {
+      editor.setValue(value);
+    }
+  }, [value, ready]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    if (!editor || !monaco || !ready) return;
+    const model = editor.getModel();
+    if (!model) return;
+    monaco.editor.setModelLanguage(model, languageFromPath(path));
+  }, [path, ready]);
 
   if (error) {
     return (
@@ -65,7 +119,7 @@ export function MonacoEditor(props: Props) {
   return (
     <div className="monaco-host">
       {!ready ? <div className="empty-state">Loading editor…</div> : null}
-      <div ref={hostRef} style={{ height: "100%", minHeight: 280 }} />
+      <div ref={hostRef} style={{ height: "100%", minHeight: 160 }} />
     </div>
   );
 }

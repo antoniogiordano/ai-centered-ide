@@ -17,7 +17,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "list_dir",
     description:
-      "List files and folders in a workspace directory. Paths are relative to the workspace root. Use path \".\" for the root.",
+      "List files and folders in a workspace directory (hides node_modules/.git/dist/…). Paths are relative to the workspace root. Use path \".\" for the root. Prefer this over shell ls.",
     riskLevel: "safe",
     phases: READ_TOOLS,
     argsSchema: z.object({
@@ -36,7 +36,23 @@ export function registerStarterTools(registry: ToolRegistry): void {
     },
     execute: async (args, ctx) => {
       const path = String(args.path ?? ".");
-      const entries = ctx.fs.listDetailed(path);
+      const HIDDEN = new Set([
+        "node_modules",
+        ".git",
+        "dist",
+        "out",
+        "build",
+        "coverage",
+        ".next",
+        ".turbo",
+        ".cache",
+        "__pycache__",
+        ".venv",
+        "venv",
+      ]);
+      const entries = ctx.fs
+        .listDetailed(path)
+        .filter((e) => !HIDDEN.has(e.name) && !e.name.startsWith(".env"));
       return {
         summary: `Listed ${path} (${entries.length} entries)`,
         output: entries,
@@ -74,7 +90,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "upsert_plan",
     description:
-      "Create or replace the delivery plan. Planning: CRUD phases + checklist texts + clarifying questions for the Plan Q&A dialog (never ask those questions only in chat prose). Building: mark checklist done and phase status. Always pass the full phases array. Pass questions=[] to clear open questions.",
+      "Update the delivery plan. Planning: CRUD phases + checklist texts + clarifying questions for the Plan Q&A dialog (never ask those questions only in chat prose). Building: structure is LOCKED — only set checklist done and phase status (same phase/item ids and texts; no add/remove/rename). After EACH completed item, call with that item done=true. Always pass the full phases array.",
     riskLevel: "safe",
     phases: PLANNING_AND_BUILDING,
     argsSchema: z.object({
@@ -87,7 +103,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
         phases: {
           type: "array",
           description:
-            "Ordered delivery phases. In planning only title+checklist text matter (done/status ignored). In building, set done and status for progress.",
+            "Ordered delivery phases. Planning: title + checklist text. Building: same structure as agreed — only change status and checklist done (ids/titles/texts must match).",
           items: {
             type: "object",
             properties: {
@@ -594,7 +610,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "run_command",
     description:
-      "Run a one-shot shell command (buffered, timeout + tree kill). Prefer terminal_* for interactive/long-running processes.",
+      "Run a one-shot shell command (buffered, timeout + tree kill). Prefer terminal_* for interactive/long-running processes. Do NOT list node_modules/.git/dist (output is stripped); use list_dir or targeted paths instead of ls -R.",
     riskLevel: "sensitive",
     phases: BUILDING_ONLY,
     argsSchema: z.object({
@@ -624,7 +640,9 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
       });
       const summary = result.timedOut
         ? `Timed out: ${args.command}`
-        : `Exit ${result.exitCode}: ${args.command}`;
+        : result.truncated
+          ? `Exit ${result.exitCode}: ${args.command} (output sanitized/truncated)`
+          : `Exit ${result.exitCode}: ${args.command}`;
       return { summary, output: result };
     },
   });
@@ -704,14 +722,20 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
       if (!ctx.terminals) {
         throw new Error("Interactive terminals are not available in this environment.");
       }
+      const { sanitizeCommandOutput } = await import("./command-output.js");
       const result = ctx.terminals.read(String(args.terminalId), {
         ...(typeof args.maxChars === "number" ? { maxChars: args.maxChars } : {}),
       });
+      const cleaned = sanitizeCommandOutput(result.output ?? "");
       return {
         summary: `Read terminal ${result.status}${
           result.exitCode !== null ? ` exit=${result.exitCode}` : ""
-        }`,
-        output: result,
+        }${cleaned.truncated ? " (sanitized)" : ""}`,
+        output: {
+          ...result,
+          output: cleaned.text,
+          truncated: cleaned.truncated,
+        },
       };
     },
   });

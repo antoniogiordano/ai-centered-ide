@@ -7,7 +7,7 @@ import type {
   SessionSummary,
   WorkspaceRef,
 } from "@ai-ide/shared";
-import { createEmptySessionState, deriveProductPhase } from "@ai-ide/shared";
+import { createEmptySessionState, deriveProductPhase, planHasOpenWork, planBuildComplete, CHECKLIST_CONTINUE_USER_MESSAGE, PLAN_CONTINUE_USER_MESSAGE } from "@ai-ide/shared";
 import type { ProjectStorage } from "@ai-ide/storage";
 import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
 import {
@@ -890,6 +890,9 @@ export class SessionManager {
   async confirmPlan(input: {
     createBranch: boolean;
     branchName?: string;
+    baseBranch?: string;
+    dirtyStrategy?: "stash" | "commit_base";
+    baseCommitMessage?: string;
   }): Promise<{
     ok: boolean;
     state?: SessionState;
@@ -908,6 +911,7 @@ export class SessionManager {
     }
 
     let createdBranch: string | null = null;
+    let branchNote = "";
     if (input.createBranch) {
       const normalized = normalizeFeatBranchName(input.branchName ?? "");
       if (!normalized) {
@@ -953,17 +957,84 @@ export class SessionManager {
           },
         };
       }
-      try {
-        await git.createAndCheckoutBranch(normalized);
-        createdBranch = normalized;
-      } catch (error) {
+      const base = input.baseBranch?.trim() || info.localBranch;
+      if (!base) {
         return {
           ok: false,
           error: {
             code: "VALIDATION_ERROR",
-            userMessage: "Could not create the branch.",
-            technicalDetail:
-              error instanceof Error ? error.message : String(error),
+            userMessage: "Select a base branch to start from.",
+            technicalDetail: "missing base branch",
+          },
+        };
+      }
+      if (!(await git.localBranchExists(base))) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: `Base branch "${base}" was not found locally.`,
+            technicalDetail: "missing base branch",
+          },
+        };
+      }
+      const dirty = await git.isDirty();
+      if (dirty && !input.dirtyStrategy) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage:
+              "The working tree has uncommitted changes. Choose stash or commit on the base branch.",
+            technicalDetail: "DIRTY_STRATEGY_REQUIRED",
+          },
+        };
+      }
+      if (
+        dirty &&
+        input.dirtyStrategy === "commit_base" &&
+        !input.baseCommitMessage?.trim()
+      ) {
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: "Enter a commit message for the base branch checkpoint.",
+            technicalDetail: "missing base commit message",
+          },
+        };
+      }
+      try {
+        const result = await git.createFeatBranchHandlingDirty({
+          name: normalized,
+          base,
+          ...(input.dirtyStrategy
+            ? { dirtyStrategy: input.dirtyStrategy }
+            : {}),
+          ...(input.baseCommitMessage
+            ? { baseCommitMessage: input.baseCommitMessage }
+            : {}),
+        });
+        createdBranch = normalized;
+        if (result.stashed) {
+          branchNote = ` Stashed uncommitted work; branched from last commit on \`${base}\`.`;
+        } else if (result.committedOnBase) {
+          branchNote = ` Committed checkpoint on \`${base}\`, then created \`${normalized}\`.`;
+        } else if (base !== info.localBranch) {
+          branchNote = ` From \`${base}\`.`;
+        }
+      } catch (error) {
+        const detail =
+          error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage:
+              detail === "DIRTY_STRATEGY_REQUIRED"
+                ? "The working tree has uncommitted changes. Choose stash or commit on the base branch."
+                : "Could not create the branch.",
+            technicalDetail: detail,
           },
         };
       }
@@ -985,7 +1056,7 @@ export class SessionManager {
       id: randomUUID(),
       role: "assistant" as const,
       content: createdBranch
-        ? `Plan confirmed. Switched to **Build** on \`${createdBranch}\`.`
+        ? `Plan confirmed. Switched to **Build** on \`${createdBranch}\`.${branchNote}`
         : "Plan confirmed. Switched to **Build** (current branch).",
       createdAt: new Date().toISOString(),
     };
@@ -995,6 +1066,7 @@ export class SessionManager {
       turns: [...started.state.turns, notice],
       status: "idle",
       error: null,
+      buildCommitOffer: null,
     };
     this.persist();
     this.push(true);
@@ -1219,6 +1291,12 @@ export class SessionManager {
       };
       this.persist();
       this.push();
+      // Never auto-rekick after errors / approvals — user must Resume.
+      if (result.state.status === "idle" && !result.state.error) {
+        if (!this.maybeTankContinueBuild()) {
+          void this.maybeOfferBuildCommit();
+        }
+      }
     } catch (error) {
       this.clearTokenFlush();
       this.pausedTurn = null;
@@ -1234,6 +1312,262 @@ export class SessionManager {
       this.persist();
       this.push();
     }
+  }
+
+  /**
+   * Safety net: if a turn ends idle while tank work remains (and there is no
+   * provider error / Stop), kick the agent again. Waits for the user when Plan
+   * Q&A is open or Start Build is pending.
+   * @returns true when a continue message was dispatched.
+   */
+  private maybeTankContinueBuild(): boolean {
+    if (this.state.status !== "idle") return false;
+    if (this.state.error) return false;
+    if (this.state.pendingApprovals.length > 0) return false;
+    const phase = deriveProductPhase(this.state);
+    if (phase === "building") {
+      if (!planHasOpenWork(this.state)) return false;
+      void this.sendMessage(CHECKLIST_CONTINUE_USER_MESSAGE);
+      return true;
+    }
+    if (phase === "planning") {
+      if (this.state.mode !== "plan") return false;
+      if (this.state.planReadyProposal) return false;
+      if (this.state.planQuestions.some((q) => q.status === "open")) return false;
+      void this.sendMessage(PLAN_CONTINUE_USER_MESSAGE);
+      return true;
+    }
+    return false;
+  }
+
+  /** After a finished build, offer a local commit when there are changes. */
+  private async maybeOfferBuildCommit(): Promise<void> {
+    if (this.state.status !== "idle") return;
+    if (this.state.error) return;
+    if (this.state.buildCommitOffer) return;
+    if (!planBuildComplete(this.state)) return;
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) return;
+    try {
+      const git = new GitService(root);
+      const status = await git.status();
+      const files = [
+        ...new Set([...status.modified, ...status.not_added]),
+      ].filter(Boolean);
+      if (files.length === 0) return;
+      this.state = {
+        ...this.state,
+        buildCommitOffer: {
+          offeredAt: new Date().toISOString(),
+          branch: status.current || null,
+          files,
+        },
+      };
+      this.push();
+    } catch {
+      /* ignore git errors */
+    }
+  }
+
+  async draftBuildCommitMessage(): Promise<{
+    ok: boolean;
+    message?: string;
+    branch?: string | null;
+    files?: string[];
+    error?: { code: string; userMessage: string; technicalDetail: string };
+  }> {
+    const offer = this.state.buildCommitOffer;
+    if (!offer) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "No completed build commit is pending.",
+          technicalDetail: "missing buildCommitOffer",
+        },
+      };
+    }
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Open a workspace first.",
+          technicalDetail: "no workspace",
+        },
+      };
+    }
+
+    const phases = this.state.planPhases
+      .map(
+        (p) =>
+          `- ${p.title}: ${p.checklist.map((c) => c.text).join("; ")}`,
+      )
+      .join("\n");
+    const fileList = offer.files.slice(0, 40).join("\n");
+    const focusFiles = offer.files.slice(0, 25).join(", ");
+
+    try {
+      const provider = await this.createProvider();
+      const messages = [
+        {
+          role: "system" as const,
+          content: [
+            "You write short git commit messages for a completed feature build.",
+            "Reply with ONLY the commit message text — no quotes, no markdown fences, no preamble.",
+            "Prefer conventional commits when it fits (feat:/fix:/chore:).",
+            "Keep it to 1–2 sentences, under 120 characters for the subject when possible.",
+          ].join("\n"),
+        },
+        {
+          role: "user" as const,
+          content: [
+            `Branch: ${offer.branch ?? "unknown"}`,
+            "Completed plan:",
+            phases || "(no phases)",
+            "",
+            "Changed files:",
+            fileList || "(none listed)",
+            "",
+            `Focus files: ${focusFiles}`,
+          ].join("\n"),
+        },
+      ];
+      let text = "";
+      for await (const chunk of provider.chat(messages)) {
+        if (chunk.type === "content") text += chunk.delta;
+        if (chunk.type === "error") {
+          return {
+            ok: false,
+            error: {
+              code: chunk.error.code,
+              userMessage: chunk.error.userMessage,
+              technicalDetail: chunk.error.technicalDetail,
+            },
+          };
+        }
+      }
+      const message = text
+        .trim()
+        .replace(/^```[\s\S]*?\n/, "")
+        .replace(/```$/, "")
+        .replace(/^["']|["']$/g, "")
+        .trim();
+      if (!message) {
+        return {
+          ok: false,
+          error: {
+            code: "PROVIDER_ERROR",
+            userMessage: "The model returned an empty commit message.",
+            technicalDetail: "empty draft",
+          },
+        };
+      }
+      return {
+        ok: true,
+        message: message.slice(0, 4000),
+        branch: offer.branch,
+        files: offer.files,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          code: "PROVIDER_ERROR",
+          userMessage: "Could not draft a commit message.",
+          technicalDetail:
+            error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+  }
+
+  async commitBuild(message: string): Promise<{
+    ok: boolean;
+    commit?: string;
+    state?: SessionState;
+    error?: { code: string; userMessage: string; technicalDetail: string };
+  }> {
+    const trimmed = message.trim();
+    if (!trimmed) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Enter a commit message.",
+          technicalDetail: "empty message",
+        },
+      };
+    }
+    if (!this.state.buildCommitOffer) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "No completed build commit is pending.",
+          technicalDetail: "missing buildCommitOffer",
+        },
+      };
+    }
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Open a workspace first.",
+          technicalDetail: "no workspace",
+        },
+      };
+    }
+    try {
+      const git = new GitService(root);
+      const staged = await git.stageAllChanges();
+      if (staged.length === 0) {
+        this.state = { ...this.state, buildCommitOffer: null };
+        this.push();
+        return {
+          ok: false,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: "Nothing to commit — working tree is clean.",
+            technicalDetail: "no staged files",
+          },
+        };
+      }
+      const commit = await git.commit(trimmed);
+      const notice = {
+        id: randomUUID(),
+        role: "assistant" as const,
+        content: `Committed on \`${this.state.buildCommitOffer.branch ?? "HEAD"}\`: ${trimmed}`,
+        createdAt: new Date().toISOString(),
+      };
+      this.state = {
+        ...this.state,
+        buildCommitOffer: null,
+        turns: [...this.state.turns, notice],
+      };
+      this.persist();
+      this.push();
+      return { ok: true, commit, state: this.state };
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Git commit failed.",
+          technicalDetail:
+            error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+  }
+
+  dismissBuildCommit(): { ok: boolean; state: SessionState } {
+    this.state = { ...this.state, buildCommitOffer: null };
+    this.push();
+    return { ok: true, state: this.state };
   }
 
   private async createProvider() {
@@ -1361,6 +1695,12 @@ export class SessionManager {
       };
       this.persist();
       this.push();
+      // Never auto-rekick after errors / approvals — user must Resume.
+      if (result.state.status === "idle" && !result.state.error) {
+        if (!this.maybeTankContinueBuild()) {
+          void this.maybeOfferBuildCommit();
+        }
+      }
     } catch (error) {
       this.clearTokenFlush();
       this.pausedTurn = null;

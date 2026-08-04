@@ -16,6 +16,9 @@ import {
   type SessionListResponse,
   type SessionSendMessageResponse,
   type SessionConfirmPlanResponse,
+  type SessionDraftBuildCommitResponse,
+  type SessionCommitBuildResponse,
+  type SessionDismissBuildCommitResponse,
   type SessionSetModeResponse,
   type SessionSwitchResponse,
   type SessionUpdateEvent,
@@ -26,12 +29,16 @@ import {
   type WorkspaceCreateProjectResponse,
   type WorkspaceGitStatusResponse,
   type WorkspaceListBranchesResponse,
+  type WorkspaceListDirResponse,
   type WorkspaceArchitectureGetResponse,
   type WorkspaceArchitectureDetectResponse,
   type WorkspaceArchitectureSaveResponse,
   type WorkspaceListRecentResponse,
   type WorkspaceOpenResponse,
   type WorkspacePickDirectoryResponse,
+  type WorkspaceReadFileResponse,
+  type WorkspaceDiffFilesResponse,
+  type WorkspaceDiffFileResponse,
 } from "@ai-ide/shared";
 
 export type DesktopBridge = {
@@ -56,7 +63,13 @@ export type DesktopBridge = {
     confirmPlan: (input: {
       createBranch: boolean;
       branchName?: string;
+      baseBranch?: string;
+      dirtyStrategy?: "stash" | "commit_base";
+      baseCommitMessage?: string;
     }) => Promise<SessionConfirmPlanResponse>;
+    draftBuildCommit: () => Promise<SessionDraftBuildCommitResponse>;
+    commitBuild: (message: string) => Promise<SessionCommitBuildResponse>;
+    dismissBuildCommit: () => Promise<SessionDismissBuildCommitResponse>;
     approve: (approvalId: string, grantCategory?: boolean) => Promise<void>;
     reject: (approvalId: string, reason?: string) => Promise<void>;
     terminalConfirm: (
@@ -98,6 +111,10 @@ export type DesktopBridge = {
     listRecent: () => Promise<WorkspaceListRecentResponse>;
     gitStatus: () => Promise<WorkspaceGitStatusResponse>;
     listBranches: () => Promise<WorkspaceListBranchesResponse>;
+    listDir: (path?: string) => Promise<WorkspaceListDirResponse>;
+    readFile: (path: string) => Promise<WorkspaceReadFileResponse>;
+    diffFiles: () => Promise<WorkspaceDiffFilesResponse>;
+    diffFile: (path: string) => Promise<WorkspaceDiffFileResponse>;
     architectureGet: () => Promise<WorkspaceArchitectureGetResponse>;
     architectureDetect: () => Promise<WorkspaceArchitectureDetectResponse>;
     architectureSave: (input: {
@@ -182,6 +199,12 @@ const bridge: DesktopBridge = {
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_SET_MODE, { mode }),
     confirmPlan: (input) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_CONFIRM_PLAN, input),
+    draftBuildCommit: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT, {}),
+    commitBuild: (message) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_COMMIT_BUILD, { message }),
+    dismissBuildCommit: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT, {}),
     approve: (approvalId, grantCategory = false) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_APPROVE, {
         approvalId,
@@ -259,6 +282,16 @@ const bridge: DesktopBridge = {
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_STATUS, {}),
     listBranches: () =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_BRANCHES, {}),
+    listDir: (path) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_DIR, {
+        path: path ?? ".",
+      }),
+    readFile: (path) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_READ_FILE, { path }),
+    diffFiles: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_DIFF_FILES, {}),
+    diffFile: (path) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_DIFF_FILE, { path }),
     architectureGet: () =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_GET, {}),
     architectureDetect: () =>

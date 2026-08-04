@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { platform } from "node:os";
+import { sanitizeCommandStreams } from "./command-output.js";
 
 export type PtyRunOptions = {
   command: string;
@@ -14,7 +15,11 @@ export type PtyRunResult = {
   exitCode: number | null;
   timedOut: boolean;
   pid: number | undefined;
+  truncated?: boolean;
 };
+
+/** Hard cap while collecting so a runaway `ls -R` cannot OOM the process. */
+const COLLECT_CAP_CHARS = 512_000;
 
 /**
  * One-shot command runner with process-tree kill on timeout.
@@ -38,38 +43,64 @@ export async function runCommand(options: PtyRunOptions): Promise<PtyRunResult> 
 
     let stdout = "";
     let stderr = "";
+    let collectTruncated = false;
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
       killTree(child.pid);
     }, timeoutMs);
 
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
+    const append = (target: "stdout" | "stderr", chunk: Buffer): void => {
+      const next = chunk.toString("utf8");
+      if (target === "stdout") {
+        if (stdout.length >= COLLECT_CAP_CHARS) {
+          collectTruncated = true;
+          return;
+        }
+        stdout += next;
+        if (stdout.length > COLLECT_CAP_CHARS) {
+          stdout = stdout.slice(0, COLLECT_CAP_CHARS);
+          collectTruncated = true;
+        }
+      } else {
+        if (stderr.length >= COLLECT_CAP_CHARS) {
+          collectTruncated = true;
+          return;
+        }
+        stderr += next;
+        if (stderr.length > COLLECT_CAP_CHARS) {
+          stderr = stderr.slice(0, COLLECT_CAP_CHARS);
+          collectTruncated = true;
+        }
+      }
+    };
+
+    child.stdout?.on("data", (chunk: Buffer) => append("stdout", chunk));
+    child.stderr?.on("data", (chunk: Buffer) => append("stderr", chunk));
 
     child.on("close", (code) => {
       clearTimeout(timer);
+      const cleaned = sanitizeCommandStreams(stdout, stderr);
       resolve({
-        stdout,
-        stderr,
+        stdout: cleaned.stdout,
+        stderr: cleaned.stderr,
         exitCode: code,
         timedOut,
         pid: child.pid,
+        truncated: cleaned.truncated || collectTruncated,
       });
     });
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      const cleaned = sanitizeCommandStreams(stdout, stderr + String(err));
       resolve({
-        stdout,
-        stderr: stderr + String(err),
+        stdout: cleaned.stdout,
+        stderr: cleaned.stderr,
         exitCode: 1,
         timedOut,
         pid: child.pid,
+        truncated: cleaned.truncated || collectTruncated,
       });
     });
   });

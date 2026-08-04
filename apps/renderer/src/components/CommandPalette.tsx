@@ -1,16 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { getBridge } from "../bridge";
-import type { VerifyTab } from "./Cockpit";
-
-const VERIFY_TABS: { id: VerifyTab; label: string }[] = [
-  { id: "plan", label: "Plan" },
-  { id: "browser", label: "Browser" },
-  { id: "diff", label: "Diff" },
-  { id: "files", label: "Files" },
-  { id: "environment", label: "Environment" },
-  { id: "tests", label: "Tests" },
-  { id: "terminal", label: "Terminal" },
-];
 
 function modHint(key: string): string {
   const isApple =
@@ -29,26 +18,20 @@ function modShiftHint(key: string): string {
 export function CommandPalette(props: {
   open: boolean;
   onClose: () => void;
-  currentVerifyTab: VerifyTab;
   onOpenWorkspace: () => void;
   onNewProject?: () => void;
   onFocusComposer: () => void;
-  onSetVerifyTab: (tab: VerifyTab) => void;
   onOpenProviderSettings?: () => void;
   onOpenArchitecture?: () => void;
-  planning?: boolean;
 }) {
   const {
     open,
     onClose,
-    currentVerifyTab,
     onOpenWorkspace,
     onNewProject,
     onFocusComposer,
-    onSetVerifyTab,
     onOpenProviderSettings,
     onOpenArchitecture,
-    planning = false,
   } = props;
 
   const inputRef = useRef<HTMLInputElement>(null);
@@ -151,19 +134,6 @@ export function CommandPalette(props: {
           },
         ]
       : []),
-    ...(planning
-      ? []
-      : VERIFY_TABS.map((tab) => ({
-          id: `tab-${tab.id}`,
-          label: `Open ${tab.label}`,
-          ...(tab.id === currentVerifyTab
-            ? { hint: "Current tab" as const }
-            : {}),
-          run: () => {
-            onSetVerifyTab(tab.id);
-            onClose();
-          },
-        }))),
   ];
 
   const filtered = q

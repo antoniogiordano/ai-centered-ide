@@ -27,9 +27,13 @@ import type {
   WorkspaceCreateProjectResponse,
   WorkspaceGitStatusResponse,
   WorkspaceListBranchesResponse,
+  WorkspaceListDirResponse,
   WorkspaceListRecentResponse,
   WorkspaceOpenResponse,
   WorkspacePickDirectoryResponse,
+  WorkspaceReadFileResponse,
+  WorkspaceDiffFilesResponse,
+  WorkspaceDiffFileResponse,
 } from "@ai-ide/shared";
 
 export type DesktopBridge = {
@@ -54,7 +58,23 @@ export type DesktopBridge = {
     confirmPlan: (input: {
       createBranch: boolean;
       branchName?: string;
+      baseBranch?: string;
+      dirtyStrategy?: "stash" | "commit_base";
+      baseCommitMessage?: string;
     }) => Promise<SessionConfirmPlanResponse>;
+    draftBuildCommit: () => Promise<{
+      ok: boolean;
+      message?: string;
+      branch?: string | null;
+      files?: string[];
+      error?: { code: string; userMessage: string; technicalDetail: string };
+    }>;
+    commitBuild: (message: string) => Promise<{
+      ok: boolean;
+      commit?: string;
+      error?: { code: string; userMessage: string; technicalDetail: string };
+    }>;
+    dismissBuildCommit: () => Promise<{ ok: boolean }>;
     approve: (approvalId: string, grantCategory?: boolean) => Promise<void>;
     reject: (approvalId: string, reason?: string) => Promise<void>;
     terminalConfirm?: (
@@ -96,6 +116,10 @@ export type DesktopBridge = {
     listRecent: () => Promise<WorkspaceListRecentResponse>;
     gitStatus: () => Promise<WorkspaceGitStatusResponse>;
     listBranches: () => Promise<WorkspaceListBranchesResponse>;
+    listDir: (path?: string) => Promise<WorkspaceListDirResponse>;
+    readFile: (path: string) => Promise<WorkspaceReadFileResponse>;
+    diffFiles: () => Promise<WorkspaceDiffFilesResponse>;
+    diffFile: (path: string) => Promise<WorkspaceDiffFileResponse>;
     architectureGet: () => Promise<WorkspaceArchitectureGetResponse>;
     architectureDetect: () => Promise<WorkspaceArchitectureDetectResponse>;
     architectureSave: (input: {

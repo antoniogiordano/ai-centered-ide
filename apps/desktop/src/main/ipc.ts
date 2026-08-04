@@ -19,6 +19,7 @@ import {
   createEmptyProject,
   GhCli,
   validateProjectName,
+  FilesystemService,
 } from "@ai-ide/workspace";
 import { ARCHITECTURE_FILE_PATH } from "@ai-ide/shared";
 import type { SessionManager } from "./session.js";
@@ -132,7 +133,29 @@ export function registerIpcHandlers(
     return session.confirmPlan({
       createBranch: req.createBranch,
       ...(req.branchName !== undefined ? { branchName: req.branchName } : {}),
+      ...(req.baseBranch !== undefined ? { baseBranch: req.baseBranch } : {}),
+      ...(req.dirtyStrategy !== undefined
+        ? { dirtyStrategy: req.dirtyStrategy }
+        : {}),
+      ...(req.baseCommitMessage !== undefined
+        ? { baseCommitMessage: req.baseCommitMessage }
+        : {}),
     });
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT, payload ?? {});
+    return session.draftBuildCommitMessage();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_COMMIT_BUILD, async (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.SESSION_COMMIT_BUILD, payload);
+    return session.commitBuild(req.message);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT, payload ?? {});
+    return session.dismissBuildCommit();
   });
 
   ipcMain.handle(IPC_CHANNELS.SESSION_SEND_MESSAGE, async (_event, payload) => {
@@ -325,19 +348,174 @@ export function registerIpcHandlers(
     safeValidate(IPC_CHANNELS.WORKSPACE_LIST_BRANCHES, payload ?? {});
     const root = session.getState().workspace?.resolvedRootPath;
     if (!root) {
-      return { isRepo: false, branches: [], current: null };
+      return {
+        isRepo: false,
+        branches: [],
+        current: null,
+        localBranches: [],
+        dirty: false,
+        dirtyFileCount: 0,
+      };
     }
     const git = new GitService(root);
     const info = await git.branchInfo();
     if (!info.isRepo) {
-      return { isRepo: false, branches: [], current: null };
+      return {
+        isRepo: false,
+        branches: [],
+        current: null,
+        localBranches: [],
+        dirty: false,
+        dirtyFileCount: 0,
+      };
     }
     const branches = await git.listTakenBranchNames();
+    const localBranches = await git.listLocalBranchesDetailed();
+    const dirty = await git.isDirty();
+    const dirtyFileCount = dirty ? await git.dirtyFileCount() : 0;
     return {
       isRepo: true,
       branches,
       current: info.localBranch,
+      localBranches,
+      dirty,
+      dirtyFileCount,
     };
+  });
+
+  const HIDDEN_DIR_NAMES = new Set([
+    "node_modules",
+    ".git",
+    "dist",
+    "out",
+    "release",
+    ".DS_Store",
+  ]);
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_LIST_DIR, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.WORKSPACE_LIST_DIR, payload ?? {});
+    const root = session.getState().workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        path: req.path,
+        entries: [],
+        error: {
+          code: "VALIDATION_ERROR" as const,
+          userMessage: "Open a workspace first.",
+          technicalDetail: "no workspace",
+        },
+      };
+    }
+    try {
+      const fs = new FilesystemService(root);
+      const entries = fs
+        .listDetailed(req.path)
+        .filter((e) => !HIDDEN_DIR_NAMES.has(e.name) && !e.name.startsWith(".env"))
+        .sort((a, b) => {
+          if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
+      return { path: req.path, entries };
+    } catch (error) {
+      return {
+        path: req.path,
+        entries: [],
+        error: errorPayload(error),
+      };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_READ_FILE, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.WORKSPACE_READ_FILE, payload);
+    const root = session.getState().workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        path: req.path,
+        error: {
+          code: "VALIDATION_ERROR" as const,
+          userMessage: "Open a workspace first.",
+          technicalDetail: "no workspace",
+        },
+      };
+    }
+    try {
+      const fs = new FilesystemService(root);
+      const content = fs.read(req.path);
+      return { path: req.path, content, truncated: false };
+    } catch (error) {
+      return {
+        path: req.path,
+        error: errorPayload(error),
+      };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_DIFF_FILES, async (_event, payload) => {
+    safeValidate(IPC_CHANNELS.WORKSPACE_DIFF_FILES, payload ?? {});
+    const root = session.getState().workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        base: null,
+        files: [],
+        error: {
+          code: "VALIDATION_ERROR" as const,
+          userMessage: "Open a workspace first.",
+          technicalDetail: "no workspace",
+        },
+      };
+    }
+    try {
+      const git = new GitService(root);
+      const info = await git.branchInfo();
+      if (!info.isRepo) {
+        return { base: null, files: [] };
+      }
+      const base = await git.resolveBranchDiffBase();
+      const files = await git.listBranchChangedFiles();
+      return { base, files };
+    } catch (error) {
+      return {
+        base: null,
+        files: [],
+        error: errorPayload(error),
+      };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.WORKSPACE_DIFF_FILE, async (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.WORKSPACE_DIFF_FILE, payload);
+    const root = session.getState().workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        path: req.path,
+        base: null,
+        patch: "",
+        untracked: false,
+        error: {
+          code: "VALIDATION_ERROR" as const,
+          userMessage: "Open a workspace first.",
+          technicalDetail: "no workspace",
+        },
+      };
+    }
+    try {
+      const git = new GitService(root);
+      const result = await git.fileDiffAgainstBase(req.path);
+      return {
+        path: req.path,
+        base: result.base,
+        patch: result.patch,
+        untracked: result.untracked,
+      };
+    } catch (error) {
+      return {
+        path: req.path,
+        base: null,
+        patch: "",
+        untracked: false,
+        error: errorPayload(error),
+      };
+    }
   });
 
   ipcMain.handle(IPC_CHANNELS.WORKSPACE_ARCHITECTURE_GET, (_event, payload) => {

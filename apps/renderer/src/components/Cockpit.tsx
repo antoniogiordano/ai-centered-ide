@@ -16,7 +16,6 @@ import type {
   Turn,
 } from "@ai-ide/shared";
 import { getBridge } from "../bridge";
-import { MonacoEditor } from "./MonacoEditor";
 import { ArchitectureSummary } from "./ArchitectureSummary";
 import {
   CollapsibleUserText,
@@ -24,17 +23,11 @@ import {
   TranscriptLabel,
 } from "./TranscriptMessages";
 import { LiveTerminalPane } from "./LiveTerminalPane";
+import { DiffNavigator } from "./DiffNavigator";
+import { BuildContinueBanner } from "./BuildContinueBanner";
+import { playChecklistChime } from "../lib/checklistSound";
 
 const SCROLL_STICK_THRESHOLD_PX = 96;
-
-export type VerifyTab =
-  | "plan"
-  | "browser"
-  | "diff"
-  | "environment"
-  | "tests"
-  | "terminal"
-  | "files";
 
 const PHASE_STATUS_LABEL: Record<PlanPhase["status"], string> = {
   pending: "Pending",
@@ -43,16 +36,6 @@ const PHASE_STATUS_LABEL: Record<PlanPhase["status"], string> = {
   skipped: "Skipped",
   failed: "Failed",
 };
-
-const VERIFY_TABS: { id: VerifyTab; label: string }[] = [
-  { id: "plan", label: "Plan" },
-  { id: "browser", label: "Browser" },
-  { id: "diff", label: "Diff" },
-  { id: "files", label: "Files" },
-  { id: "environment", label: "Environment" },
-  { id: "tests", label: "Tests" },
-  { id: "terminal", label: "Terminal" },
-];
 
 function toolNameByCallId(turn: Turn): Map<string, string> {
   const map = new Map<string, string>();
@@ -85,26 +68,6 @@ function actionLabel(toolName: string): string {
     default:
       return toolName.replace(/_/g, " ");
   }
-}
-
-function extractFileChanges(turns: Turn[]): { path: string; summary: string; success: boolean }[] {
-  const changes: { path: string; summary: string; success: boolean }[] = [];
-  for (const turn of turns) {
-    const names = toolNameByCallId(turn);
-    for (const result of turn.toolResults ?? []) {
-      const name = names.get(result.callId);
-      if (name !== "write_file" && name !== "git_commit") continue;
-      const args = turn.toolCalls?.find((c) => c.id === result.callId)?.arguments;
-      const path =
-        typeof args?.path === "string"
-          ? args.path
-          : typeof args?.file === "string"
-            ? args.file
-            : "unknown file";
-      changes.push({ path, summary: result.summary, success: result.success });
-    }
-  }
-  return changes;
 }
 
 function extractCommandHistory(
@@ -288,6 +251,7 @@ function PlanBoard(props: {
   onOpenQa?: (() => void) | undefined;
   onConfirmPlan?: (() => void) | undefined;
   planning?: boolean;
+  compact?: boolean;
 }) {
   const phases = props.state?.planPhases ?? [];
   const questions = props.state?.planQuestions ?? [];
@@ -299,6 +263,45 @@ function PlanBoard(props: {
     (mode === "plan" || planStatus === "drafting");
   const showReadyCta =
     planning && Boolean(proposal) && typeof props.onConfirmPlan === "function";
+  const [justDoneIds, setJustDoneIds] = useState<Set<string>>(() => new Set());
+  const knownDoneRef = useRef<Set<string> | null>(null);
+
+  useEffect(() => {
+    if (planning) {
+      knownDoneRef.current = null;
+      return;
+    }
+    const doneIds = new Set<string>();
+    for (const phase of phases) {
+      for (const item of phase.checklist) {
+        if (item.done) doneIds.add(item.id);
+      }
+    }
+    if (knownDoneRef.current === null) {
+      knownDoneRef.current = doneIds;
+      return;
+    }
+    const newly: string[] = [];
+    for (const id of doneIds) {
+      if (!knownDoneRef.current.has(id)) newly.push(id);
+    }
+    knownDoneRef.current = doneIds;
+    if (newly.length === 0) return;
+    setJustDoneIds((prev) => {
+      const next = new Set(prev);
+      for (const id of newly) next.add(id);
+      return next;
+    });
+    playChecklistChime();
+    const t = window.setTimeout(() => {
+      setJustDoneIds((prev) => {
+        const next = new Set(prev);
+        for (const id of newly) next.delete(id);
+        return next;
+      });
+    }, 1200);
+    return () => window.clearTimeout(t);
+  }, [phases, planning]);
 
   if (phases.length === 0) {
     return (
@@ -322,7 +325,7 @@ function PlanBoard(props: {
 
   return (
     <div
-      className={`plan-board ${planning ? "plan-board-drafting" : ""} ${showReadyCta ? "plan-board-ready" : ""}`}
+      className={`plan-board ${planning ? "plan-board-drafting" : ""} ${showReadyCta ? "plan-board-ready" : ""} ${props.compact ? "plan-board-compact" : ""}`}
     >
       <div className="plan-board-scroll">
         <div className="plan-board-header">
@@ -429,7 +432,7 @@ function PlanBoard(props: {
                     key={item.id}
                     className={`plan-check ${
                       !planning && item.done ? "plan-check-done" : ""
-                    }`}
+                    } ${justDoneIds.has(item.id) ? "plan-check-just-done" : ""}`}
                   >
                     <span className="plan-check-mark" aria-hidden>
                       {planning ? "·" : item.done ? "✓" : "○"}
@@ -508,7 +511,9 @@ export function ConversationPane(props: {
   const turns = state?.turns ?? [];
   const showThinking =
     busy &&
-    (state?.status === "thinking" || state?.status === "running") &&
+    (state?.status === "thinking" ||
+      state?.status === "running" ||
+      (state?.status === "streaming" && Boolean(state?.activityLabel))) &&
     !state?.partialAssistantText;
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
     "idle",
@@ -794,6 +799,8 @@ export function ConversationPane(props: {
           ) : null}
         </div>
 
+        <BuildContinueBanner state={state} />
+
         {(state?.pendingApprovals ?? []).map((approval) => (
           <ApprovalCard key={approval.id} approval={approval} />
         ))}
@@ -825,6 +832,12 @@ function formatApprovalArgs(toolCall: ToolCall): string | null {
   }
 }
 
+const TERMINAL_AUTO_APPROVE_MS = 3000;
+
+function isTerminalCommandApproval(toolName: string): boolean {
+  return toolName === "run_command";
+}
+
 function ApprovalCard(props: {
   approval: {
     id: string;
@@ -835,6 +848,42 @@ function ApprovalCard(props: {
 }) {
   const { approval } = props;
   const argsPreview = formatApprovalArgs(approval.toolCall);
+  const autoApprove = isTerminalCommandApproval(approval.toolCall.name);
+  const [progress, setProgress] = useState(0);
+  const settledRef = useRef(false);
+  const approvalIdRef = useRef(approval.id);
+  approvalIdRef.current = approval.id;
+
+  const settle = (action: "approve" | "approve_session" | "reject") => {
+    if (settledRef.current) return;
+    settledRef.current = true;
+    const id = approvalIdRef.current;
+    if (action === "reject") {
+      void getBridge()?.session.reject(id);
+      return;
+    }
+    void getBridge()?.session.approve(id, action === "approve_session");
+  };
+
+  useEffect(() => {
+    settledRef.current = false;
+    setProgress(0);
+    if (!autoApprove) return;
+
+    const startedAt = Date.now();
+    const tick = () => {
+      if (settledRef.current) return;
+      const p = Math.min(1, (Date.now() - startedAt) / TERMINAL_AUTO_APPROVE_MS);
+      setProgress(p);
+      if (p >= 1) {
+        settledRef.current = true;
+        void getBridge()?.session.approve(approvalIdRef.current);
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 32);
+    return () => window.clearInterval(id);
+  }, [approval.id, autoApprove]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -849,25 +898,25 @@ function ApprovalCard(props: {
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
-        void getBridge()?.session.reject(approval.id);
+        settle("reject");
         return;
       }
       if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         e.stopPropagation();
-        void getBridge()?.session.approve(approval.id);
+        settle("approve");
         return;
       }
       if (e.key === "1" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         e.stopPropagation();
-        void getBridge()?.session.approve(approval.id);
+        settle("approve");
         return;
       }
       if (e.key === "2" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         e.stopPropagation();
-        void getBridge()?.session.approve(approval.id, true);
+        settle("approve_session");
       }
     };
     window.addEventListener("keydown", onKey, true);
@@ -876,147 +925,105 @@ function ApprovalCard(props: {
 
   return (
     <div className="approval-card" role="dialog" aria-label="Approval required">
-      <strong>Approval required</strong>
-      <p>{approval.description}</p>
-      <p className="approval-meta">
-        Tool: {approval.toolCall.name} · Risk: {approval.riskLevel}
-      </p>
-      {argsPreview ? (
-        <pre className="approval-command" tabIndex={0}>
-          {argsPreview}
-        </pre>
+      {autoApprove ? (
+        <div className="approval-progress" aria-hidden>
+          <div
+            className="approval-progress-fill"
+            style={{ width: `${progress * 100}%` }}
+          />
+        </div>
       ) : null}
-      <div className="approval-actions">
-        <button
-          type="button"
-          className="btn"
-          onClick={() => void getBridge()?.session.approve(approval.id)}
-        >
-          Approve once · Enter
-        </button>
-        <button
-          type="button"
-          className="btn btn-secondary"
-          onClick={() => void getBridge()?.session.approve(approval.id, true)}
-        >
-          Approve for session · 2
-        </button>
-        <button
-          type="button"
-          className="btn btn-secondary"
-          onClick={() => void getBridge()?.session.reject(approval.id)}
-        >
-          Reject · Esc
-        </button>
+      <div className="approval-card-body">
+        <strong>
+          {autoApprove
+            ? "Command — auto-approves in 3s"
+            : "Approval required"}
+        </strong>
+        <p>{approval.description}</p>
+        <p className="approval-meta">
+          Tool: {approval.toolCall.name} · Risk: {approval.riskLevel}
+        </p>
+        {argsPreview ? (
+          <pre className="approval-command" tabIndex={0}>
+            {argsPreview}
+          </pre>
+        ) : null}
+        <div className="approval-actions">
+          <button
+            type="button"
+            className="btn"
+            onClick={() => settle("approve")}
+          >
+            Approve once · Enter
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => settle("approve_session")}
+          >
+            Approve for session · 2
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => settle("reject")}
+          >
+            Reject · Esc
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 
-function VerifyTabPanel(props: {
-  tab: VerifyTab;
+function BuildCockpit(props: {
   state: SessionState | null;
   onOpenQa?: (() => void) | undefined;
-  onConfirmPlan?: (() => void) | undefined;
-  planning?: boolean;
 }) {
-  const { tab, state, onOpenQa, onConfirmPlan, planning } = props;
-  const turns = state?.turns ?? [];
-
-  const fileChanges = useMemo(() => extractFileChanges(turns), [turns]);
+  const turns = props.state?.turns ?? [];
   const commandHistory = useMemo(() => extractCommandHistory(turns), [turns]);
-
-  switch (tab) {
-    case "plan":
-      return (
-        <PlanBoard
-          state={state}
-          onOpenQa={onOpenQa}
-          onConfirmPlan={onConfirmPlan}
-          planning={Boolean(planning)}
-        />
-      );
-
-    case "browser":
-      return (
-        <div className="empty-state verify-empty">
-          <strong>Browser QA preview</strong>
-          <p>No active browser session. When QA runs, the live preview appears here.</p>
-          <p className="verify-hint">
-            Base URL hint: configure your app URL in environment settings (e.g.{" "}
-            <code>http://localhost:5173</code>).
-          </p>
-        </div>
-      );
-
-    case "diff":
-      if (fileChanges.length === 0) {
-        return (
-          <div className="empty-state verify-empty">
-            <strong>Session file changes</strong>
-            <p>Modified files from this session will be listed here with diffs.</p>
-          </div>
-        );
+  const refreshToken = useMemo(() => {
+    let n = 0;
+    for (const turn of turns) {
+      for (const call of turn.toolCalls ?? []) {
+        if (
+          call.name === "write_file" ||
+          call.name === "run_command" ||
+          call.name === "git_commit"
+        ) {
+          n += 1;
+        }
       }
-      return (
-        <ul className="verify-list">
-          {fileChanges.map((change, i) => (
-            <li key={`${change.path}-${i}`} className="verify-list-item">
-              <span className={`verify-badge ${change.success ? "ok" : "fail"}`}>
-                {change.success ? "modified" : "failed"}
-              </span>
-              <span className="verify-list-primary">{change.path}</span>
-              <span className="verify-list-secondary">{change.summary}</span>
-            </li>
-          ))}
-        </ul>
-      );
-
-    case "files": {
-      const samplePath = fileChanges[0]?.path ?? "README.md";
-      const sample =
-        fileChanges[0]?.summary ??
-        "// Monaco is read-only by default.\n// Switch to manual edit mode from the command palette when needed.\n";
-      return (
-        <div className="files-panel">
-          <div className="files-toolbar">
-            <span className="verify-hint">{samplePath} · read-only</span>
-          </div>
-          <MonacoEditor path={samplePath} value={sample} readOnly />
-        </div>
-      );
+      n += turn.toolResults?.length ?? 0;
     }
+    n += props.state?.liveTerminals?.length ?? 0;
+    return `${props.state?.status ?? ""}:${n}`;
+  }, [turns, props.state?.liveTerminals?.length, props.state?.status]);
 
-    case "environment":
-      return (
-        <div className="empty-state verify-empty">
-          <strong>Environment services</strong>
-          <p>No services running yet. Start your dev stack to see API, web, and database status.</p>
-          {state?.workspace ? (
-            <p className="verify-hint">Workspace: {state.workspace.name}</p>
-          ) : null}
-        </div>
-      );
+  const showTerminal = (props.state?.liveTerminals?.length ?? 0) > 0;
 
-    case "tests":
-      return (
-        <div className="empty-state verify-empty">
-          <strong>Cypress scenarios</strong>
-          <p>No test recordings or scenarios yet. Record a flow or run Cypress to populate this tab.</p>
-        </div>
-      );
-
-    case "terminal":
-      return (
-        <LiveTerminalPane state={state} commandHistory={commandHistory} />
-      );
-  }
+  return (
+    <div className={`build-cockpit ${showTerminal ? "build-cockpit-with-terminal" : ""}`}>
+      <section className="build-cockpit-plan" aria-label="Plan">
+        <PlanBoard state={props.state} onOpenQa={props.onOpenQa} planning={false} />
+      </section>
+      <section className="build-cockpit-side" aria-label="Branch diff">
+        <DiffNavigator
+          workspaceRoot={props.state?.workspace?.resolvedRootPath}
+          refreshToken={refreshToken}
+        />
+      </section>
+      {showTerminal ? (
+        <section className="build-cockpit-terminal" aria-label="Terminal">
+          <LiveTerminalPane state={props.state} commandHistory={commandHistory} />
+        </section>
+      ) : null}
+    </div>
+  );
 }
 
 export function VerifyPane(props: {
   state: SessionState | null;
-  activeTab: VerifyTab;
-  onTabChange: (tab: VerifyTab) => void;
   onOpenQa?: (() => void) | undefined;
   onConfirmPlan?: (() => void) | undefined;
   onOpenArchitecture?: (() => void) | undefined;
@@ -1024,8 +1031,6 @@ export function VerifyPane(props: {
 }) {
   const {
     state,
-    activeTab,
-    onTabChange,
     onOpenQa,
     onConfirmPlan,
     onOpenArchitecture,
@@ -1051,32 +1056,9 @@ export function VerifyPane(props: {
   }
 
   return (
-    <>
-      <div className="pane-header verify-header">
-        <span>Verify</span>
-        <div className="tab-bar" role="tablist" aria-label="Verify panels">
-          {VERIFY_TABS.map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              role="tab"
-              className={`tab ${activeTab === tab.id ? "tab-active" : ""}`}
-              aria-selected={activeTab === tab.id}
-              onClick={() => onTabChange(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-      </div>
-      <div className="pane-body" role="tabpanel">
-        <VerifyTabPanel
-          tab={activeTab}
-          state={state}
-          onOpenQa={onOpenQa}
-          planning={false}
-        />
-      </div>
-    </>
+    <div className="pane-body build-side-pane" role="region" aria-label="Build">
+      <BuildCockpit state={state} onOpenQa={onOpenQa} />
+    </div>
   );
 }
+

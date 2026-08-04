@@ -19,12 +19,84 @@ import {
   applyUpsertPlan,
   buildContext,
   bumpSessionSequence,
+  CHECKLIST_CONTINUE_NUDGE,
+  compactProviderMessages,
+  isAgentTankMode,
   isPlanMutationTool,
   parseToolCallsFromText,
+  planChecklistProgress,
+  planHasOpenWork,
+  PLAN_CONTINUE_NUDGE,
   productPhaseForState,
   tryParsePartialJson,
   TurnStateMachine,
 } from "./state.js";
+
+function isTankMode(state: SessionState): boolean {
+  return isAgentTankMode(state);
+}
+
+/** Keep the build/plan loop alive — no max rounds while tank mode applies. */
+function pushTankContinue(
+  workingState: SessionState,
+  messages: ChatMessage[],
+  tankRounds: number,
+  emit: (event: AgentProgressEvent) => void,
+): { state: SessionState; tankRounds: number } {
+  const nextRound = tankRounds + 1;
+  const planning = productPhaseForState(workingState) === "planning";
+  const { done, total } = planChecklistProgress(workingState);
+  const label = planning
+    ? `Tank · planning · go ${nextRound}`
+    : `Tank · checklist ${done}/${total} · go ${nextRound}`;
+  let state = workingState;
+  if (nextRound === 1 || nextRound % 5 === 0) {
+    const notice: Turn = {
+      id: randomUUID(),
+      role: "assistant",
+      content: planning
+        ? `**Tank mode** · planning still open — upsert_plan / questions / propose_plan_ready (round ${nextRound})…`
+        : `**Tank mode** · checklist ${done}/${total} still open — continuing with tools (round ${nextRound})…`,
+      createdAt: new Date().toISOString(),
+    };
+    state = { ...state, turns: [...state.turns, notice] };
+  }
+  state = {
+    ...state,
+    activityLabel: label,
+    status: "thinking",
+  };
+  emit({
+    type: "session_patch",
+    patch: {
+      turns: state.turns,
+      activityLabel: label,
+      status: "thinking",
+    },
+  });
+  emit({ type: "activity", label, status: "thinking" });
+  // Drop bloated history before the nudge — plan + goal + fresh tail only.
+  const compacted = compactProviderMessages(messages, state);
+  messages.length = 0;
+  messages.push(...compacted, {
+    role: "user",
+    content: planning ? PLAN_CONTINUE_NUDGE : CHECKLIST_CONTINUE_NUDGE,
+  });
+  return { state, tankRounds: nextRound };
+}
+
+function refreshBuildMessages(
+  messages: ChatMessage[],
+  state: SessionState,
+): void {
+  // Bound context during long tank runs (planning or building).
+  if (!isTankMode(state) && productPhaseForState(state) !== "building") {
+    return;
+  }
+  const compacted = compactProviderMessages(messages, state);
+  messages.length = 0;
+  messages.push(...compacted);
+}
 
 export type AgentProgressEvent =
   | { type: "activity"; label: string; status: SessionState["status"] }
@@ -48,13 +120,18 @@ export type AgentProgressEvent =
     }
   | {
       type: "session_patch";
-      patch: Pick<
-        SessionState,
-        | "planPhases"
-        | "planQuestions"
-        | "planStatus"
-        | "mode"
-        | "planReadyProposal"
+      patch: Partial<
+        Pick<
+          SessionState,
+          | "planPhases"
+          | "planQuestions"
+          | "planStatus"
+          | "mode"
+          | "planReadyProposal"
+          | "turns"
+          | "activityLabel"
+          | "status"
+        >
       >;
       /** Live draft while tool args stream — do not persist. */
       provisional?: boolean;
@@ -95,6 +172,7 @@ export async function runAgentTurn(
   const machine = new TurnStateMachine();
   machine.begin();
   const emit = deps.onProgress ?? (() => undefined);
+  let tankRounds = 0;
 
   let workingState: SessionState = { ...state };
   const registry = createDefaultRegistry();
@@ -149,7 +227,7 @@ export async function runAgentTurn(
   const toolResults: ToolResult[] = [];
   const allToolCalls: ToolCall[] = [];
 
-  while (machine.nextIteration()) {
+  while (machine.nextIteration(isTankMode(workingState))) {
     if (deps.signal?.aborted) {
       return fail(workingState, "Interrupted by user.");
     }
@@ -165,6 +243,7 @@ export async function runAgentTurn(
     let streamedThisRound = false;
     let lastProvisionalEmit = 0;
 
+    refreshBuildMessages(messages, workingState);
     for await (const chunk of deps.provider.chat(messages, {
       ...(toolDefs.length ? { tools: toolDefs } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
@@ -285,6 +364,19 @@ export async function runAgentTurn(
     }
 
     if (toolCalls.length === 0) {
+      // Keep provider history coherent when the model narrates without tools.
+      if (roundContent.trim()) {
+        messages.push({
+          role: "assistant",
+          content: roundContent,
+        });
+      }
+      if (isTankMode(workingState)) {
+        const tank = pushTankContinue(workingState, messages, tankRounds, emit);
+        workingState = tank.state;
+        tankRounds = tank.tankRounds;
+        continue;
+      }
       machine.complete();
       break;
     }
@@ -352,7 +444,7 @@ export async function runAgentTurn(
           ),
         });
         toolDefs = toolDefsFor(workingState);
-        if (!machine.recordToolResult(call.name, result.success)) {
+        if (!machine.recordToolResult(call.name, result.success, isTankMode(workingState))) {
           stop = true;
           break;
         }
@@ -378,7 +470,7 @@ export async function runAgentTurn(
           tool_call_id: call.id,
           content: failed.summary,
         });
-        if (!machine.recordToolResult(call.name, false)) {
+        if (!machine.recordToolResult(call.name, false, isTankMode(workingState))) {
           stop = true;
           break;
         }
@@ -456,7 +548,7 @@ export async function runAgentTurn(
         content: toolContent,
       });
 
-      if (!machine.recordToolResult(call.name, outcome.result.success)) {
+      if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
         stop = true;
         break;
       }
@@ -487,7 +579,7 @@ export async function runAgentTurn(
     state: bumpSessionSequence({
       ...workingState,
       status: "idle",
-      turns: [...workingState.turns, assistantTurn],
+      turns: appendIdleStallNotice(workingState, assistantTurn),
       error: null,
       partialAssistantText: null,
       activityLabel: null,
@@ -555,11 +647,33 @@ function toolActivityLabel(call: ToolCall): string {
 }
 
 function fail(state: SessionState, message: string): AgentLoopResult {
+  const turns = [...state.turns];
+  const interrupted = message === "Interrupted by user.";
+  if (
+    !interrupted &&
+    productPhaseForState(state) === "building" &&
+    planHasOpenWork(state)
+  ) {
+    const { done, total } = planChecklistProgress(state);
+    turns.push({
+      id: randomUUID(),
+      role: "assistant",
+      content: [
+        `**Build paused** · checklist ${done}/${total}.`,
+        "",
+        message,
+        "",
+        "Tank mode will not retry this automatically. Press **Resume** when you want to continue.",
+      ].join("\n"),
+      createdAt: new Date().toISOString(),
+    });
+  }
   return {
     state: bumpSessionSequence({
       ...state,
       status: "error",
       error: message,
+      turns,
       partialAssistantText: null,
       activityLabel: null,
       activeToolCallId: null,
@@ -568,6 +682,28 @@ function fail(state: SessionState, message: string): AgentLoopResult {
     assistantContent: "",
     toolResults: [],
   };
+}
+
+function appendIdleStallNotice(
+  state: SessionState,
+  assistantTurn: Turn,
+): Turn[] {
+  const turns = [...state.turns, assistantTurn];
+  if (productPhaseForState(state) !== "building" || !planHasOpenWork(state)) {
+    return turns;
+  }
+  const { done, total } = planChecklistProgress(state);
+  turns.push({
+    id: randomUUID(),
+    role: "assistant",
+    content: [
+      `**Stopped** · checklist ${done}/${total} still open.`,
+      "",
+      "Tank mode normally keeps going until every check is done. Resume only if you hit Stop or the run was interrupted.",
+    ].join("\n"),
+    createdAt: new Date().toISOString(),
+  });
+  return turns;
 }
 
 /**
@@ -582,6 +718,7 @@ export async function resumeAgentTurn(
   const machine = new TurnStateMachine();
   machine.begin();
   const emit = deps.onProgress ?? (() => undefined);
+  let tankRounds = 0;
   const registry = createDefaultRegistry();
   const gateway = deps.gateway ?? new ToolGateway(registry);
 
@@ -676,7 +813,7 @@ export async function resumeAgentTurn(
         ),
       });
       toolDefs = toolDefsFor(workingState);
-      if (!machine.recordToolResult(call.name, result.success)) {
+      if (!machine.recordToolResult(call.name, result.success, isTankMode(workingState))) {
         stop = true;
         break;
       }
@@ -702,7 +839,7 @@ export async function resumeAgentTurn(
         tool_call_id: call.id,
         content: failed.summary,
       });
-      if (!machine.recordToolResult(call.name, false)) {
+      if (!machine.recordToolResult(call.name, false, isTankMode(workingState))) {
         stop = true;
         break;
       }
@@ -780,7 +917,7 @@ export async function resumeAgentTurn(
         2,
       ),
     });
-    if (!machine.recordToolResult(call.name, outcome.result.success)) {
+    if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
       stop = true;
       break;
     }
@@ -794,7 +931,7 @@ export async function resumeAgentTurn(
   }
 
   // Continue provider rounds (same as runAgentTurn after a tool batch).
-  while (machine.nextIteration()) {
+  while (machine.nextIteration(isTankMode(workingState))) {
     if (deps.signal?.aborted) {
       return fail(workingState, "Interrupted by user.");
     }
@@ -809,6 +946,7 @@ export async function resumeAgentTurn(
     >();
     let streamedThisRound = false;
 
+    refreshBuildMessages(messages, workingState);
     for await (const chunk of deps.provider.chat(messages, {
       ...(toolDefs.length ? { tools: toolDefs } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
@@ -880,6 +1018,18 @@ export async function resumeAgentTurn(
     }
 
     if (toolCalls.length === 0) {
+      if (roundContent.trim()) {
+        messages.push({
+          role: "assistant",
+          content: roundContent,
+        });
+      }
+      if (isTankMode(workingState)) {
+        const tank = pushTankContinue(workingState, messages, tankRounds, emit);
+        workingState = tank.state;
+        tankRounds = tank.tankRounds;
+        continue;
+      }
       machine.complete();
       break;
     }
@@ -942,7 +1092,7 @@ export async function resumeAgentTurn(
           ),
         });
         toolDefs = toolDefsFor(workingState);
-        if (!machine.recordToolResult(call.name, result.success)) {
+        if (!machine.recordToolResult(call.name, result.success, isTankMode(workingState))) {
           batchStop = true;
           break;
         }
@@ -968,7 +1118,7 @@ export async function resumeAgentTurn(
           tool_call_id: call.id,
           content: failed.summary,
         });
-        if (!machine.recordToolResult(call.name, false)) {
+        if (!machine.recordToolResult(call.name, false, isTankMode(workingState))) {
           batchStop = true;
           break;
         }
@@ -1043,7 +1193,7 @@ export async function resumeAgentTurn(
           2,
         ),
       });
-      if (!machine.recordToolResult(call.name, outcome.result.success)) {
+      if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
         batchStop = true;
         break;
       }
@@ -1072,7 +1222,7 @@ export async function resumeAgentTurn(
     state: bumpSessionSequence({
       ...workingState,
       status: "idle",
-      turns: [...workingState.turns, assistantTurn],
+      turns: appendIdleStallNotice(workingState, assistantTurn),
       error: null,
       partialAssistantText: null,
       activityLabel: null,

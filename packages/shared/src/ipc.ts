@@ -48,7 +48,14 @@ export const IPC_CHANNELS = {
   WORKSPACE_ARCHITECTURE_GET: "workspace:architecture-get",
   WORKSPACE_ARCHITECTURE_SAVE: "workspace:architecture-save",
   WORKSPACE_ARCHITECTURE_DETECT: "workspace:architecture-detect",
+  WORKSPACE_LIST_DIR: "workspace:list-dir",
+  WORKSPACE_READ_FILE: "workspace:read-file",
+  WORKSPACE_DIFF_FILES: "workspace:diff-files",
+  WORKSPACE_DIFF_FILE: "workspace:diff-file",
   SESSION_CONFIRM_PLAN: "session:confirm-plan",
+  SESSION_DRAFT_BUILD_COMMIT: "session:draft-build-commit",
+  SESSION_COMMIT_BUILD: "session:commit-build",
+  SESSION_DISMISS_BUILD_COMMIT: "session:dismiss-build-commit",
   PROVIDER_VERIFY: "provider:verify",
   PROVIDER_LIST_MODELS: "provider:list-models",
   PROVIDER_SAVE_CONFIG: "provider:save-config",
@@ -460,11 +467,105 @@ export type WorkspaceListBranchesRequest = z.infer<
 
 export const WorkspaceListBranchesResponseSchema = z.object({
   isRepo: z.boolean(),
+  /** Names that collide with a new local branch (local + remote short names). */
   branches: z.array(z.string()),
   current: z.string().nullable(),
+  /** Local heads only, newest commit first — for base-branch picker. */
+  localBranches: z
+    .array(
+      z.object({
+        name: z.string().min(1),
+        lastCommitAt: z.string().min(1),
+      }),
+    )
+    .default([]),
+  /** Working tree has uncommitted changes. */
+  dirty: z.boolean().default(false),
+  dirtyFileCount: z.number().int().nonnegative().default(0),
 });
 export type WorkspaceListBranchesResponse = z.infer<
   typeof WorkspaceListBranchesResponseSchema
+>;
+
+export const WorkspaceListDirRequestSchema = z.object({
+  path: z.string().default("."),
+});
+export type WorkspaceListDirRequest = z.infer<
+  typeof WorkspaceListDirRequestSchema
+>;
+
+export const WorkspaceFileEntrySchema = z.object({
+  name: z.string(),
+  path: z.string(),
+  isDirectory: z.boolean(),
+  size: z.number(),
+});
+export type WorkspaceFileEntry = z.infer<typeof WorkspaceFileEntrySchema>;
+
+export const WorkspaceListDirResponseSchema = z.object({
+  path: z.string(),
+  entries: z.array(WorkspaceFileEntrySchema),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type WorkspaceListDirResponse = z.infer<
+  typeof WorkspaceListDirResponseSchema
+>;
+
+export const WorkspaceReadFileRequestSchema = z.object({
+  path: z.string().min(1),
+});
+export type WorkspaceReadFileRequest = z.infer<
+  typeof WorkspaceReadFileRequestSchema
+>;
+
+export const WorkspaceReadFileResponseSchema = z.object({
+  path: z.string(),
+  content: z.string().optional(),
+  truncated: z.boolean().optional(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type WorkspaceReadFileResponse = z.infer<
+  typeof WorkspaceReadFileResponseSchema
+>;
+
+export const WorkspaceDiffFilesRequestSchema = z.object({});
+export type WorkspaceDiffFilesRequest = z.infer<
+  typeof WorkspaceDiffFilesRequestSchema
+>;
+
+export const WorkspaceDiffFileEntrySchema = z.object({
+  path: z.string(),
+  status: z.enum(["A", "M", "D", "R", "?"]),
+});
+export type WorkspaceDiffFileEntry = z.infer<
+  typeof WorkspaceDiffFileEntrySchema
+>;
+
+export const WorkspaceDiffFilesResponseSchema = z.object({
+  base: z.string().nullable(),
+  files: z.array(WorkspaceDiffFileEntrySchema),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type WorkspaceDiffFilesResponse = z.infer<
+  typeof WorkspaceDiffFilesResponseSchema
+>;
+
+export const WorkspaceDiffFileRequestSchema = z.object({
+  path: z.string().min(1),
+});
+export type WorkspaceDiffFileRequest = z.infer<
+  typeof WorkspaceDiffFileRequestSchema
+>;
+
+export const WorkspaceDiffFileResponseSchema = z.object({
+  path: z.string(),
+  base: z.string().nullable(),
+  patch: z.string(),
+  untracked: z.boolean(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type WorkspaceDiffFileResponse = z.infer<
+  typeof WorkspaceDiffFileResponseSchema
 >;
 
 export const WorkspaceArchitectureGetRequestSchema = z.object({});
@@ -551,6 +652,16 @@ export type WorkspaceArchitectureSaveResponse = z.infer<
 export const SessionConfirmPlanRequestSchema = z.object({
   createBranch: z.boolean(),
   branchName: z.string().min(1).max(80).optional(),
+  /** Local branch (or ref) to create the feat branch from. Defaults to current HEAD. */
+  baseBranch: z.string().min(1).max(120).optional(),
+  /**
+   * Required when the worktree is dirty and createBranch is true:
+   * - stash: stash changes, create feat from base tip (last commit)
+   * - commit_base: commit on base, then create feat from that commit
+   */
+  dirtyStrategy: z.enum(["stash", "commit_base"]).optional(),
+  /** Commit message when dirtyStrategy is commit_base. */
+  baseCommitMessage: z.string().min(1).max(4000).optional(),
 });
 export type SessionConfirmPlanRequest = z.infer<
   typeof SessionConfirmPlanRequestSchema
@@ -564,6 +675,52 @@ export const SessionConfirmPlanResponseSchema = z.object({
 });
 export type SessionConfirmPlanResponse = z.infer<
   typeof SessionConfirmPlanResponseSchema
+>;
+
+export const SessionDraftBuildCommitRequestSchema = z.object({});
+export type SessionDraftBuildCommitRequest = z.infer<
+  typeof SessionDraftBuildCommitRequestSchema
+>;
+
+export const SessionDraftBuildCommitResponseSchema = z.object({
+  ok: z.boolean(),
+  message: z.string().optional(),
+  branch: z.string().nullable().optional(),
+  files: z.array(z.string()).optional(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type SessionDraftBuildCommitResponse = z.infer<
+  typeof SessionDraftBuildCommitResponseSchema
+>;
+
+export const SessionCommitBuildRequestSchema = z.object({
+  message: z.string().min(1).max(4000),
+});
+export type SessionCommitBuildRequest = z.infer<
+  typeof SessionCommitBuildRequestSchema
+>;
+
+export const SessionCommitBuildResponseSchema = z.object({
+  ok: z.boolean(),
+  commit: z.string().optional(),
+  state: SessionStateSchema.optional(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type SessionCommitBuildResponse = z.infer<
+  typeof SessionCommitBuildResponseSchema
+>;
+
+export const SessionDismissBuildCommitRequestSchema = z.object({});
+export type SessionDismissBuildCommitRequest = z.infer<
+  typeof SessionDismissBuildCommitRequestSchema
+>;
+
+export const SessionDismissBuildCommitResponseSchema = z.object({
+  ok: z.boolean(),
+  state: SessionStateSchema.optional(),
+});
+export type SessionDismissBuildCommitResponse = z.infer<
+  typeof SessionDismissBuildCommitResponseSchema
 >;
 
 export const ProviderVerifyRequestSchema = z.object({
@@ -661,12 +818,20 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.WORKSPACE_CREATE_PROJECT]: WorkspaceCreateProjectRequestSchema,
   [IPC_CHANNELS.WORKSPACE_GIT_STATUS]: WorkspaceGitStatusRequestSchema,
   [IPC_CHANNELS.WORKSPACE_LIST_BRANCHES]: WorkspaceListBranchesRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_LIST_DIR]: WorkspaceListDirRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_READ_FILE]: WorkspaceReadFileRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_DIFF_FILES]: WorkspaceDiffFilesRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_DIFF_FILE]: WorkspaceDiffFileRequestSchema,
   [IPC_CHANNELS.WORKSPACE_ARCHITECTURE_GET]: WorkspaceArchitectureGetRequestSchema,
   [IPC_CHANNELS.WORKSPACE_ARCHITECTURE_DETECT]:
     WorkspaceArchitectureDetectRequestSchema,
   [IPC_CHANNELS.WORKSPACE_ARCHITECTURE_SAVE]:
     WorkspaceArchitectureSaveRequestSchema,
   [IPC_CHANNELS.SESSION_CONFIRM_PLAN]: SessionConfirmPlanRequestSchema,
+  [IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT]: SessionDraftBuildCommitRequestSchema,
+  [IPC_CHANNELS.SESSION_COMMIT_BUILD]: SessionCommitBuildRequestSchema,
+  [IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT]:
+    SessionDismissBuildCommitRequestSchema,
   [IPC_CHANNELS.PROVIDER_VERIFY]: ProviderVerifyRequestSchema,
   [IPC_CHANNELS.PROVIDER_LIST_MODELS]: ProviderListModelsRequestSchema,
   [IPC_CHANNELS.PROVIDER_SAVE_CONFIG]: ProviderSaveConfigRequestSchema,

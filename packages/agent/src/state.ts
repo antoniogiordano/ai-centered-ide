@@ -12,8 +12,13 @@ import type {
 import { createEmptySessionState } from "@ai-ide/shared";
 import {
   formatArchitectureForPrompt,
+  planChecklistProgress as sharedPlanChecklistProgress,
+  planHasOpenWork as sharedPlanHasOpenWork,
+  CHECKLIST_CONTINUE_USER_MESSAGE,
+  PLAN_CONTINUE_USER_MESSAGE,
 } from "@ai-ide/shared";
 import { ArchitectureStore } from "@ai-ide/workspace";
+import type { ChatMessage } from "@ai-ide/provider";
 
 export type TurnPhase =
   | "idle"
@@ -39,16 +44,27 @@ export class TurnStateMachine {
     this.sameToolStreak = 0;
   }
 
-  nextIteration(): boolean {
+  /**
+   * @param tank When true (build + open checklist), never stop on iteration cap —
+   * local models keep going until the plan is done or the user hits Stop.
+   */
+  nextIteration(tank = false): boolean {
     this.iteration += 1;
-    if (this.iteration > MAX_ITERATIONS) {
+    if (!tank && this.iteration > MAX_ITERATIONS) {
       this.phase = "failed";
       return false;
     }
     return true;
   }
 
-  recordToolResult(toolName: string, success: boolean): boolean {
+  /**
+   * @param tank In tank mode, tool failure / same-tool streak do not abort the loop.
+   */
+  recordToolResult(
+    toolName: string,
+    success: boolean,
+    tank = false,
+  ): boolean {
     if (!success) {
       this.consecutiveToolFailures += 1;
     } else {
@@ -61,6 +77,8 @@ export class TurnStateMachine {
       this.lastToolName = toolName;
       this.sameToolStreak = 1;
     }
+
+    if (tank) return true;
 
     if (this.consecutiveToolFailures >= MAX_CONSECUTIVE_TOOL_FAILURES) {
       this.phase = "failed";
@@ -78,6 +96,7 @@ export class TurnStateMachine {
   }
 }
 
+/** Planning / ask caps. Building tank mode ignores this via nextIteration(true). */
 export const MAX_ITERATIONS = 12;
 export const MAX_CONSECUTIVE_TOOL_FAILURES = 3;
 export const MAX_SAME_TOOL_STREAK = 8;
@@ -118,8 +137,29 @@ function formatPlanForPrompt(state: SessionState): string {
     ? `User confirmation pending for branch ${state.planReadyProposal.suggestedBranch}. Do not call propose_plan_ready again unless the plan changes.`
     : null;
 
+  const focus = (() => {
+    if (planning) return null;
+    const { done, total } = sharedPlanChecklistProgress(state);
+    const current =
+      state.planPhases.find((p) => p.status === "in_progress") ??
+      state.planPhases.find(
+        (p) =>
+          p.status === "pending" ||
+          p.status === "failed" ||
+          p.checklist.some((c) => !c.done),
+      );
+    const nextItem = current?.checklist.find((c) => !c.done);
+    return [
+      "Focus (authoritative — prefer this over chat history):",
+      `- Checklist progress: ${done}/${total}`,
+      `- Current phase: ${current ? `${current.title} [${current.status}]` : "(none)"}`,
+      `- Next open item: ${nextItem ? nextItem.text : "(all done)"}`,
+    ].join("\n");
+  })();
+
   return [
     `Plan status: ${state.planStatus}`,
+    ...(focus ? [focus, ""] : []),
     "Current plan:",
     ...lines,
     questions,
@@ -197,6 +237,7 @@ export function buildSystemPrompt(state: SessionState): string {
     "4) When the user explicitly wants to run shell/npm/git (e.g. \"npm init\", \"install\", \"just initialize\"): keep a minimal plan focused on that, set questions=[], then call propose_plan_ready immediately. Do not keep interviewing.",
     "5) Otherwise, when the plan is solid AND all open questions are answered, call propose_plan_ready with a short suggestedBranch (feat/kebab-case). The IDE opens Start Build — do NOT start building yourself.",
     "6) Do NOT call propose_plan_ready while upsert_plan.questions still has status=open items.",
+    "TANK MODE (planning): until propose_plan_ready is accepted by the user (Start Build), you must keep using tools — upsert_plan (phases + checks) and/or open questions. NEVER stop on exploration-only narration. Brief explore → upsert_plan. The IDE re-prompts until the plan is ready or open questions await the user.",
     formatPlanForPrompt(state),
   ];
 
@@ -210,9 +251,19 @@ export function buildSystemPrompt(state: SessionState): string {
     "Never claim you cannot execute shell commands in this phase — you can.",
     "One-shot commands: run_command. Interactive / long-running shells: terminal_open → terminal_write (user gets 3s confirm/edit) → terminal_read. When the user must choose interactively, use terminal_ask.",
     "Install packages when the plan calls for them (never during planning).",
-    "After meaningful progress, call upsert_plan to mark checklist items done=true and update phase status.",
+    "Shell / listing hygiene:",
+    "- Prefer list_dir / search_text / search_graph over shell ls/find. Never recursively list node_modules, .git, dist, or build output.",
+    "- Command stdout is auto-filtered (noise dirs stripped + size-capped); still avoid generating that noise.",
+    "Checklist progress (critical — structure is locked):",
+    "- The plan phases/checklist texts are frozen from planning. Do NOT add, remove, or rename phases or checklist items. Do NOT change questions.",
+    "- upsert_plan may ONLY flip checklist done=true/false and phase status (pending|in_progress|completed|skipped|failed).",
+    "- Always pass the full phases array with the same ids/titles/texts; change only done and status.",
+    "- After EACH completed checklist item, immediately call upsert_plan with that item done=true (keep prior done items true). Prefer one item per upsert_plan so the Plan UI animates and chimes per check.",
+    "- Do not batch many newly completed items into a single upsert_plan at the end of a long turn when you can mark them as you go.",
+    "- Update phase status (in_progress / completed) as work moves forward.",
     "Keep the plan truthful: only mark items done when the work is actually done.",
-    "When all phases are completed, say so clearly.",
+    "TANK MODE: while any checklist item is open, NEVER stop with prose only — keep calling tools (upsert_plan progress + implementation) until every item is done=true and phases are completed. The IDE will keep re-prompting forever until the checklist is complete (or the user hits Stop). No waiting for the user.",
+    "When ALL checklist items are done and phases are completed, say so clearly. Do not invent a separate test phase unless the plan already includes testing work.",
     formatPlanForPrompt(state),
   ];
 
@@ -231,27 +282,168 @@ export function buildContext(state: SessionState, userMessage: string): Turn[] {
     content: buildSystemPrompt(state),
     createdAt: new Date().toISOString(),
   };
+
+  const building = productPhaseForState(state) === "building";
+  if (!building) {
+    const history = state.turns.filter(
+      (t) => t.role === "user" || t.role === "assistant",
+    );
+    const last = history[history.length - 1];
+    const alreadyHasUser =
+      last?.role === "user" && last.content === userMessage;
+    return [
+      systemTurn,
+      ...history,
+      ...(alreadyHasUser
+        ? []
+        : [
+            {
+              id: randomUUID(),
+              role: "user" as const,
+              content: userMessage,
+              createdAt: new Date().toISOString(),
+            },
+          ]),
+    ];
+  }
+
+  // Building: goal + plan (in system) + short fresh tail — not the full chat.
+  const goal = sessionGoal(state);
   const history = state.turns.filter(
-    (t) => t.role === "user" || t.role === "assistant",
+    (t) =>
+      (t.role === "user" || t.role === "assistant") &&
+      !isNoiseTranscriptTurn(t),
   );
-  const last = history[history.length - 1];
+  const tail = history.slice(-BUILD_CONTEXT_TAIL_TURNS);
+  const turns: Turn[] = [systemTurn];
+  if (goal) {
+    const goalAlreadyInTail = tail.some(
+      (t) => t.role === "user" && t.content === goal,
+    );
+    if (!goalAlreadyInTail) {
+      turns.push({
+        id: randomUUID(),
+        role: "user",
+        content: `Original goal:\n${goal}`,
+        createdAt: new Date().toISOString(),
+      });
+    }
+  }
+  turns.push(...tail);
+  const last = turns[turns.length - 1];
   const alreadyHasUser =
     last?.role === "user" && last.content === userMessage;
-  return [
-    systemTurn,
-    ...history,
-    ...(alreadyHasUser
-      ? []
-      : [
-          {
-            id: randomUUID(),
-            role: "user" as const,
-            content: userMessage,
-            createdAt: new Date().toISOString(),
-          },
-        ]),
-  ];
+  if (!alreadyHasUser) {
+    turns.push({
+      id: randomUUID(),
+      role: "user",
+      content: userMessage,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  return turns;
 }
+
+/** First real user ask for this session (skips IDE/tank synthetic prompts). */
+export function sessionGoal(
+  state: Pick<SessionState, "turns">,
+): string | null {
+  for (const turn of state.turns) {
+    if (turn.role !== "user") continue;
+    const text = turn.content.trim();
+    if (!text || isSyntheticUserPrompt(text)) continue;
+    return text;
+  }
+  return null;
+}
+
+export function isSyntheticUserPrompt(content: string): boolean {
+  const text = content.trim();
+  if (!text) return true;
+  if (text === CHECKLIST_CONTINUE_USER_MESSAGE) return true;
+  if (text.startsWith("[IDE · TANK]")) return true;
+  if (text.startsWith("Build mode is active.")) return true;
+  if (text.startsWith("Continue: update the checklist")) return true;
+  if (text.startsWith("Continue planning:")) return true;
+  if (text === PLAN_CONTINUE_USER_MESSAGE) return true;
+  return false;
+}
+
+function isNoiseTranscriptTurn(turn: Turn): boolean {
+  if (turn.role === "user") return isSyntheticUserPrompt(turn.content);
+  if (turn.role !== "assistant") return false;
+  const c = turn.content.trim();
+  return (
+    c.startsWith("**Tank mode**") ||
+    c.startsWith("**Build paused**") ||
+    c.startsWith("**Stopped**") ||
+    c.startsWith("**Paused**")
+  );
+}
+
+/**
+ * Rebuild provider messages for a long build: fresh system/plan + original goal
+ * + a bounded live tail (tool chains kept intact).
+ */
+export function compactProviderMessages(
+  messages: ChatMessage[],
+  state: SessionState,
+  tailMax = BUILD_LIVE_MESSAGE_TAIL,
+): ChatMessage[] {
+  const system: ChatMessage = {
+    role: "system",
+    content: buildSystemPrompt(state),
+  };
+  const goal = sessionGoal(state);
+  const goalMsg: ChatMessage | null = goal
+    ? { role: "user", content: `Original goal:\n${goal}` }
+    : null;
+
+  const body = messages.filter((m) => {
+    if (m.role === "system") return false;
+    if (m.role === "user" && m.content.startsWith("Original goal:")) return false;
+    return true;
+  });
+  const tail = takeSafeMessageTail(body, tailMax);
+  return [system, ...(goalMsg ? [goalMsg] : []), ...tail];
+}
+
+/** Keep assistant→tool groups intact when slicing a live message list. */
+export function takeSafeMessageTail(
+  messages: ChatMessage[],
+  max: number,
+): ChatMessage[] {
+  if (messages.length <= max) return messages;
+  let start = messages.length - max;
+  while (start > 0 && messages[start]?.role === "tool") {
+    start -= 1;
+  }
+  const at = messages[start];
+  if (
+    at?.role === "assistant" &&
+    at.tool_calls &&
+    at.tool_calls.length > 0 &&
+    start > 0
+  ) {
+    // already on the assistant that owns following tools — good
+  } else if (start > 0 && messages[start - 1]?.role === "assistant") {
+    const prev = messages[start - 1];
+    if (
+      prev &&
+      prev.role === "assistant" &&
+      prev.tool_calls &&
+      prev.tool_calls.length > 0
+    ) {
+      start -= 1;
+    }
+  }
+  return messages.slice(start);
+}
+
+/** Max transcript turns kept after the goal in building context. */
+export const BUILD_CONTEXT_TAIL_TURNS = 10;
+/** Max live provider messages kept after system+goal during a long build turn. */
+export const BUILD_LIVE_MESSAGE_TAIL = 28;
 
 export function bumpSessionSequence(state: SessionState): SessionState {
   return { ...state, sequence: state.sequence + 1 };
@@ -306,20 +498,21 @@ export function applyUpsertPlan(
 
   const planning = productPhaseForState(state) === "planning";
 
+  if (!planning) {
+    return applyBuildPlanProgress(state, rawPhases, args, callId);
+  }
+
   const phases: PlanPhase[] = rawPhases.map((raw, index) => {
     const p = (raw ?? {}) as Record<string, unknown>;
     const checklistRaw = Array.isArray(p.checklist) ? p.checklist : [];
     // Planning: structure only — no execution progress.
-    const status = planning
-      ? "pending"
-      : normalizePhaseStatus(p.status, index === 0);
     return {
       id: typeof p.id === "string" && p.id ? p.id : randomUUID(),
       title:
         typeof p.title === "string" && p.title.trim()
           ? p.title.trim()
           : `Phase ${index + 1}`,
-      status,
+      status: "pending",
       checklist: checklistRaw.map((item, itemIndex) => {
         const c = (item ?? {}) as Record<string, unknown>;
         return {
@@ -328,7 +521,7 @@ export function applyUpsertPlan(
             typeof c.text === "string" && c.text.trim()
               ? c.text.trim()
               : `Item ${itemIndex + 1}`,
-          done: planning ? false : Boolean(c.done),
+          done: false,
         };
       }),
     };
@@ -365,6 +558,161 @@ export function applyUpsertPlan(
       output: {
         planPhases: phases,
         planQuestions: questions,
+        planStatus: next.planStatus,
+      },
+    },
+  };
+}
+
+/**
+ * Building: plan structure is frozen. Only checklist done flags and phase
+ * status may change — no add/remove/rename of phases or checklist texts.
+ */
+function applyBuildPlanProgress(
+  state: SessionState,
+  rawPhases: unknown[],
+  args: Record<string, unknown>,
+  callId: string,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const existing = state.planPhases;
+  if (existing.length === 0) {
+    return {
+      callId,
+      state,
+      result: {
+        callId,
+        success: false,
+        summary:
+          "No plan to update in Build. Structure was fixed in planning — cannot create phases here.",
+        error: "Empty plan",
+      },
+    };
+  }
+
+  // Questions are planning-only; ignore if echoed in build payloads.
+  void args.questions;
+
+  if (rawPhases.length !== existing.length) {
+    return {
+      callId,
+      state,
+      result: {
+        callId,
+        success: false,
+        summary: `Build mode cannot add/remove phases (have ${existing.length}, got ${rawPhases.length}). Only mark checks done and update phase status.`,
+        error: "Structure locked",
+      },
+    };
+  }
+
+  const incomingById = new Map<string, Record<string, unknown>>();
+  for (const raw of rawPhases) {
+    const p = (raw ?? {}) as Record<string, unknown>;
+    if (typeof p.id === "string" && p.id) incomingById.set(p.id, p);
+  }
+
+  const phases: PlanPhase[] = [];
+  for (let index = 0; index < existing.length; index++) {
+    const prev = existing[index]!;
+    const rawMatch =
+      incomingById.get(prev.id) ??
+      ((rawPhases[index] ?? {}) as Record<string, unknown>);
+
+    const incomingTitle =
+      typeof rawMatch.title === "string" ? rawMatch.title.trim() : "";
+    if (incomingTitle && incomingTitle !== prev.title) {
+      return {
+        callId,
+        state,
+        result: {
+          callId,
+          success: false,
+          summary: `Build mode cannot rename phases ("${prev.title}" → "${incomingTitle}"). Only status/done.`,
+          error: "Structure locked",
+        },
+      };
+    }
+
+    const checklistRaw = Array.isArray(rawMatch.checklist)
+      ? rawMatch.checklist
+      : null;
+    if (!checklistRaw || checklistRaw.length !== prev.checklist.length) {
+      return {
+        callId,
+        state,
+        result: {
+          callId,
+          success: false,
+          summary: `Build mode cannot add/remove checklist items on "${prev.title}" (have ${prev.checklist.length}, got ${checklistRaw?.length ?? 0}). Only check/uncheck.`,
+          error: "Structure locked",
+        },
+      };
+    }
+
+    const itemById = new Map<string, Record<string, unknown>>();
+    for (const item of checklistRaw) {
+      const c = (item ?? {}) as Record<string, unknown>;
+      if (typeof c.id === "string" && c.id) itemById.set(c.id, c);
+    }
+
+    const checklist = [];
+    for (let itemIndex = 0; itemIndex < prev.checklist.length; itemIndex++) {
+      const prevItem = prev.checklist[itemIndex]!;
+      const incomingItem =
+        itemById.get(prevItem.id) ??
+        ((checklistRaw[itemIndex] ?? {}) as Record<string, unknown>);
+
+      const incomingText =
+        typeof incomingItem.text === "string" ? incomingItem.text.trim() : "";
+      if (incomingText && incomingText !== prevItem.text) {
+        return {
+          callId,
+          state,
+          result: {
+            callId,
+            success: false,
+            summary: `Build mode cannot edit checklist text ("${prevItem.text}"). Only done=true/false.`,
+            error: "Structure locked",
+          },
+        };
+      }
+
+      checklist.push({
+        id: prevItem.id,
+        text: prevItem.text,
+        done:
+          typeof incomingItem.done === "boolean"
+            ? incomingItem.done
+            : prevItem.done,
+      });
+    }
+
+    phases.push({
+      id: prev.id,
+      title: prev.title,
+      status: normalizePhaseStatus(rawMatch.status, prev.status),
+      checklist,
+    });
+  }
+
+  const next: SessionState = {
+    ...state,
+    planPhases: phases,
+    planSteps: [],
+    planStatus: "executing",
+  };
+
+  const { done, total } = sharedPlanChecklistProgress(next);
+  return {
+    callId,
+    state: next,
+    result: {
+      callId,
+      success: true,
+      summary: `Progress updated: ${done}/${total} checklist · phase statuses synced.`,
+      output: {
+        planPhases: phases,
+        planQuestions: next.planQuestions,
         planStatus: next.planStatus,
       },
     },
@@ -535,7 +883,7 @@ export function applyFinalizePlan(
 
 function normalizePhaseStatus(
   value: unknown,
-  isFirst: boolean,
+  fallback: PlanPhase["status"] | boolean = "pending",
 ): PlanPhase["status"] {
   const allowed = new Set([
     "pending",
@@ -547,7 +895,10 @@ function normalizePhaseStatus(
   if (typeof value === "string" && allowed.has(value)) {
     return value as PlanPhase["status"];
   }
-  return isFirst ? "in_progress" : "pending";
+  if (typeof fallback === "boolean") {
+    return fallback ? "in_progress" : "pending";
+  }
+  return fallback;
 }
 
 function parsePlanQuestion(raw: unknown, index: number): PlanQuestion {
@@ -767,3 +1118,63 @@ export function productPhaseForState(
   if (state.mode === "plan" || state.planStatus === "drafting") return "planning";
   return "building";
 }
+
+/** True when build plan still has unfinished checklist items or open phases. */
+export function planHasOpenWork(
+  state: Pick<SessionState, "planPhases">,
+): boolean {
+  return sharedPlanHasOpenWork(state);
+}
+
+export function planChecklistProgress(
+  state: Pick<SessionState, "planPhases">,
+): { done: number; total: number } {
+  return sharedPlanChecklistProgress(state);
+}
+
+/** Open Plan Q&A items waiting on the user. */
+export function hasOpenPlanQuestions(
+  state: Pick<SessionState, "planQuestions">,
+): boolean {
+  return state.planQuestions.some((q) => q.status === "open");
+}
+
+/**
+ * Keep the agent loop running without user input:
+ * - building: until checklist/phases are complete
+ * - planning (mode=plan): until propose_plan_ready (Start Build) or open questions await the user
+ */
+export function isAgentTankMode(state: SessionState): boolean {
+  const phase = productPhaseForState(state);
+  if (phase === "building") {
+    return sharedPlanHasOpenWork(state);
+  }
+  // Only the Plan workflow tanks — not casual ask/autonomous with drafting status.
+  if (phase === "planning" && state.mode === "plan") {
+    if (state.planReadyProposal) return false;
+    if (hasOpenPlanQuestions(state)) return false;
+    return true;
+  }
+  return false;
+}
+
+export const CHECKLIST_CONTINUE_NUDGE = [
+  "[IDE · TANK] Checklist still incomplete — do not stop.",
+  "Plan structure is locked: upsert_plan may only flip checklist done and phase status (no add/remove/rename).",
+  "Immediately with tools:",
+  "1) upsert_plan: mark finished items done=true; update phase status.",
+  "2) Execute the next open checklist item (write_file / run_command / …).",
+  "Prefer tools over narration. Keep going until the checklist is fully done.",
+].join("\n");
+
+export const PLAN_CONTINUE_NUDGE = [
+  "[IDE · TANK] Planning is not finished — do not stop on narration.",
+  "Immediately with tools:",
+  "1) upsert_plan with concrete phases + checklist item texts (draft outline).",
+  "2) If anything is unclear, add open questions with selection + options (Plan Q&A UI).",
+  "3) When the plan is solid and questions are cleared, call propose_plan_ready.",
+  "Do not only explore/list files. Produce plan structure or questions now.",
+].join("\n");
+
+export { CHECKLIST_CONTINUE_USER_MESSAGE, PLAN_CONTINUE_USER_MESSAGE };
+

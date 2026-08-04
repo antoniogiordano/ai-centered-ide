@@ -3,7 +3,7 @@ import { deriveProductPhase } from "@ai-ide/shared";
 import { getBridge } from "./bridge";
 import { useBridgeReady, useSessionState } from "./hooks/useSessionState";
 import { OnboardingWizard } from "./components/OnboardingWizard";
-import { ConversationPane, VerifyPane, type VerifyTab } from "./components/Cockpit";
+import { ConversationPane, VerifyPane } from "./components/Cockpit";
 import { ComposerBar } from "./components/ComposerBar";
 import { CommandPalette } from "./components/CommandPalette";
 import {
@@ -12,6 +12,7 @@ import {
   type PlanQaAnswer,
 } from "./components/PlanQaDialog";
 import { StartBuildDialog } from "./components/StartBuildDialog";
+import { CommitBuildDialog } from "./components/CommitBuildDialog";
 import { NewProjectDialog } from "./components/NewProjectDialog";
 import {
   ArchitecturePane,
@@ -53,11 +54,14 @@ export function App() {
   const [onboarded, setOnboarded] = useState(readOnboardingComplete);
   const [providerOpen, setProviderOpen] = useState(() => !readOnboardingComplete());
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [verifyTab, setVerifyTab] = useState<VerifyTab>("plan");
   const [qaOpen, setQaOpen] = useState(false);
   const [qaFocusRequestId, setQaFocusRequestId] = useState(0);
   const [qaDismissedKey, setQaDismissedKey] = useState<string | null>(null);
   const [startBuildOpen, setStartBuildOpen] = useState(false);
+  const [commitBuildOpen, setCommitBuildOpen] = useState(false);
+  const [commitBuildDismissedKey, setCommitBuildDismissedKey] = useState<
+    string | null
+  >(null);
   const [startBuildDismissedKey, setStartBuildDismissedKey] = useState<
     string | null
   >(null);
@@ -70,12 +74,6 @@ export function App() {
     hasRemote: boolean;
   } | null>(null);
   const composerRef = useRef<HTMLInputElement>(null);
-  const lastAutoFocus = useRef<string | null>(null);
-
-  const liveTerminalCount = state?.liveTerminals?.length ?? 0;
-  useEffect(() => {
-    if (liveTerminalCount > 0) setVerifyTab("terminal");
-  }, [liveTerminalCount]);
 
   const openPlanQuestions = useMemo(
     () => (state?.planQuestions ?? []).filter((q) => q.status === "open"),
@@ -119,11 +117,17 @@ export function App() {
     setQaOpen(false);
     setStartBuildOpen(false);
     setStartBuildDismissedKey(null);
+    setCommitBuildOpen(false);
+    setCommitBuildDismissedKey(null);
   }, [activeSessionId]);
 
   const planReady = Boolean(state?.planReadyProposal);
   const planReadyKey = state?.planReadyProposal
     ? `${state.sessionId}:${state.planReadyProposal.suggestedBranch}:${state.planReadyProposal.summary ?? ""}`
+    : null;
+  const buildCommitOffer = state?.buildCommitOffer ?? null;
+  const buildCommitKey = buildCommitOffer
+    ? `${state?.sessionId}:${buildCommitOffer.offeredAt}`
     : null;
   const openStartBuild = useCallback(() => {
     if (!state?.planReadyProposal) return;
@@ -137,7 +141,7 @@ export function App() {
       return;
     }
     if (startBuildDismissedKey === planReadyKey) return;
-    if (qaOpen || providerOpen || newProjectOpen) return;
+    if (qaOpen || providerOpen || newProjectOpen || commitBuildOpen) return;
     setStartBuildOpen(true);
   }, [
     planning,
@@ -147,6 +151,26 @@ export function App() {
     qaOpen,
     providerOpen,
     newProjectOpen,
+    commitBuildOpen,
+  ]);
+
+  // Auto-open local commit dialog when build checklist is complete.
+  useEffect(() => {
+    if (!buildCommitOffer || !buildCommitKey) {
+      setCommitBuildOpen(false);
+      return;
+    }
+    if (commitBuildDismissedKey === buildCommitKey) return;
+    if (providerOpen || newProjectOpen || startBuildOpen || qaOpen) return;
+    setCommitBuildOpen(true);
+  }, [
+    buildCommitOffer,
+    buildCommitKey,
+    commitBuildDismissedKey,
+    providerOpen,
+    newProjectOpen,
+    startBuildOpen,
+    qaOpen,
   ]);
 
   useEffect(() => {
@@ -263,29 +287,6 @@ export function App() {
     setQaOpen(false);
     setQaDismissedKey(openQuestionKey);
   }
-
-  // Auto-focus Plan while drafting; Diff when development starts.
-  useEffect(() => {
-    if (!state) return;
-    const key = `${state.sessionId}:${state.mode}:${state.planStatus}`;
-    if (lastAutoFocus.current === key) return;
-    lastAutoFocus.current = key;
-    if (state.mode === "plan" || state.planStatus === "drafting") {
-      setVerifyTab("plan");
-      return;
-    }
-    if (state.mode === "agent" || state.planStatus === "executing") {
-      setVerifyTab((current) => (current === "plan" ? "diff" : current));
-    }
-  }, [state?.sessionId, state?.mode, state?.planStatus]);
-
-  // Keep Plan tab in view when the plan structure changes during planning.
-  useEffect(() => {
-    if (!state) return;
-    if (state.mode === "plan" || state.planStatus === "drafting") {
-      setVerifyTab("plan");
-    }
-  }, [state?.planPhases, state?.mode, state?.planStatus]);
 
   const workspaceRoot = state?.workspace?.resolvedRootPath ?? null;
 
@@ -488,8 +489,6 @@ export function App() {
           ) : (
             <VerifyPane
               state={state}
-              activeTab={verifyTab}
-              onTabChange={setVerifyTab}
               planning={phase === "planning"}
               onOpenQa={() => {
                 setQaDismissedKey(null);
@@ -505,15 +504,12 @@ export function App() {
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
-        currentVerifyTab={verifyTab}
-        planning={phase === "planning"}
         onOpenWorkspace={() => void openWorkspace()}
         onNewProject={() => setNewProjectOpen(true)}
         onFocusComposer={() => {
           if (qaOpen) setQaFocusRequestId((n) => n + 1);
           else composerRef.current?.focus();
         }}
-        onSetVerifyTab={setVerifyTab}
         onOpenProviderSettings={openProviderSettings}
         onOpenArchitecture={openArchitecturePane}
       />
@@ -547,6 +543,28 @@ export function App() {
         }}
         onConfirmed={() => {
           setStartBuildOpen(false);
+          void getBridge()?.workspace.gitStatus().then((info) => {
+            if (info) setGitStatus(info);
+          });
+        }}
+      />
+
+      <CommitBuildDialog
+        open={
+          commitBuildOpen &&
+          Boolean(buildCommitOffer) &&
+          !providerOpen &&
+          !newProjectOpen &&
+          !startBuildOpen
+        }
+        offer={buildCommitOffer}
+        onClose={() => {
+          setCommitBuildOpen(false);
+          if (buildCommitKey) setCommitBuildDismissedKey(buildCommitKey);
+        }}
+        onCommitted={() => {
+          setCommitBuildOpen(false);
+          if (buildCommitKey) setCommitBuildDismissedKey(buildCommitKey);
           void getBridge()?.workspace.gitStatus().then((info) => {
             if (info) setGitStatus(info);
           });
