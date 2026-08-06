@@ -434,6 +434,60 @@ export class GhCli {
       owner,
     };
   }
+
+  /** Create a pull request with `gh pr create`. Returns the PR URL. */
+  async createPullRequest(input: {
+    cwd: string;
+    base: string;
+    head: string;
+    title: string;
+    body?: string;
+  }): Promise<{ url: string }> {
+    const binary = this.resolveBinary();
+    if (!binary) {
+      throw new AppError({
+        code: "NOT_FOUND",
+        userMessage: "GitHub CLI (gh) is not installed.",
+        technicalDetail: "gh binary missing",
+      });
+    }
+
+    const status = await this.status();
+    if (!status.authenticated) {
+      throw new AppError({
+        code: "PERMISSION_DENIED",
+        userMessage: "GitHub CLI is not authenticated. Run: gh auth login",
+        technicalDetail: status.detail ?? "unauthenticated",
+      });
+    }
+
+    const args = [
+      "pr",
+      "create",
+      "--base",
+      input.base,
+      "--head",
+      input.head,
+      "--title",
+      input.title.trim() || input.head,
+      "--body",
+      input.body?.trim() || "",
+    ];
+    const result = await runGh(binary, args, { cwd: input.cwd });
+    const url =
+      result.stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => /^https?:\/\//i.test(l)) ?? result.stdout.trim();
+    if (!url) {
+      throw new AppError({
+        code: "PROVIDER_ERROR",
+        userMessage: "Pull request was created but no URL was returned.",
+        technicalDetail: result.stdout.slice(0, 400),
+      });
+    }
+    return { url };
+  }
 }
 
 function runGhSpawn(

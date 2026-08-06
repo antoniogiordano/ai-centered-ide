@@ -73,6 +73,14 @@ describe("phase tool gating", () => {
         "read_file",
         "search_text",
         "upsert_plan",
+        "read_plan",
+        "add_phase",
+        "replace_phase",
+        "delete_phase",
+        "add_check",
+        "replace_check",
+        "delete_check",
+        "set_questions",
         "propose_plan_ready",
         "read_architecture",
         "upsert_architecture",
@@ -99,9 +107,12 @@ describe("phase tool gating", () => {
         "search_graph",
         "get_code_snippet",
         "upsert_plan",
+        "propose_testing_ready",
         "read_architecture",
       ]),
     );
     expect(names).not.toContain("propose_plan_ready");
+    expect(names).not.toContain("add_phase");
+    expect(names).not.toContain("set_questions");
   });
 });

@@ -64,6 +64,67 @@ describe("FilesystemService", () => {
     expect(fs.read("hello.txt")).toBe("world");
     rmSync(dir, { recursive: true });
   });
+
+  it("readWindow pages lines and reports nextStartLine", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const fs = new FilesystemService(dir);
+    const body = Array.from({ length: 40 }, (_, i) => `line-${i + 1}`).join(
+      "\n",
+    );
+    fs.write("big.txt", body);
+
+    const first = await fs.readWindow("big.txt", {
+      startLine: 1,
+      maxLines: 10,
+    });
+    expect(first.content.split("\n")).toHaveLength(10);
+    expect(first.startLine).toBe(1);
+    expect(first.endLine).toBe(10);
+    expect(first.truncated).toBe(true);
+    expect(first.nextStartLine).toBe(11);
+    expect(first.totalLines).toBe(40);
+
+    const second = await fs.readWindow("big.txt", {
+      startLine: 11,
+      maxLines: 10,
+    });
+    expect(second.content.startsWith("line-11")).toBe(true);
+    expect(second.endLine).toBe(20);
+
+    const last = await fs.readWindow("big.txt", {
+      startLine: 35,
+      maxLines: 20,
+    });
+    expect(last.truncated).toBe(false);
+    expect(last.nextStartLine).toBeNull();
+    expect(last.endLine).toBe(40);
+
+    rmSync(dir, { recursive: true });
+  });
+
+  it("readWindow streams files larger than maxReadBytes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const fs = new FilesystemService(dir, 2_000);
+    // ~4KB of lines → above 2KB cap for full read(), but windowed stream works.
+    const lines = Array.from({ length: 200 }, (_, i) => `row-${i + 1}-${"x".repeat(16)}`);
+    writeFileSync(join(dir, "huge.txt"), lines.join("\n"), "utf8");
+
+    expect(() => fs.read("huge.txt")).toThrow(/too large|startLine/i);
+
+    const window = await fs.readWindow("huge.txt", {
+      startLine: 50,
+      maxLines: 5,
+    });
+    expect(window.content).toContain("row-50-");
+    expect(window.startLine).toBe(50);
+    expect(window.endLine).toBe(54);
+    expect(window.truncated).toBe(true);
+    expect(window.nextStartLine).toBe(55);
+    // Streamed truncated windows skip a full line count.
+    expect(window.totalLines).toBeNull();
+
+    rmSync(dir, { recursive: true });
+  });
 });
 
 describe("searchText", () => {

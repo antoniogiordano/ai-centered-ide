@@ -12,9 +12,9 @@ import type {
   SessionState,
   SessionSummary,
   ToolCall,
-  ToolResult,
   Turn,
 } from "@ai-ide/shared";
+import { deriveProductPhase } from "@ai-ide/shared";
 import { getBridge } from "../bridge";
 import { ArchitectureSummary } from "./ArchitectureSummary";
 import {
@@ -25,6 +25,8 @@ import {
 import { LiveTerminalPane } from "./LiveTerminalPane";
 import { DiffNavigator } from "./DiffNavigator";
 import { BuildContinueBanner } from "./BuildContinueBanner";
+import { StartBuildBanner } from "./StartBuildBanner";
+import { TestingReportBoard } from "./TestingReportBoard";
 import { playChecklistChime } from "../lib/checklistSound";
 
 const SCROLL_STICK_THRESHOLD_PX = 96;
@@ -48,15 +50,21 @@ function toolNameByCallId(turn: Turn): Map<string, string> {
 function actionLabel(toolName: string): string {
   switch (toolName) {
     case "write_file":
-      return "Modified file";
+      return "Write file";
     case "run_command":
-      return "Ran command";
+      return "Run command";
+    case "get_test_report":
+      return "Test report";
+    case "list_failed_tests":
+      return "Failed tests";
+    case "read_test_log":
+      return "Read test log";
     case "read_file":
       return "Read file";
     case "list_dir":
-      return "Listed directory";
+      return "List dir";
     case "search_text":
-      return "Searched text";
+      return "Search text";
     case "git_status":
       return "Git status";
     case "git_diff":
@@ -64,9 +72,85 @@ function actionLabel(toolName: string): string {
     case "git_commit":
       return "Git commit";
     case "checkpoint_restore":
-      return "Restored checkpoint";
+      return "Restore checkpoint";
+    case "upsert_plan":
+      return "Update plan";
+    case "read_plan":
+      return "Read plan";
+    case "add_phase":
+      return "Add phase";
+    case "replace_phase":
+      return "Replace phase";
+    case "delete_phase":
+      return "Delete phase";
+    case "add_check":
+      return "Add check";
+    case "replace_check":
+      return "Replace check";
+    case "delete_check":
+      return "Delete check";
+    case "set_questions":
+      return "Set questions";
+    case "propose_plan_ready":
+      return "Propose plan ready";
+    case "propose_testing_ready":
+      return "Propose testing ready";
+    case "search_graph":
+      return "Graph search";
+    case "search_code":
+      return "Code search";
     default:
       return toolName.replace(/_/g, " ");
+  }
+}
+
+/** One-line target for the collapsed tool row (path / command / query). */
+function toolTargetPreview(
+  toolName: string,
+  args: Record<string, unknown> | undefined,
+): string | null {
+  if (!args) return null;
+  if (typeof args.path === "string" && args.path.trim()) {
+    return args.path.trim();
+  }
+  if (typeof args.command === "string" && args.command.trim()) {
+    const cmd = args.command.trim().replace(/\s+/g, " ");
+    return cmd.length > 100 ? `${cmd.slice(0, 97)}…` : cmd;
+  }
+  if (typeof args.query === "string" && args.query.trim()) {
+    const q = args.query.trim();
+    return q.length > 80 ? `“${q.slice(0, 77)}…”` : `“${q}”`;
+  }
+  if (typeof args.text === "string" && args.text.trim() && toolName.startsWith("terminal_")) {
+    const t = args.text.trim().replace(/\s+/g, " ");
+    return t.length > 80 ? `${t.slice(0, 77)}…` : t;
+  }
+  if (toolName === "upsert_plan" && Array.isArray(args.phases)) {
+    return `${args.phases.length} phase${args.phases.length === 1 ? "" : "s"}`;
+  }
+  return null;
+}
+
+/** Args for the expandable log — keep full write_file content (scrollable in UI). */
+function formatToolArgsForLog(
+  _toolName: string,
+  args: Record<string, unknown> | undefined,
+): string | null {
+  if (!args || Object.keys(args).length === 0) return null;
+  try {
+    return JSON.stringify(args, null, 2);
+  } catch {
+    return String(args);
+  }
+}
+
+function formatToolOutputForLog(output: unknown): string | null {
+  if (output === undefined || output === null) return null;
+  if (typeof output === "string") return output;
+  try {
+    return JSON.stringify(output, null, 2);
+  } catch {
+    return String(output);
   }
 }
 
@@ -97,68 +181,81 @@ function extractCommandHistory(
   return history;
 }
 
-function ActionCard(props: { toolName: string; result: ToolResult; toolCall?: ToolCall }) {
+function ToolLogCard(props: {
+  toolName: string;
+  status: "running" | "done" | "failed";
+  label?: string;
+  summary?: string;
+  error?: string;
+  arguments?: Record<string, unknown>;
+  output?: unknown;
+}) {
   const [expanded, setExpanded] = useState(false);
   const label = actionLabel(props.toolName);
+  const target = toolTargetPreview(props.toolName, props.arguments);
+  const argsLog = formatToolArgsForLog(props.toolName, props.arguments);
+  const outputLog = formatToolOutputForLog(props.output);
+  const statusClass =
+    props.status === "running"
+      ? "tool-row-running"
+      : props.status === "done"
+        ? "tool-row-ok"
+        : "tool-row-fail";
 
   return (
-    <div className={`tool-row ${props.result.success ? "tool-row-ok" : "tool-row-fail"}`}>
+    <div className={`tool-row ${statusClass}`}>
       <button
         type="button"
         className="tool-row-header"
         onClick={() => setExpanded((v) => !v)}
         aria-expanded={expanded}
       >
-        <span className="tool-row-label">{label}</span>
-        <span className="tool-row-meta">{props.result.success ? "done" : "failed"}</span>
-      </button>
-      {expanded ? (
-        <div className="tool-row-body">
-          <p>{props.result.summary}</p>
-          {props.result.error ? (
-            <p className="tool-row-error">{props.result.error}</p>
-          ) : null}
-          {props.toolCall ? (
-            <pre className="tool-row-args">
-              {JSON.stringify(props.toolCall.arguments, null, 2)}
-            </pre>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-function LiveToolRow(props: {
-  label: string;
-  status: "running" | "done" | "failed";
-  summary?: string;
-}) {
-  return (
-    <div className={`tool-row tool-row-${props.status === "running" ? "running" : props.status === "done" ? "ok" : "fail"}`}>
-      <div className="tool-row-header">
         <span className="tool-row-label">
           {props.status === "running" ? (
             <span className="thinking-spinner" aria-hidden />
           ) : null}
-          {props.label}
+          <span className="tool-row-name">{label}</span>
+          {target ? <span className="tool-row-target">{target}</span> : null}
         </span>
-        <span className="tool-row-meta">{props.status}</span>
-      </div>
-      {props.summary ? (
+        <span className="tool-row-meta">
+          {props.status}
+          <span className="tool-row-chevron" aria-hidden>
+            {expanded ? "▾" : "▸"}
+          </span>
+        </span>
+      </button>
+      {expanded ? (
         <div className="tool-row-body">
-          <p>{props.summary}</p>
+          <p className="tool-row-toolid">
+            <code>{props.toolName}</code>
+            {props.label && props.label !== label ? (
+              <span> · {props.label}</span>
+            ) : null}
+          </p>
+          {props.summary?.trim() ? (
+            <p className="tool-row-summary">{props.summary.trim()}</p>
+          ) : null}
+          {props.error ? (
+            <p className="tool-row-error">{props.error}</p>
+          ) : null}
+          {argsLog ? (
+            <>
+              <div className="tool-row-section">Arguments</div>
+              <pre className="tool-row-args">{argsLog}</pre>
+            </>
+          ) : (
+            <p className="tool-row-summary">No arguments yet.</p>
+          )}
+          {outputLog ? (
+            <>
+              <div className="tool-row-section">Output</div>
+              <pre className="tool-row-output">{outputLog}</pre>
+            </>
+          ) : null}
         </div>
       ) : null}
     </div>
   );
-}
-
-function modEnterHint(): string {
-  const isApple =
-    typeof navigator !== "undefined" &&
-    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-  return isApple ? "⌘↵" : "Ctrl+Enter";
 }
 
 function modShiftHint(key: string): string {
@@ -175,68 +272,106 @@ function roleHeading(role: Turn["role"]): string {
   return "Tool";
 }
 
+const VISIBLE_USER_COLLAPSE_CHARS = 160;
+
+export type ChatClipboardMode = "visible" | "deep";
+
 /** Plain-text export of the open chat for the clipboard. */
 export function formatChatForClipboard(
   turns: Turn[],
   meta?: { title?: string | null; workspaceName?: string | null },
+  mode: ChatClipboardMode = "visible",
 ): string {
+  const deep = mode === "deep";
   const lines: string[] = [];
   const title = meta?.title?.trim() || "Chat";
   lines.push(`# ${title}`);
   if (meta?.workspaceName?.trim()) {
     lines.push(`Workspace: ${meta.workspaceName.trim()}`);
   }
+  if (deep) {
+    lines.push("Mode: deep (full tool args + output)");
+  }
   lines.push("");
 
   for (const turn of turns) {
     lines.push(`## ${roleHeading(turn.role)}`);
     const body = turn.content.trim();
-    if (body) lines.push(body);
+    if (body) {
+      if (
+        !deep &&
+        turn.role === "user" &&
+        body.length > VISIBLE_USER_COLLAPSE_CHARS
+      ) {
+        lines.push(`${body.slice(0, VISIBLE_USER_COLLAPSE_CHARS).trimEnd()}…`);
+      } else {
+        lines.push(body);
+      }
+    }
 
     for (const result of turn.toolResults ?? []) {
       const call = turn.toolCalls?.find((c) => c.id === result.callId);
       const name = call?.name ?? "tool";
-      const status = result.success ? "ok" : "failed";
+      const status = result.success ? "done" : "failed";
+      const target = toolTargetPreview(name, call?.arguments);
       lines.push("");
-      lines.push(`### ${actionLabel(name)} · ${name} (${status})`);
-      if (result.summary?.trim()) {
-        lines.push(result.summary.trim());
-      }
-      if (result.error?.trim()) {
-        lines.push("");
-        lines.push(`Error: ${result.error.trim()}`);
-      }
-      if (call?.arguments && Object.keys(call.arguments).length > 0) {
-        lines.push("");
-        lines.push("Arguments:");
-        lines.push("```json");
-        lines.push(JSON.stringify(call.arguments, null, 2));
-        lines.push("```");
-      }
-      if (result.output !== undefined) {
-        lines.push("");
-        lines.push("Output:");
-        if (typeof result.output === "string") {
-          lines.push(result.output);
-        } else {
+      if (deep) {
+        lines.push(`### ${actionLabel(name)} · ${name} (${status})`);
+        if (result.summary?.trim()) {
+          lines.push(result.summary.trim());
+        }
+        if (result.error?.trim()) {
+          lines.push("");
+          lines.push(`Error: ${result.error.trim()}`);
+        }
+        if (call?.arguments && Object.keys(call.arguments).length > 0) {
+          lines.push("");
+          lines.push("Arguments:");
           lines.push("```json");
-          lines.push(JSON.stringify(result.output, null, 2));
+          lines.push(JSON.stringify(call.arguments, null, 2));
           lines.push("```");
+        }
+        if (result.output !== undefined) {
+          lines.push("");
+          lines.push("Output:");
+          if (typeof result.output === "string") {
+            lines.push(result.output);
+          } else {
+            lines.push("```json");
+            lines.push(JSON.stringify(result.output, null, 2));
+            lines.push("```");
+          }
+        }
+      } else {
+        // Collapsed tool row as shown in chat (label + one-line target).
+        const head = target
+          ? `${actionLabel(name)} · ${target} · ${status}`
+          : `${actionLabel(name)} · ${status}`;
+        lines.push(`- ${head}`);
+        if (result.error?.trim()) {
+          lines.push(`  Error: ${result.error.trim()}`);
         }
       }
     }
 
-    // Tool calls without a matching result (rare / in-flight after cancel).
     for (const call of turn.toolCalls ?? []) {
       const hasResult = (turn.toolResults ?? []).some((r) => r.callId === call.id);
       if (hasResult) continue;
       lines.push("");
-      lines.push(`### ${actionLabel(call.name)} · ${call.name} (no result)`);
-      if (call.arguments && Object.keys(call.arguments).length > 0) {
-        lines.push("Arguments:");
-        lines.push("```json");
-        lines.push(JSON.stringify(call.arguments, null, 2));
-        lines.push("```");
+      const target = toolTargetPreview(call.name, call.arguments);
+      if (deep) {
+        lines.push(`### ${actionLabel(call.name)} · ${call.name} (no result)`);
+        if (call.arguments && Object.keys(call.arguments).length > 0) {
+          lines.push("Arguments:");
+          lines.push("```json");
+          lines.push(JSON.stringify(call.arguments, null, 2));
+          lines.push("```");
+        }
+      } else {
+        const head = target
+          ? `${actionLabel(call.name)} · ${target} · running`
+          : `${actionLabel(call.name)} · running`;
+        lines.push(`- ${head}`);
       }
     }
 
@@ -249,7 +384,6 @@ export function formatChatForClipboard(
 function PlanBoard(props: {
   state: SessionState | null;
   onOpenQa?: (() => void) | undefined;
-  onConfirmPlan?: (() => void) | undefined;
   planning?: boolean;
   compact?: boolean;
 }) {
@@ -257,12 +391,9 @@ function PlanBoard(props: {
   const questions = props.state?.planQuestions ?? [];
   const planStatus = props.state?.planStatus ?? "drafting";
   const mode = props.state?.mode ?? "plan";
-  const proposal = props.state?.planReadyProposal ?? null;
   const planning =
     props.planning ??
     (mode === "plan" || planStatus === "drafting");
-  const showReadyCta =
-    planning && Boolean(proposal) && typeof props.onConfirmPlan === "function";
   const [justDoneIds, setJustDoneIds] = useState<Set<string>>(() => new Set());
   const knownDoneRef = useRef<Set<string> | null>(null);
 
@@ -325,7 +456,7 @@ function PlanBoard(props: {
 
   return (
     <div
-      className={`plan-board ${planning ? "plan-board-drafting" : ""} ${showReadyCta ? "plan-board-ready" : ""} ${props.compact ? "plan-board-compact" : ""}`}
+      className={`plan-board ${planning ? "plan-board-drafting" : ""} ${props.compact ? "plan-board-compact" : ""}`}
     >
       <div className="plan-board-scroll">
         <div className="plan-board-header">
@@ -394,13 +525,23 @@ function PlanBoard(props: {
                         })}
                       </div>
                     ) : null}
-                    {q.answer ? (
-                      <div className="plan-question-answer">{q.answer}</div>
-                    ) : (
-                      <div className="plan-question-answer muted">
-                        Waiting for answer in Q&A dialog…
-                      </div>
-                    )}
+                    {(() => {
+                      const options = q.options ?? [];
+                      const pickedIds = q.selectedOptionIds ?? [];
+                      const pillsShowAnswer =
+                        options.length > 0 && pickedIds.length > 0;
+                      if (pillsShowAnswer) return null;
+                      if (q.answer) {
+                        return (
+                          <div className="plan-question-answer">{q.answer}</div>
+                        );
+                      }
+                      return (
+                        <div className="plan-question-answer muted">
+                          Waiting for answer in Q&A dialog…
+                        </div>
+                      );
+                    })()}
                   </div>
                 </li>
               ))}
@@ -448,27 +589,6 @@ function PlanBoard(props: {
           ))}
         </ol>
       </div>
-
-      {showReadyCta && proposal ? (
-        <div className="plan-board-cta">
-          <div className="plan-board-cta-copy">
-            <strong>Plan ready</strong>
-            <span className="muted">
-              {proposal.summary?.trim()
-                ? proposal.summary
-                : `Suggested branch ${proposal.suggestedBranch}`}
-            </span>
-          </div>
-          <button
-            type="button"
-            className="btn btn-primary plan-board-cta-btn"
-            onClick={props.onConfirmPlan}
-            title={`Confirm plan (${modEnterHint()})`}
-          >
-            Start building · {modEnterHint()}
-          </button>
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -486,8 +606,9 @@ export function ConversationPane(props: {
   state: SessionState | null;
   sessions: SessionSummary[];
   activeSessionId: string | null;
+  onBuildStarted?: (() => void) | undefined;
 }) {
-  const { state, sessions, activeSessionId } = props;
+  const { state, sessions, activeSessionId, onBuildStarted } = props;
   const bridge = getBridge();
   const busy = isBusy(state?.status);
   const canCancel = typeof bridge?.session.cancel === "function";
@@ -518,7 +639,11 @@ export function ConversationPane(props: {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
     "idle",
   );
+  const [copyDeepState, setCopyDeepState] = useState<
+    "idle" | "copied" | "failed"
+  >("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyDeepResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const tabSessions =
     sessions.length > 0
@@ -541,45 +666,57 @@ export function ConversationPane(props: {
   const activeTabTitle =
     tabSessions.find((s) => s.id === activeSessionId)?.title ?? "Chat";
 
-  async function copyChat() {
+  async function copyChat(mode: ChatClipboardMode) {
     if (turns.length === 0) return;
-    const text = formatChatForClipboard(turns, {
-      title: activeTabTitle,
-      workspaceName: state?.workspace?.name ?? null,
-    });
+    const text = formatChatForClipboard(
+      turns,
+      {
+        title: activeTabTitle,
+        workspaceName: state?.workspace?.name ?? null,
+      },
+      mode,
+    );
+    const setState = mode === "deep" ? setCopyDeepState : setCopyState;
+    const resetRef = mode === "deep" ? copyDeepResetRef : copyResetRef;
     try {
       await navigator.clipboard.writeText(text);
-      setCopyState("copied");
+      setState("copied");
     } catch {
-      setCopyState("failed");
+      setState("failed");
     }
-    if (copyResetRef.current) clearTimeout(copyResetRef.current);
-    copyResetRef.current = setTimeout(() => setCopyState("idle"), 1600);
+    if (resetRef.current) clearTimeout(resetRef.current);
+    resetRef.current = setTimeout(() => setState("idle"), 1600);
   }
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (!(e.metaKey || e.ctrlKey) || !e.shiftKey) return;
-      if (e.key.toLowerCase() !== "c") return;
+      const key = e.key.toLowerCase();
+      if (key !== "c" && key !== "d") return;
       if (turns.length === 0) return;
       e.preventDefault();
-      void copyChat();
+      void copyChat(key === "d" ? "deep" : "visible");
     }
     function onCopyEvent() {
-      void copyChat();
+      void copyChat("visible");
+    }
+    function onCopyDeepEvent() {
+      void copyChat("deep");
     }
     window.addEventListener("keydown", onKey, true);
     window.addEventListener("aifi:copy-open-chat", onCopyEvent);
+    window.addEventListener("aifi:copy-open-chat-deep", onCopyDeepEvent);
     return () => {
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("aifi:copy-open-chat", onCopyEvent);
+      window.removeEventListener("aifi:copy-open-chat-deep", onCopyDeepEvent);
     };
-    // copyChat closes over latest turns/title; rebind when transcript changes.
   }, [turns, activeTabTitle, state?.workspace?.name]);
 
   useEffect(() => {
     return () => {
       if (copyResetRef.current) clearTimeout(copyResetRef.current);
+      if (copyDeepResetRef.current) clearTimeout(copyDeepResetRef.current);
     };
   }, []);
 
@@ -624,11 +761,13 @@ export function ConversationPane(props: {
 
   function phaseLetter(phase: string | undefined): string {
     if (phase === "building") return "B";
+    if (phase === "testing") return "T";
     return "P";
   }
 
   function phaseTitle(phase: string | undefined): string {
     if (phase === "building") return "Build";
+    if (phase === "testing") return "Test";
     return "Plan";
   }
 
@@ -638,6 +777,12 @@ export function ConversationPane(props: {
       : copyState === "failed"
         ? "Copy failed"
         : `Copy · ${modShiftHint("C")}`;
+  const copyDeepLabel =
+    copyDeepState === "copied"
+      ? "Copied deep"
+      : copyDeepState === "failed"
+        ? "Deep failed"
+        : `Deep · ${modShiftHint("D")}`;
 
   return (
     <>
@@ -681,12 +826,22 @@ export function ConversationPane(props: {
         <button
           type="button"
           className="session-tab-copy"
-          title="Copy entire open chat"
-          aria-label="Copy entire open chat"
+          title={`Copy visible chat (${modShiftHint("C")})`}
+          aria-label={`Copy visible chat (${modShiftHint("C")})`}
           disabled={turns.length === 0}
-          onClick={() => void copyChat()}
+          onClick={() => void copyChat("visible")}
         >
           {copyLabel}
+        </button>
+        <button
+          type="button"
+          className="session-tab-copy"
+          title={`Copy deep — full tool args and output (${modShiftHint("D")})`}
+          aria-label={`Copy deep chat (${modShiftHint("D")})`}
+          disabled={turns.length === 0}
+          onClick={() => void copyChat("deep")}
+        >
+          {copyDeepLabel}
         </button>
         <button
           type="button"
@@ -718,7 +873,7 @@ export function ConversationPane(props: {
         {state?.error ? (
           <div className="error-banner" role="alert">
             <strong>Error</strong>
-            <span>{state.error}</span>
+            <span className="error-banner-detail">{state.error}</span>
           </div>
         ) : null}
 
@@ -739,11 +894,18 @@ export function ConversationPane(props: {
                     const toolCall = turn.toolCalls?.find((c) => c.id === result.callId);
                     const toolName = toolCall?.name ?? "tool";
                     return (
-                      <ActionCard
+                      <ToolLogCard
                         key={result.callId}
                         toolName={toolName}
-                        result={result}
-                        {...(toolCall ? { toolCall } : {})}
+                        status={result.success ? "done" : "failed"}
+                        {...(result.summary ? { summary: result.summary } : {})}
+                        {...(result.error ? { error: result.error } : {})}
+                        {...(toolCall?.arguments
+                          ? { arguments: toolCall.arguments }
+                          : {})}
+                        {...(result.output !== undefined
+                          ? { output: result.output }
+                          : {})}
                       />
                     );
                   })}
@@ -756,11 +918,15 @@ export function ConversationPane(props: {
           {busy || (state?.liveTools?.length ?? 0) > 0 ? (
             <div className="transcript-block transcript-live">
               {(state?.liveTools ?? []).map((tool) => (
-                <LiveToolRow
+                <ToolLogCard
                   key={tool.id}
-                  label={tool.label}
+                  toolName={tool.name}
                   status={tool.status}
+                  label={tool.label}
                   {...(tool.summary ? { summary: tool.summary } : {})}
+                  {...(tool.arguments ? { arguments: tool.arguments } : {})}
+                  {...(tool.output !== undefined ? { output: tool.output } : {})}
+                  {...(tool.error ? { error: tool.error } : {})}
                 />
               ))}
 
@@ -799,6 +965,7 @@ export function ConversationPane(props: {
           ) : null}
         </div>
 
+        <StartBuildBanner state={state} onConfirmed={onBuildStarted} />
         <BuildContinueBanner state={state} />
 
         {(state?.pendingApprovals ?? []).map((approval) => (
@@ -1001,11 +1168,20 @@ function BuildCockpit(props: {
   }, [turns, props.state?.liveTerminals?.length, props.state?.status]);
 
   const showTerminal = (props.state?.liveTerminals?.length ?? 0) > 0;
+  const phase = props.state ? deriveProductPhase(props.state) : "building";
+  const showTestingReport = phase === "testing";
 
   return (
     <div className={`build-cockpit ${showTerminal ? "build-cockpit-with-terminal" : ""}`}>
-      <section className="build-cockpit-plan" aria-label="Plan">
-        <PlanBoard state={props.state} onOpenQa={props.onOpenQa} planning={false} />
+      <section
+        className="build-cockpit-plan"
+        aria-label={showTestingReport ? "Testing report" : "Plan"}
+      >
+        {showTestingReport ? (
+          <TestingReportBoard state={props.state} />
+        ) : (
+          <PlanBoard state={props.state} onOpenQa={props.onOpenQa} planning={false} />
+        )}
       </section>
       <section className="build-cockpit-side" aria-label="Branch diff">
         <DiffNavigator
@@ -1025,14 +1201,12 @@ function BuildCockpit(props: {
 export function VerifyPane(props: {
   state: SessionState | null;
   onOpenQa?: (() => void) | undefined;
-  onConfirmPlan?: (() => void) | undefined;
   onOpenArchitecture?: (() => void) | undefined;
   planning?: boolean;
 }) {
   const {
     state,
     onOpenQa,
-    onConfirmPlan,
     onOpenArchitecture,
     planning = false,
   } = props;
@@ -1045,12 +1219,7 @@ export function VerifyPane(props: {
           planning
           onOpenArchitecture={onOpenArchitecture}
         />
-        <PlanBoard
-          state={state}
-          onOpenQa={onOpenQa}
-          onConfirmPlan={onConfirmPlan}
-          planning
-        />
+        <PlanBoard state={state} onOpenQa={onOpenQa} planning />
       </div>
     );
   }

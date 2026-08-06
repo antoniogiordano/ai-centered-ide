@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ProviderHudSchema } from "./providers.js";
 
 export const AgentModeSchema = z.enum(["ask", "plan", "agent", "autonomous"]);
 export type AgentMode = z.infer<typeof AgentModeSchema>;
@@ -63,9 +64,85 @@ export type PlanReadyProposal = z.infer<typeof PlanReadyProposalSchema>;
 export const BuildCommitOfferSchema = z.object({
   offeredAt: z.string().datetime(),
   branch: z.string().nullable(),
+  /** Branch the feat work started from (Start Build base). */
+  baseBranch: z.string().nullable().default(null),
   files: z.array(z.string()).default([]),
 });
 export type BuildCommitOffer = z.infer<typeof BuildCommitOfferSchema>;
+
+/** After tests (+ optional commit): open a remote PR or merge locally into the start base. */
+export const BuildIntegrateOfferSchema = z.object({
+  offeredAt: z.string().datetime(),
+  headBranch: z.string().min(1),
+  baseBranch: z.string().min(1),
+});
+export type BuildIntegrateOffer = z.infer<typeof BuildIntegrateOfferSchema>;
+
+export const TestSuiteKindSchema = z.enum([
+  "lint",
+  "typecheck",
+  "unit",
+  "e2e",
+  "other",
+]);
+export type TestSuiteKind = z.infer<typeof TestSuiteKindSchema>;
+
+/** Frozen command the IDE will run for the post-build test gate. */
+export const TestRunSpecSchema = z.object({
+  id: z.string().min(1),
+  kind: TestSuiteKindSchema,
+  command: z.string().min(1),
+  /** Relative to workspace root; omit = root. */
+  cwd: z.string().min(1).optional(),
+  timeoutMs: z.number().int().positive().optional(),
+  /** Detected runner/platform label (vitest, jest, eslint, tsc, cypress…). */
+  platform: z.string().min(1).optional(),
+});
+export type TestRunSpec = z.infer<typeof TestRunSpecSchema>;
+
+export const TestSuiteCountsSchema = z.object({
+  passed: z.number().int().nonnegative().default(0),
+  failed: z.number().int().nonnegative().default(0),
+  skipped: z.number().int().nonnegative().default(0),
+  total: z.number().int().nonnegative().default(0),
+  /** Suite-file level counts when available (Jest "Test Suites:"). */
+  suiteFilesPassed: z.number().int().nonnegative().optional(),
+  suiteFilesFailed: z.number().int().nonnegative().optional(),
+  suiteFilesTotal: z.number().int().nonnegative().optional(),
+});
+export type TestSuiteCounts = z.infer<typeof TestSuiteCountsSchema>;
+
+export const TestSuiteResultSchema = z.object({
+  id: z.string().min(1),
+  kind: TestSuiteKindSchema,
+  command: z.string().min(1),
+  status: z.enum(["passed", "failed", "cancelled", "timed_out", "skipped"]),
+  exitCode: z.number().int().nullable(),
+  durationMs: z.number().nonnegative(),
+  /** Short model-facing summary (not the full log). */
+  summary: z.string(),
+  logChars: z.number().int().nonnegative().default(0),
+  logChunkSize: z.number().int().positive().default(8000),
+  logChunks: z.number().int().nonnegative().default(0),
+  /** Runner/platform when known (from architecture profile or log heuristics). */
+  platform: z.string().min(1).optional(),
+  /** Parsed pass/fail counts when the runner prints a summary. */
+  counts: TestSuiteCountsSchema.optional(),
+  /** Individual failed test titles (capped). */
+  failedTests: z.array(z.string().min(1)).default([]),
+});
+export type TestSuiteResult = z.infer<typeof TestSuiteResultSchema>;
+
+/** IDE-owned verification gate after build checklist completion. */
+export const TestRunReportSchema = z.object({
+  startedAt: z.string().datetime(),
+  finishedAt: z.string().datetime().optional(),
+  status: z.enum(["running", "passed", "failed", "skipped"]),
+  specs: z.array(TestRunSpecSchema).default([]),
+  suites: z.array(TestSuiteResultSchema).default([]),
+  digest: z.string().optional(),
+});
+export type TestRunReport = z.infer<typeof TestRunReportSchema>;
 
 export const PlanQuestionOptionSchema = z.object({
   id: z.string().min(1),
@@ -180,6 +257,43 @@ export const SessionStateSchema = z.object({
   planReadyProposal: PlanReadyProposalSchema.nullable().default(null),
   /** Set when build checklist is complete; cleared on commit or dismiss. */
   buildCommitOffer: BuildCommitOfferSchema.nullable().default(null),
+  /** After tests: offer remote PR or local merge into buildBaseBranch. */
+  buildIntegrateOffer: BuildIntegrateOfferSchema.nullable().default(null),
+  /**
+   * Branch Start Build started from (feat fork base, or current if no new branch).
+   * Used as default merge/PR target after the test gate.
+   */
+  buildBaseBranch: z.string().nullable().default(null),
+  /** Last / in-flight post-build test gate (IDE-run). Full logs live in-process. */
+  testRun: TestRunReportSchema.nullable().default(null),
+  /**
+   * Set when the agent calls propose_testing_ready after the checklist is done.
+   * Cleared on Start Build / new build. Required before the IDE runs the test gate.
+   */
+  testingConfirmedAt: z.string().datetime().nullable().default(null),
+  /** Set when the gate passed or was skipped; cleared when starting a new build. */
+  testGatePassedAt: z.string().datetime().nullable().default(null),
+  /**
+   * Consecutive paid-provider auto-fix turns kicked by a failed test gate.
+   * Reset on pass, Start Build, or manual Resume.
+   */
+  testGateAutoFixAttempts: z.number().int().nonnegative().default(0),
+  /**
+   * When true (paid provider only), the IDE stops auto-injecting test-gate
+   * continue prompts until the user hits Resume.
+   */
+  testGateCircuitOpen: z.boolean().default(false),
+  /** Fingerprint of the last failed gate (suite ids + error signal). */
+  testGateFailureFingerprint: z.string().nullable().default(null),
+  /** Consecutive gate failures with the same fingerprint. */
+  testGateSameFailureStreak: z.number().int().nonnegative().default(0),
+  /**
+   * 0 = none, 1 = escalate strategy, 2 = strong (rewrite tests / oscillation).
+   * Injected into the system prompt on the next fix turn.
+   */
+  testGateEscalationLevel: z.number().int().nonnegative().default(0),
+  /** Recent failed-suite keys (e.g. "unit", "typecheck") for oscillation detection. */
+  testGateRecentSuiteKeys: z.array(z.string()).default([]),
   pendingApprovals: z.array(
     z.object({
       id: z.string().min(1),
@@ -211,6 +325,11 @@ export const SessionStateSchema = z.object({
       label: z.string().min(1),
       status: z.enum(["running", "done", "failed"]),
       summary: z.string().optional(),
+      /** Tool arguments when known (for expandable log; may be partial while streaming). */
+      arguments: z.record(z.unknown()).optional(),
+      /** Full tool output for the IDE log (not compacted for the model). */
+      output: z.unknown().optional(),
+      error: z.string().optional(),
     }),
   ),
   /** Interactive PTY sessions owned by the app (not persisted). */
@@ -219,27 +338,87 @@ export const SessionStateSchema = z.object({
   pendingTerminalConfirm: PendingTerminalConfirmSchema.nullable().default(null),
   /** Exclusive Q&A when the agent needs a human decision for the terminal. */
   pendingTerminalAsk: PendingTerminalAskSchema.nullable().default(null),
+  /** Active provider + token/cost counters for the chrome HUD. */
+  providerHud: ProviderHudSchema.nullable().default(null),
   error: z.string().nullable(),
 });
 export type SessionState = z.infer<typeof SessionStateSchema>;
 
 /**
  * Product phase for a chat session.
- * planning | building (later: unit_test | qa | e2e, …)
+ * planning | building | testing (post-build verification gate)
  */
-export const ProductPhaseSchema = z.enum(["planning", "building"]);
+export const ProductPhaseSchema = z.enum(["planning", "building", "testing"]);
 export type ProductPhase = z.infer<typeof ProductPhaseSchema>;
 
 export function deriveProductPhase(state: {
   mode?: string | null;
   planStatus?: string | null;
   sessionKind?: string | null;
+  testRun?: { status?: string | null } | null;
+  planPhases?: Array<{
+    status: string;
+    checklist: Array<{ done: boolean }>;
+  }>;
+  buildCommitOffer?: unknown | null;
+  buildIntegrateOffer?: unknown | null;
 }): ProductPhase {
   void state.sessionKind;
   if (state.mode === "plan" || state.planStatus === "drafting") {
     return "planning";
   }
+  if (state.testRun?.status === "running") {
+    return "testing";
+  }
+  // Checklist complete → Testing (await confirm, gate, or fix loop) until commit/PR offer.
+  if (
+    state.planStatus === "executing" &&
+    Array.isArray(state.planPhases) &&
+    state.planPhases.length > 0 &&
+    !planHasOpenWork({ planPhases: state.planPhases }) &&
+    !state.buildCommitOffer &&
+    !state.buildIntegrateOffer
+  ) {
+    return "testing";
+  }
   return "building";
+}
+
+/** Checklist done, agent has not confirmed testing yet — prompt for propose_testing_ready. */
+export function awaitsTestingConfirm(state: {
+  planStatus: string;
+  planPhases: Array<{
+    status: string;
+    checklist: Array<{ done: boolean }>;
+  }>;
+  testingConfirmedAt?: string | null;
+  testGatePassedAt?: string | null;
+  buildCommitOffer?: unknown | null;
+  buildIntegrateOffer?: unknown | null;
+}): boolean {
+  if (!planBuildComplete(state)) return false;
+  if (state.testingConfirmedAt) return false;
+  if (state.testGatePassedAt) return false;
+  if (state.buildCommitOffer || state.buildIntegrateOffer) return false;
+  return true;
+}
+
+/** IDE may start the post-build test gate. */
+export function canStartTestGate(state: {
+  planStatus: string;
+  planPhases: Array<{
+    status: string;
+    checklist: Array<{ done: boolean }>;
+  }>;
+  testingConfirmedAt?: string | null;
+  testGatePassedAt?: string | null;
+  buildCommitOffer?: unknown | null;
+}): boolean {
+  if (!planBuildComplete(state)) return false;
+  if (!state.testingConfirmedAt) return false;
+  if (state.testGatePassedAt) return false;
+  if (state.buildCommitOffer) return false;
+  return true;
 }
 
 export function planHasOpenWork(state: {
@@ -287,18 +466,22 @@ export function planChecklistProgress(state: {
 
 /** Composer / Continue button message when build stalls with open checklist. */
 export const CHECKLIST_CONTINUE_USER_MESSAGE =
-  "Continue: update the checklist (mark finished items done via upsert_plan), then implement the next open checklist item with tools. Do not only narrate.";
+  "Continue: keep existing done checklist items as done=true (do not uncheck or redo from scratch). Prefer Focus → Next open item; if several items are already finished, upsert_plan may mark multiple done=true. Spot-check only if needed; do not only narrate.";
 
 /** Resume planning when the agent stalled without a ready proposal or open Q&A. */
 export const PLAN_CONTINUE_USER_MESSAGE =
-  "Continue planning: call upsert_plan with concrete phases + checklist items, and open clarifying questions (with options) if anything is unclear. When the plan is solid and questions are cleared, call propose_plan_ready. Do not only narrate.";
+  "Continue planning: use read_plan / add_phase / add_check / set_questions (prefer micro CRUD; upsert_plan only for a full rewrite). When the plan is solid and questions are cleared, call propose_plan_ready. Do not only narrate.";
+
+/** Checklist complete — agent must confirm before the IDE Test gate runs. */
+export const TESTING_READY_CONTINUE_USER_MESSAGE =
+  "Testing phase: the build checklist is complete. Verify the work is finished (spot-check if needed), then call propose_testing_ready. Do not narrate only — the IDE will run lint/typecheck/unit after that tool. Do not run those suites yourself.";
 
 export const SessionSummarySchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1),
   updatedAt: z.string().datetime(),
   workspaceName: z.string().nullable(),
-  /** Plan / Build (per chat). Future phases will extend ProductPhase. */
+  /** Plan / Build / Test (per chat). */
   phase: ProductPhaseSchema.default("planning"),
 });
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;
@@ -340,6 +523,19 @@ export class AppError extends Error {
   }
 }
 
+/** Session / UI string: user message plus technical detail when useful. */
+export function formatAppErrorDisplay(error: {
+  userMessage: string;
+  technicalDetail?: string | null;
+}): string {
+  const user = error.userMessage.trim();
+  const detail = (error.technicalDetail ?? "").trim();
+  if (!detail || detail === user) return user || "Unknown error.";
+  if (user.includes(detail)) return user;
+  const capped = detail.length > 1200 ? `${detail.slice(0, 1197)}…` : detail;
+  return `${user}\n${capped}`;
+}
+
 export const AppErrorPayloadSchema = z.object({
   code: AppErrorCodeSchema,
   userMessage: z.string(),
@@ -360,6 +556,17 @@ export function createEmptySessionState(sessionId: string): SessionState {
     planQuestions: [],
     planReadyProposal: null,
     buildCommitOffer: null,
+    buildIntegrateOffer: null,
+    buildBaseBranch: null,
+    testRun: null,
+    testingConfirmedAt: null,
+    testGatePassedAt: null,
+    testGateAutoFixAttempts: 0,
+    testGateCircuitOpen: false,
+    testGateFailureFingerprint: null,
+    testGateSameFailureStreak: 0,
+    testGateEscalationLevel: 0,
+    testGateRecentSuiteKeys: [],
     pendingApprovals: [],
     approvalGrants: [],
     activeToolCallId: null,
@@ -370,6 +577,7 @@ export function createEmptySessionState(sessionId: string): SessionState {
     liveTerminals: [],
     pendingTerminalConfirm: null,
     pendingTerminalAsk: null,
+    providerHud: null,
     error: null,
   };
 }

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { AppError } from "@ai-ide/shared";
-import { MockProvider, parseSseDataLines } from "./index.js";
+import {
+  MockProvider,
+  parseSseDataLines,
+  requiresReasoningEffortNoneWithTools,
+} from "./index.js";
 import {
   assertHttpsForRemote,
   classifyProviderError,
@@ -36,5 +40,12 @@ describe("provider", () => {
   it("classifies retryable errors", () => {
     expect(isRetryable(classifyProviderError(new Error("HTTP 429")))).toBe(true);
     expect(isRetryable(classifyProviderError(new Error("HTTP 401")))).toBe(false);
+  });
+
+  it("flags gpt-5 / luna models for reasoning_effort none with tools", () => {
+    expect(requiresReasoningEffortNoneWithTools("gpt-5.6-luna")).toBe(true);
+    expect(requiresReasoningEffortNoneWithTools("gpt-5.2")).toBe(true);
+    expect(requiresReasoningEffortNoneWithTools("o3-mini")).toBe(true);
+    expect(requiresReasoningEffortNoneWithTools("gpt-4o-mini")).toBe(false);
   });
 });

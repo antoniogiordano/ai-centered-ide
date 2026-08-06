@@ -92,10 +92,19 @@ export function CommandPalette(props: {
     },
     {
       id: "copy-chat",
-      label: "Copy open chat",
+      label: "Copy open chat (visible)",
       hint: modShiftHint("C"),
       run: () => {
         window.dispatchEvent(new CustomEvent("aifi:copy-open-chat"));
+        onClose();
+      },
+    },
+    {
+      id: "copy-chat-deep",
+      label: "Copy open chat (deep)",
+      hint: modShiftHint("D"),
+      run: () => {
+        window.dispatchEvent(new CustomEvent("aifi:copy-open-chat-deep"));
         onClose();
       },
     },
@@ -112,7 +121,7 @@ export function CommandPalette(props: {
       ? [
           {
             id: "provider",
-            label: "Provider settings",
+            label: "Providers",
             hint: modHint("P"),
             run: () => {
               onOpenProviderSettings();

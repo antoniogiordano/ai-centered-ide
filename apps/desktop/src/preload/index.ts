@@ -8,6 +8,9 @@ import {
   type GithubLoginCancelResponse,
   type ProviderGetConfigResponse,
   type ProviderListModelsResponse,
+  type ProviderListResponse,
+  type ProviderSetActiveResponse,
+  type ProviderDeleteResponse,
   type ProviderSaveConfigResponse,
   type ProviderVerifyResponse,
   type SessionCloseResponse,
@@ -19,6 +22,8 @@ import {
   type SessionDraftBuildCommitResponse,
   type SessionCommitBuildResponse,
   type SessionDismissBuildCommitResponse,
+  type SessionIntegrateBuildResponse,
+  type SessionDismissBuildIntegrateResponse,
   type SessionSetModeResponse,
   type SessionSwitchResponse,
   type SessionUpdateEvent,
@@ -67,9 +72,12 @@ export type DesktopBridge = {
       dirtyStrategy?: "stash" | "commit_base";
       baseCommitMessage?: string;
     }) => Promise<SessionConfirmPlanResponse>;
+    rejectPlanReady: () => Promise<{ ok: boolean; state?: import("@ai-ide/shared").SessionState }>;
     draftBuildCommit: () => Promise<SessionDraftBuildCommitResponse>;
     commitBuild: (message: string) => Promise<SessionCommitBuildResponse>;
     dismissBuildCommit: () => Promise<SessionDismissBuildCommitResponse>;
+    integrateBuild: (action: "pr" | "merge") => Promise<SessionIntegrateBuildResponse>;
+    dismissBuildIntegrate: () => Promise<SessionDismissBuildIntegrateResponse>;
     approve: (approvalId: string, grantCategory?: boolean) => Promise<void>;
     reject: (approvalId: string, reason?: string) => Promise<void>;
     terminalConfirm: (
@@ -132,6 +140,9 @@ export type DesktopBridge = {
   };
   provider: {
     getConfig: () => Promise<ProviderGetConfigResponse>;
+    list: () => Promise<ProviderListResponse>;
+    setActive: (id: string) => Promise<ProviderSetActiveResponse>;
+    delete: (id: string) => Promise<ProviderDeleteResponse>;
     verify: (input: {
       baseUrl: string;
       apiKey: string;
@@ -142,9 +153,14 @@ export type DesktopBridge = {
       apiKey: string;
     }) => Promise<ProviderListModelsResponse>;
     saveConfig: (input: {
+      id?: string;
+      name?: string;
       baseUrl: string;
       apiKey: string;
       defaultModel: string;
+      paid?: boolean;
+      pricing?: { inputPer1M?: number; outputPer1M?: number };
+      makeActive?: boolean;
     }) => Promise<ProviderSaveConfigResponse>;
   };
   ui: {
@@ -199,12 +215,18 @@ const bridge: DesktopBridge = {
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_SET_MODE, { mode }),
     confirmPlan: (input) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_CONFIRM_PLAN, input),
+    rejectPlanReady: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_REJECT_PLAN_READY, {}),
     draftBuildCommit: () =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT, {}),
     commitBuild: (message) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_COMMIT_BUILD, { message }),
     dismissBuildCommit: () =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT, {}),
+    integrateBuild: (action) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_INTEGRATE_BUILD, { action }),
+    dismissBuildIntegrate: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_DISMISS_BUILD_INTEGRATE, {}),
     approve: (approvalId, grantCategory = false) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_APPROVE, {
         approvalId,
@@ -315,6 +337,11 @@ const bridge: DesktopBridge = {
   provider: {
     getConfig: () =>
       ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_GET_CONFIG, {}),
+    list: () => ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_LIST, {}),
+    setActive: (id: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_SET_ACTIVE, { id }),
+    delete: (id: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_DELETE, { id }),
     verify: (input) => ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_VERIFY, input),
     listModels: (input) =>
       ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_LIST_MODELS, input),

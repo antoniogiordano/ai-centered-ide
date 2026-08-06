@@ -12,7 +12,7 @@ const CBM_MODEL_TOOLS: Array<{
   {
     name: "search_graph",
     description:
-      "Search the indexed codebase graph (functions, classes, routes). Prefer this over listing directories. Use limit 10–20.",
+      "PRIMARY explore tool when indexed: search the codebase graph (functions, classes, components, routes) by keyword. Prefer over list_dir for discovery. Typical limit 10–20.",
     properties: {
       query: { type: "string", description: "Keyword / BM25 query" },
       label: { type: "string" },
@@ -26,7 +26,7 @@ const CBM_MODEL_TOOLS: Array<{
   {
     name: "trace_path",
     description:
-      "BFS call graph: who calls a function and what it calls (depth 1–5).",
+      "BFS call graph from a symbol: callers/callees (depth 1–5). Prefer after search_graph finds a qualified_name.",
     properties: {
       function_name: { type: "string" },
       qualified_name: { type: "string" },
@@ -37,7 +37,7 @@ const CBM_MODEL_TOOLS: Array<{
   {
     name: "get_code_snippet",
     description:
-      "Fetch source for a symbol by qualified_name (from search_graph).",
+      "Fetch source for a symbol by qualified_name (from search_graph). Prefer over read_file when you have a graph hit.",
     required: ["qualified_name"],
     properties: {
       qualified_name: { type: "string" },
@@ -47,12 +47,13 @@ const CBM_MODEL_TOOLS: Array<{
   {
     name: "get_architecture",
     description:
-      "Project architecture overview: languages, packages, routes, hotspots.",
+      "Indexed architecture overview: languages, packages, routes, hotspots. Prefer early in a chat instead of walking dirs with list_dir.",
     properties: {},
   },
   {
     name: "search_code",
-    description: "Text search (grep-like) over indexed files.",
+    description:
+      "Indexed text search (grep-like). Prefer over search_text / repeated list_dir when looking for symbols or strings.",
     properties: {
       query: { type: "string" },
       pattern: { type: "string" },

@@ -4,6 +4,10 @@ import { platform } from "node:os";
 import { join } from "node:path";
 import pty from "node-pty";
 import type { LiveTerminal } from "@ai-ide/shared";
+import {
+  enrichShellEnv,
+  interactiveToolchainBootstrap,
+} from "@ai-ide/tools";
 
 const MAX_BUFFER_CHARS = 200_000;
 const PREVIEW_CHARS = 4_000;
@@ -104,12 +108,16 @@ export class TerminalManager {
     const title = opts.title?.trim() || `Terminal ${this.titleCounter}`;
     const cwd = opts.cwd;
     const { file, args } = defaultShell();
+    const env = enrichShellEnv(cwd, {
+      ...process.env,
+      TERM: "xterm-256color",
+    }) as Record<string, string>;
     const term = pty.spawn(file, args, {
       name: "xterm-256color",
       cols: opts.cols ?? 100,
       rows: opts.rows ?? 30,
       cwd,
-      env: { ...process.env, TERM: "xterm-256color" } as Record<string, string>,
+      env,
     });
 
     const session: Session = {
@@ -133,6 +141,20 @@ export class TerminalManager {
       session.term = null;
       this.emitChange();
     });
+
+    // Activate nvm/fnm + project pin once so the session stays usable.
+    const bootstrap = interactiveToolchainBootstrap(cwd);
+    if (bootstrap) {
+      setTimeout(() => {
+        try {
+          if (session.term && session.status === "running") {
+            session.term.write(bootstrap);
+          }
+        } catch {
+          /* shell not ready */
+        }
+      }, 250);
+    }
 
     this.emitChange();
     return this.toLive(session);

@@ -62,6 +62,10 @@ export type DesktopBridge = {
       dirtyStrategy?: "stash" | "commit_base";
       baseCommitMessage?: string;
     }) => Promise<SessionConfirmPlanResponse>;
+    rejectPlanReady: () => Promise<{
+      ok: boolean;
+      state?: import("@ai-ide/shared").SessionState;
+    }>;
     draftBuildCommit: () => Promise<{
       ok: boolean;
       message?: string;
@@ -75,6 +79,12 @@ export type DesktopBridge = {
       error?: { code: string; userMessage: string; technicalDetail: string };
     }>;
     dismissBuildCommit: () => Promise<{ ok: boolean }>;
+    integrateBuild: (action: "pr" | "merge") => Promise<{
+      ok: boolean;
+      url?: string;
+      error?: { code: string; userMessage: string; technicalDetail: string };
+    }>;
+    dismissBuildIntegrate: () => Promise<{ ok: boolean }>;
     approve: (approvalId: string, grantCategory?: boolean) => Promise<void>;
     reject: (approvalId: string, reason?: string) => Promise<void>;
     terminalConfirm?: (
@@ -136,7 +146,16 @@ export type DesktopBridge = {
     loginCancel: () => Promise<GithubLoginCancelResponse>;
   };
   provider: {
-    getConfig: () => Promise<ProviderGetConfigResponse>;
+    getConfig: () => Promise<
+      import("@ai-ide/shared").ProviderGetConfigResponse
+    >;
+    list: () => Promise<import("@ai-ide/shared").ProviderListResponse>;
+    setActive: (
+      id: string,
+    ) => Promise<import("@ai-ide/shared").ProviderSetActiveResponse>;
+    delete: (
+      id: string,
+    ) => Promise<import("@ai-ide/shared").ProviderDeleteResponse>;
     verify: (input: {
       baseUrl: string;
       apiKey: string;
@@ -147,9 +166,14 @@ export type DesktopBridge = {
       apiKey: string;
     }) => Promise<ProviderListModelsResponse>;
     saveConfig: (input: {
+      id?: string;
+      name?: string;
       baseUrl: string;
       apiKey: string;
       defaultModel: string;
+      paid?: boolean;
+      pricing?: { inputPer1M?: number; outputPer1M?: number };
+      makeActive?: boolean;
     }) => Promise<ProviderSaveConfigResponse>;
   };
   ui?: {

@@ -432,7 +432,7 @@ export function PlanQaDialog(props: {
                 onClick={goBack}
                 disabled={submitting}
               >
-                ← Back
+                ← Back · Backspace
               </button>
               <button
                 type="button"
@@ -537,7 +537,7 @@ export function PlanQaDialog(props: {
                 onClick={goBack}
                 disabled={typeof step === "number" && step === 0}
               >
-                ← Back
+                ← Back · Backspace
               </button>
               <button type="button" className="btn" onClick={goNext}>
                 Next · Enter

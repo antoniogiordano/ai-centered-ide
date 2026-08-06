@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { platform } from "node:os";
-import { sanitizeCommandStreams } from "./command-output.js";
+import { enrichShellEnv, wrapUnixLoginCommand } from "./shell-env.js";
 
 export type PtyRunOptions = {
   command: string;
@@ -28,15 +28,23 @@ const COLLECT_CAP_CHARS = 512_000;
 export async function runCommand(options: PtyRunOptions): Promise<PtyRunResult> {
   const timeoutMs = options.timeoutMs ?? 120_000;
   const shell = platform() === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/bash";
+  const command =
+    platform() === "win32"
+      ? options.command
+      : wrapUnixLoginCommand(options.command, options.cwd);
   const args =
     platform() === "win32"
-      ? ["/d", "/s", "/c", options.command]
-      : ["-lc", options.command];
+      ? ["/d", "/s", "/c", command]
+      : ["-lc", command];
+  const env = enrichShellEnv(options.cwd, {
+    ...process.env,
+    ...options.env,
+  });
 
   return new Promise((resolve) => {
     const child = spawn(shell, args, {
       cwd: options.cwd,
-      env: { ...process.env, ...options.env },
+      env,
       detached: platform() !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -80,27 +88,27 @@ export async function runCommand(options: PtyRunOptions): Promise<PtyRunResult> 
 
     child.on("close", (code) => {
       clearTimeout(timer);
-      const cleaned = sanitizeCommandStreams(stdout, stderr);
+      // Keep full collected streams for the IDE log. Model context is compacted
+      // later via formatToolResultForModel (sanitize + size cap).
       resolve({
-        stdout: cleaned.stdout,
-        stderr: cleaned.stderr,
+        stdout,
+        stderr,
         exitCode: code,
         timedOut,
         pid: child.pid,
-        truncated: cleaned.truncated || collectTruncated,
+        truncated: collectTruncated,
       });
     });
 
     child.on("error", (err) => {
       clearTimeout(timer);
-      const cleaned = sanitizeCommandStreams(stdout, stderr + String(err));
       resolve({
-        stdout: cleaned.stdout,
-        stderr: cleaned.stderr,
+        stdout,
+        stderr: stderr + String(err),
         exitCode: 1,
         timedOut,
         pid: child.pid,
-        truncated: cleaned.truncated || collectTruncated,
+        truncated: collectTruncated,
       });
     });
   });

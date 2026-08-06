@@ -41,8 +41,26 @@ export class OpenAiCompatibleProvider implements AiProvider {
     if (!response.ok) {
       throw await this.httpError(response);
     }
-    const body = (await response.json()) as { data?: Array<{ id: string }> };
-    return (body.data ?? []).map((m) => ({ id: m.id }));
+    const body = (await response.json()) as {
+      data?: Array<{ id?: string; name?: string }>;
+      models?: Array<{ id?: string; name?: string } | string>;
+    };
+    const raw = body.data ?? body.models ?? [];
+    const ids: string[] = [];
+    for (const entry of raw) {
+      if (typeof entry === "string" && entry.trim()) {
+        ids.push(entry.trim());
+        continue;
+      }
+      if (entry && typeof entry === "object") {
+        const id =
+          (typeof entry.id === "string" && entry.id.trim()) ||
+          (typeof entry.name === "string" && entry.name.trim()) ||
+          "";
+        if (id) ids.push(id);
+      }
+    }
+    return [...new Set(ids)].map((id) => ({ id }));
   }
 
   async *chat(
@@ -59,6 +77,18 @@ export class OpenAiCompatibleProvider implements AiProvider {
       messages: messages.map(toOpenAiMessage),
       stream: true,
     };
+    // Many local servers reject unknown fields; cloud OpenAI-compatible APIs
+    // need this to emit a final usage chunk on the stream.
+    try {
+      const host = new URL(this.config.baseUrl).hostname;
+      const local =
+        host === "localhost" || host === "127.0.0.1" || host === "::1";
+      if (!local) {
+        body.stream_options = { include_usage: true };
+      }
+    } catch {
+      body.stream_options = { include_usage: true };
+    }
     if (options?.tools?.length) {
       body.tools = options.tools.map((t) => ({
         type: "function",
@@ -69,6 +99,11 @@ export class OpenAiCompatibleProvider implements AiProvider {
         },
       }));
       body.tool_choice = "auto";
+      // gpt-5 / reasoning models reject tools unless reasoning_effort is none
+      // on /v1/chat/completions (otherwise they require /v1/responses).
+      if (requiresReasoningEffortNoneWithTools(model)) {
+        body.reasoning_effort = "none";
+      }
     }
 
     let response: Response;
@@ -108,6 +143,7 @@ export class OpenAiCompatibleProvider implements AiProvider {
     let buffer = "";
     const toolCalls = new Map<number, ToolCallAccumulator>();
     let finishReason = "stop";
+    let usage: { inputTokens: number; outputTokens: number } | undefined;
 
     try {
       for (;;) {
@@ -131,11 +167,21 @@ export class OpenAiCompatibleProvider implements AiProvider {
                 index,
               };
             }
-            yield { type: "done", finishReason };
+            yield {
+              type: "done",
+              finishReason,
+              ...(usage ? { usage } : {}),
+            };
             return;
           }
           try {
             const parsed = JSON.parse(payload) as {
+              usage?: {
+                prompt_tokens?: number;
+                completion_tokens?: number;
+                input_tokens?: number;
+                output_tokens?: number;
+              };
               choices?: Array<{
                 finish_reason?: string | null;
                 delta?: {
@@ -148,6 +194,13 @@ export class OpenAiCompatibleProvider implements AiProvider {
                 };
               }>;
             };
+            if (parsed.usage) {
+              const u = parsed.usage;
+              usage = {
+                inputTokens: u.prompt_tokens ?? u.input_tokens ?? 0,
+                outputTokens: u.completion_tokens ?? u.output_tokens ?? 0,
+              };
+            }
             const choice = parsed.choices?.[0];
             if (choice?.finish_reason) finishReason = choice.finish_reason;
             const delta = choice?.delta;
@@ -187,7 +240,11 @@ export class OpenAiCompatibleProvider implements AiProvider {
           }
         }
       }
-      yield { type: "done", finishReason };
+      yield {
+        type: "done",
+        finishReason,
+        ...(usage ? { usage } : {}),
+      };
     } catch (error) {
       yield { type: "error", error: this.toAppError(error) };
     } finally {
@@ -229,10 +286,15 @@ export class OpenAiCompatibleProvider implements AiProvider {
 
   private async httpError(response: Response): Promise<AppError> {
     const text = await response.text();
+    const providerMessage = extractProviderErrorMessage(text);
+    const statusHint = httpStatusHint(response.status);
+    const userMessage = providerMessage
+      ? `Provider error (HTTP ${response.status}): ${providerMessage}`
+      : `Provider error (HTTP ${response.status})${statusHint ? `: ${statusHint}` : "."}`;
     return new AppError({
       code: "PROVIDER_ERROR",
-      userMessage: "The AI provider returned an error.",
-      technicalDetail: `HTTP ${response.status}: ${text}`,
+      userMessage,
+      technicalDetail: `HTTP ${response.status}: ${text.slice(0, 4000)}`,
     });
   }
 
@@ -253,6 +315,66 @@ export class OpenAiCompatibleProvider implements AiProvider {
       cause: error,
     });
   }
+}
+
+function extractProviderErrorMessage(body: string): string | null {
+  const trimmed = body.trim();
+  if (!trimmed) return null;
+  try {
+    const json = JSON.parse(trimmed) as {
+      error?: { message?: unknown; code?: unknown; type?: unknown };
+      message?: unknown;
+    };
+    const nested = json.error;
+    if (nested && typeof nested === "object") {
+      const parts: string[] = [];
+      if (typeof nested.message === "string" && nested.message.trim()) {
+        parts.push(nested.message.trim());
+      }
+      if (typeof nested.code === "string" && nested.code.trim()) {
+        parts.push(`code=${nested.code.trim()}`);
+      } else if (typeof nested.type === "string" && nested.type.trim()) {
+        parts.push(nested.type.trim());
+      }
+      if (parts.length) return parts.join(" · ");
+    }
+    if (typeof json.message === "string" && json.message.trim()) {
+      return json.message.trim();
+    }
+  } catch {
+    /* plain text body */
+  }
+  const oneLine = trimmed.replace(/\s+/g, " ");
+  return oneLine.length > 280 ? `${oneLine.slice(0, 277)}…` : oneLine;
+}
+
+function httpStatusHint(status: number): string | null {
+  switch (status) {
+    case 401:
+      return "Unauthorized — check API key";
+    case 403:
+      return "Forbidden — key or model access denied";
+    case 404:
+      return "Not found — check base URL / model id";
+    case 429:
+      return "Rate limited — retry later";
+    default:
+      return status >= 500 ? "Upstream server error" : null;
+  }
+}
+
+/** Models that default to reasoning and cannot mix tools + reasoning on chat/completions. */
+export function requiresReasoningEffortNoneWithTools(model: string): boolean {
+  const m = model.trim().toLowerCase();
+  if (!m) return false;
+  return (
+    m.startsWith("gpt-5") ||
+    m.startsWith("o1") ||
+    m.startsWith("o3") ||
+    m.startsWith("o4") ||
+    m.includes("luna") ||
+    m.includes("reasoning")
+  );
 }
 
 function toOpenAiMessage(message: ChatMessage): Record<string, unknown> {

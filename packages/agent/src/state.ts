@@ -16,6 +16,11 @@ import {
   planHasOpenWork as sharedPlanHasOpenWork,
   CHECKLIST_CONTINUE_USER_MESSAGE,
   PLAN_CONTINUE_USER_MESSAGE,
+  TESTING_READY_CONTINUE_USER_MESSAGE,
+  planBuildComplete,
+  isTestGateSyntheticPrompt,
+  formatTestGateForBuildPrompt,
+  formatTestGateEscalationSystemRules,
 } from "@ai-ide/shared";
 import { ArchitectureStore } from "@ai-ide/workspace";
 import type { ChatMessage } from "@ai-ide/provider";
@@ -103,7 +108,7 @@ export const MAX_SAME_TOOL_STREAK = 8;
 
 function formatPlanForPrompt(state: SessionState): string {
   if (state.planPhases.length === 0) {
-    return "Current plan: (empty — call upsert_plan with draft phases + open questions).";
+    return "Current plan: (empty — use add_phase / set_questions, or upsert_plan for a full draft).";
   }
   const planning = productPhaseForState(state) === "planning";
   const lines = state.planPhases.map((phase, i) => {
@@ -182,30 +187,41 @@ export function buildSystemPrompt(state: SessionState): string {
     ? [
         `Active workspace root: ${root}`,
         "Paths are relative to the workspace root (never absolute OS paths).",
-        "When the codebase index is ready, prefer graph tools: search_graph, get_code_snippet, trace_path, get_architecture, search_code.",
-        "When the index is not ready, use list_dir / read_file / search_text as fallback.",
+        "When the codebase index is ready (see CODEBASE INDEX in the system prompt): MUST use search_graph / search_code / get_architecture / get_code_snippet / trace_path for discovery — not repeated list_dir.",
+        "When the index is not ready, use list_dir / read_file / search_text. Never use shell cat/ls/find to browse the repo.",
+        "read_file is windowed (startLine/maxLines). If truncated, continue with nextStartLine — do not expect whole large files in one call.",
       ]
     : [
         "No workspace is open yet. Ask the user to open a project folder before reading files.",
       ];
 
-  const architectureBlock = (() => {
-    if (!root) return formatArchitectureForPrompt(null);
+  const architectureProfile = (() => {
+    if (!root) return null;
     try {
-      const view = new ArchitectureStore(root).loadOrDetect();
-      return formatArchitectureForPrompt(view.profile, {
-        intent: view.intent,
-        drift: view.drift,
-        fromFile: view.fromFile,
-      });
+      return new ArchitectureStore(root).loadOrDetect();
     } catch {
-      return formatArchitectureForPrompt(null);
+      return null;
     }
   })();
 
+  const architectureBlock = architectureProfile
+    ? formatArchitectureForPrompt(architectureProfile.profile, {
+        intent: architectureProfile.intent,
+        drift: architectureProfile.drift,
+        fromFile: architectureProfile.fromFile,
+      })
+    : formatArchitectureForPrompt(null);
+
+  const testGateBlock = formatTestGateForBuildPrompt(
+    architectureProfile?.profile ?? null,
+  );
+  const escalationBlock = formatTestGateEscalationSystemRules(
+    state.testGateEscalationLevel ?? 0,
+  );
+
   const planningRules = [
     "PHASE: PLANNING — the plan is being created (not executed).",
-    "Available tools: codebase graph tools (when indexed) OR list_dir/read_file/search_text (fallback), plus read_architecture, upsert_architecture, upsert_plan, propose_plan_ready.",
+    "Available tools: when indexed — search_graph / search_code / get_architecture / get_code_snippet / trace_path (primary), plus list_dir/read_file/search_text (fallback), plus read_architecture, upsert_architecture, read_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, upsert_plan (full rewrite), propose_plan_ready.",
     "Unavailable: write_file, git_*, run_command, terminal_*, checkpoint_restore.",
     "IMPORTANT: Never tell the user you cannot run shell commands. Commands run only after Start Build. When the user asks to run npm/git/shell now, call propose_plan_ready so the IDE can switch to Build — then you will get run_command / terminal_*.",
     "",
@@ -213,57 +229,80 @@ export function buildSystemPrompt(state: SessionState): string {
     "",
     "Stack & dependencies:",
     "- Call read_architecture early for detected stack + ARCHITECTURE.md intent/overrides.",
-    "- Prefer search_graph / get_architecture over dumping whole files when the index is ready.",
+    "- When indexed: search_graph / get_architecture first; do not explore with a chain of list_dir.",
     "- Declare languages, frameworks, and packages in the plan (phases/checklist + clarifying questions). Do not invent a parallel Architecture chat.",
     "- Do NOT install packages in planning. Installs happen in DEVELOPMENT via run_command / terminal_* after the user starts build.",
     "- Use upsert_architecture only for sparse intent/overrides when detection is wrong — never dump the whole stack into the file.",
     "",
-    "Plan structure (CRUD only — no progress tracking yet):",
-    "- Use upsert_plan to create/update/remove phases and checklist item texts.",
+    "Plan structure (prefer micro CRUD — ids preferred, index fallback):",
+    "- read_plan to inspect the current plan.",
+    "- add_phase / replace_phase / delete_phase for phases; add_check / replace_check / delete_check for checklist items.",
+    "- Prefer small edits over rewriting the whole plan. Use upsert_plan only for a full rewrite when starting from empty or replacing everything.",
     "- Do NOT mark checklist items done. Do NOT set phase status to completed/failed/skipped. Progress marking starts only after development begins.",
     "- Checklist items are a draft outline of work, not a live todo board.",
+    "- Checklist granularity: keep items ATOMIC but practical — one coherent unit of work (e.g. one component + its styles, or one module + tests). Too coarse (\"build the whole app\") is bad; too fine (\"create file 1…40\" / one check per tiny file) is also bad. Aim for checks the agent can finish in a few tool calls, not dozens of micro-files for one check.",
+    "- When the stack has a test runner, include checklist items to author the matching test files (execution happens later in the IDE Test gate, not during planning).",
+    "- Implementation shape (for the plan): prefer many small source modules (~500–700 characters each where practical). Plan for componentization/splitting instead of monolithic files. Exempt lockfiles, generated assets, and dense config that cannot sensibly split.",
     "",
     "Clarifying questions (critical — dedicated Plan Q&A dialog; USER answers there, never you):",
-    "- ALWAYS put open questions in upsert_plan.questions. NEVER ask multiple-choice / A-B-C questions only in chat prose — the Plan Q&A UI will not open.",
+    "- ALWAYS put open questions via set_questions (or upsert_plan.questions). NEVER ask multiple-choice / A-B-C questions only in chat prose — the Plan Q&A UI will not open.",
     "- EVERY question MUST include selection: \"single\" OR \"multiple\", plus 2–8 concrete options[{id,label}].",
-    "- Leave status=\"open\". Do NOT invent answers. Do NOT re-ask in prose after upsert_plan.",
-    "- Prefer 1–3 open questions per turn. If the user already answered or said to skip and just run something, clear questions=[] and proceed.",
+    "- Leave status=\"open\". Do NOT invent answers. Do NOT re-ask in prose after set_questions.",
+    "- Prefer 1–3 open questions per turn. If the user already answered or said to skip and just run something, clear with set_questions({questions:[]}) and proceed.",
     "- Chat may briefly say that the Plan Q&A dialog is open — do not paste the options as a numbered list in the message.",
     "",
     "Turn discipline (critical):",
-    "1) First broad request: lightly explore the repo, then upsert_plan with draft phases + checklist texts + open questions if needed. Do NOT dump a full analysis essay.",
-    "2) After user answers (or says to proceed / only run a command): upsert_plan to reshape; if they want execution now, call propose_plan_ready.",
+    "1) First broad request: when indexed, search_graph (or get_architecture) on the user's terms — NOT a list_dir tour — then add_phase (or upsert_plan once) with draft phases + checklist + set_questions if needed. Do NOT dump a full analysis essay.",
+    "2) After user answers (or says to proceed / only run a command): reshape with micro CRUD; if they want execution now, call propose_plan_ready.",
     "3) Never implement, rewrite files, or pretend development has started.",
-    "4) When the user explicitly wants to run shell/npm/git (e.g. \"npm init\", \"install\", \"just initialize\"): keep a minimal plan focused on that, set questions=[], then call propose_plan_ready immediately. Do not keep interviewing.",
-    "5) Otherwise, when the plan is solid AND all open questions are answered, call propose_plan_ready with a short suggestedBranch (feat/kebab-case). The IDE opens Start Build — do NOT start building yourself.",
-    "6) Do NOT call propose_plan_ready while upsert_plan.questions still has status=open items.",
-    "TANK MODE (planning): until propose_plan_ready is accepted by the user (Start Build), you must keep using tools — upsert_plan (phases + checks) and/or open questions. NEVER stop on exploration-only narration. Brief explore → upsert_plan. The IDE re-prompts until the plan is ready or open questions await the user.",
+    "4) When the user explicitly wants to run shell/npm/git (e.g. \"npm init\", \"install\", \"just initialize\"): keep a minimal plan focused on that, set_questions({questions:[]}), then call propose_plan_ready immediately. Do not keep interviewing.",
+    "5) Otherwise, when the plan is solid AND all open questions are answered, call propose_plan_ready with a short suggestedBranch (feat/kebab-case). The IDE opens Start Build for USER confirmation — do NOT start building yourself.",
+    "6) Do NOT call propose_plan_ready while open questions remain.",
+    "TANK MODE (planning): until propose_plan_ready is accepted by the user (Start Build), you must keep using tools — plan CRUD / set_questions. NEVER stop on exploration-only narration. Brief graph explore → plan tools. The IDE re-prompts until the plan is ready or open questions await the user.",
     formatPlanForPrompt(state),
   ];
 
   const buildRules = [
     "PHASE: DEVELOPMENT — now you may mark checklist progress and run commands.",
     architectureBlock,
+    testGateBlock,
+    ...(escalationBlock ? [escalationBlock] : []),
     "The plan structure was agreed in planning. Implement it phase by phase using tools (including write/git/commands/terminals).",
     "On the first build turn after Start Build: take action immediately — run tools for the first incomplete checklist item. Do not only acknowledge Build mode.",
-    "Code reading: use search_graph → get_code_snippet / trace_path when indexed; do not invent qualified_name values — take them from search results.",
-    "When the user asks to run a command: DO IT with run_command (one-shot) or terminal_open + terminal_write (interactive). Prefer run_command for npm init / short installs.",
-    "Never claim you cannot execute shell commands in this phase — you can.",
-    "One-shot commands: run_command. Interactive / long-running shells: terminal_open → terminal_write (user gets 3s confirm/edit) → terminal_read. When the user must choose interactively, use terminal_ask.",
+    "Code reading (critical — do not use the shell as a file browser):",
+    "- When indexed: search_graph → get_code_snippet / trace_path / search_code first. Do not discover files via repeated list_dir.",
+    "- For a known path (from graph or user): use read_file / list_dir / search_text. NEVER run cat/ls/head/find via run_command to inspect source — those commands are blocked.",
+    "- Large files: read_file returns a line window (default ~250 lines). If truncated=true, call again with startLine=nextStartLine. Do not try to load the whole file in one call.",
+    "- Do not invent qualified_name values — take them from search_graph / search_code results.",
+    "When the user asks to run a command: DO IT with tools — prefer a persistent terminal for Node/npm/pnpm workflows.",
+    "Never claim you cannot execute shell commands in this phase — you can (installs, builds, dev servers, git). Verification suites (lint/typecheck/unit) are IDE-owned after the checklist — do not run them yourself.",
+    "Shell / terminal workflow (critical — keep one solid session):",
+    "- Prefer terminal_open → terminal_write → terminal_read for ANY multi-step shell work (nvm, npm/pnpm install, next/dev servers, git sequences).",
+    "- Open ONE terminal per task stream and reuse its terminalId. Do NOT open a new terminal for every command. Do NOT re-run nvm use before every line once the session is active.",
+    "- The IDE bootstraps nvm/fnm + .nvmrc/.node-version when a terminal opens and enriches PATH. After open, wait briefly / terminal_read until you see the node version banner if present, then run your commands.",
+    "- run_command is for short one-shots only (also auto-loads nvm/.nvmrc in that same process). Env still does NOT carry to the next run_command — for sequences, use terminal_*.",
+    "- Interactive / long-running: terminal_open → terminal_write (user gets 3s confirm/edit) → terminal_read. Choices: terminal_ask.",
     "Install packages when the plan calls for them (never during planning).",
-    "Shell / listing hygiene:",
-    "- Prefer list_dir / search_text / search_graph over shell ls/find. Never recursively list node_modules, .git, dist, or build output.",
+    "Shell hygiene:",
+    "- run_command / terminal_* are for install/build/dev-server/git workflows — not for reading files, listing trees, or running the IDE Test gate suites.",
+    "- Never recursively list node_modules, .git, dist, or build output.",
     "- Command stdout is auto-filtered (noise dirs stripped + size-capped); still avoid generating that noise.",
+    "- Host shell (not a container): cwd=workspace. Prefer project pins (.nvmrc, engines) over guessing Node versions.",
+    "Code size (critical):",
+    "- Keep hand-written source files short: target ~500–700 characters max per file when practical. If a file would grow larger, split/componentize (extract hooks, subcomponents, helpers, styles) instead of growing one blob.",
+    "- Do NOT explode a single checklist item into dozens of tiny files (30–40 files for one check is wrong). Balance: small modules, atomic checks that still group related work.",
+    "- Exempt: lockfiles, large generated/vendor assets, and configs that cannot sensibly split.",
     "Checklist progress (critical — structure is locked):",
     "- The plan phases/checklist texts are frozen from planning. Do NOT add, remove, or rename phases or checklist items. Do NOT change questions.",
-    "- upsert_plan may ONLY flip checklist done=true/false and phase status (pending|in_progress|completed|skipped|failed).",
+    "- upsert_plan may ONLY set checklist done=true (never uncheck) and update phase status (pending|in_progress|completed|skipped|failed).",
     "- Always pass the full phases array with the same ids/titles/texts; change only done and status.",
-    "- After EACH completed checklist item, immediately call upsert_plan with that item done=true (keep prior done items true). Prefer one item per upsert_plan so the Plan UI animates and chimes per check.",
-    "- Do not batch many newly completed items into a single upsert_plan at the end of a long turn when you can mark them as you go.",
-    "- Update phase status (in_progress / completed) as work moves forward.",
-    "Keep the plan truthful: only mark items done when the work is actually done.",
+    "- Prefer focusing on Focus → Next open item, then mark it done. If you genuinely finished several checklist items in the same round, you MAY flip multiple done=true in one upsert_plan (keep prior done items true).",
+    "- RESUME / same chat: items already marked [x] / done=true are authoritative progress. Do NOT reset them or redo the whole plan from scratch. Continue from Focus → Next open item. You may briefly verify a done item still holds; if something is wrong, fix the code — leave the check done=true.",
+    "- After the checklist is fully done, call propose_testing_ready (do not only narrate). The IDE then runs the Test gate before offering commit. If it fails: get_test_report (counts/platform per suite) → list_failed_tests → read_test_log only if needed. Do not invent a parallel test phase unless the plan already required it.",
+    "- Update phase status (in_progress / completed) as work moves forward. Do not reopen completed phases without cause.",
+    "Keep the plan truthful: only mark items done when the work is actually done (including required test files written, not executed).",
     "TANK MODE: while any checklist item is open, NEVER stop with prose only — keep calling tools (upsert_plan progress + implementation) until every item is done=true and phases are completed. The IDE will keep re-prompting forever until the checklist is complete (or the user hits Stop). No waiting for the user.",
-    "When ALL checklist items are done and phases are completed, say so clearly. Do not invent a separate test phase unless the plan already includes testing work.",
+    "When ALL checklist items are done and phases are completed, call propose_testing_ready so the IDE can run the Test gate. Do not launch lint/test yourself.",
     formatPlanForPrompt(state),
   ];
 
@@ -308,13 +347,22 @@ export function buildContext(state: SessionState, userMessage: string): Turn[] {
   }
 
   // Building: goal + plan (in system) + short fresh tail — not the full chat.
+  // Escalated test-fix: keep a longer tail so prior digests survive compaction.
   const goal = sessionGoal(state);
   const history = state.turns.filter(
     (t) =>
       (t.role === "user" || t.role === "assistant") &&
       !isNoiseTranscriptTurn(t),
   );
-  const tail = history.slice(-BUILD_CONTEXT_TAIL_TURNS);
+  const tailMax =
+    (state.testGateEscalationLevel ?? 0) > 0
+      ? BUILD_CONTEXT_TAIL_TURNS + 8
+      : BUILD_CONTEXT_TAIL_TURNS;
+  const pinnedDigests = history.filter(
+    (t) => t.role === "user" && isTestGateSyntheticPrompt(t.content),
+  );
+  const recentDigests = pinnedDigests.slice(-2);
+  const tail = history.slice(-tailMax);
   const turns: Turn[] = [systemTurn];
   if (goal) {
     const goalAlreadyInTail = tail.some(
@@ -327,6 +375,11 @@ export function buildContext(state: SessionState, userMessage: string): Turn[] {
         content: `Original goal:\n${goal}`,
         createdAt: new Date().toISOString(),
       });
+    }
+  }
+  for (const dig of recentDigests) {
+    if (!tail.some((t) => t.id === dig.id)) {
+      turns.push(dig);
     }
   }
   turns.push(...tail);
@@ -366,6 +419,9 @@ export function isSyntheticUserPrompt(content: string): boolean {
   if (text.startsWith("Continue: update the checklist")) return true;
   if (text.startsWith("Continue planning:")) return true;
   if (text === PLAN_CONTINUE_USER_MESSAGE) return true;
+  if (text === TESTING_READY_CONTINUE_USER_MESSAGE) return true;
+  if (text.startsWith("Testing phase:")) return true;
+  if (isTestGateSyntheticPrompt(text)) return true;
   return false;
 }
 
@@ -536,16 +592,13 @@ export function applyUpsertPlan(
           )
         : [];
 
-  const next: SessionState = {
+  const next: SessionState = clearPlanReady({
     ...state,
     planPhases: phases,
     planQuestions: questions,
     planSteps: [],
-    planStatus:
-      state.planStatus === "finalized" || state.planStatus === "executing"
-        ? "executing"
-        : "drafting",
-  };
+    planStatus: "drafting",
+  });
 
   const openCount = questions.filter((q) => q.status === "open").length;
   return {
@@ -564,9 +617,446 @@ export function applyUpsertPlan(
   };
 }
 
+function clearPlanReady(state: SessionState): SessionState {
+  if (!state.planReadyProposal && state.planStatus === "drafting") return state;
+  return {
+    ...state,
+    planReadyProposal: null,
+    planStatus:
+      state.planStatus === "executing" ? "executing" : "drafting",
+  };
+}
+
+function planningOnlyGuard(
+  state: SessionState,
+  callId: string,
+  toolName: string,
+): { state: SessionState; result: ToolResult; callId: string } | null {
+  if (productPhaseForState(state) === "planning") return null;
+  return {
+    callId,
+    state,
+    result: {
+      callId,
+      success: false,
+      summary: `${toolName} is only available while planning. Use upsert_plan to mark checklist progress during build.`,
+      error: "Wrong phase",
+    },
+  };
+}
+
+function resolvePhaseIndex(
+  phases: PlanPhase[],
+  id?: unknown,
+  index?: unknown,
+): { index: number; error?: string } {
+  if (typeof id === "string" && id.trim()) {
+    const i = phases.findIndex((p) => p.id === id.trim());
+    if (i >= 0) return { index: i };
+    return { index: -1, error: `No phase with id "${id.trim()}".` };
+  }
+  if (typeof index === "number" && Number.isInteger(index)) {
+    if (index >= 0 && index < phases.length) return { index };
+    return {
+      index: -1,
+      error: `phaseIndex ${index} out of range (0..${Math.max(0, phases.length - 1)}).`,
+    };
+  }
+  return {
+    index: -1,
+    error: "Provide phaseId or phaseIndex.",
+  };
+}
+
+function resolveCheckIndex(
+  checklist: PlanPhase["checklist"],
+  id?: unknown,
+  index?: unknown,
+): { index: number; error?: string } {
+  if (typeof id === "string" && id.trim()) {
+    const i = checklist.findIndex((c) => c.id === id.trim());
+    if (i >= 0) return { index: i };
+    return { index: -1, error: `No checklist item with id "${id.trim()}".` };
+  }
+  if (typeof index === "number" && Number.isInteger(index)) {
+    if (index >= 0 && index < checklist.length) return { index };
+    return {
+      index: -1,
+      error: `checkIndex ${index} out of range (0..${Math.max(0, checklist.length - 1)}).`,
+    };
+  }
+  return {
+    index: -1,
+    error: "Provide checkId or checkIndex.",
+  };
+}
+
+function insertAfterIndex(
+  length: number,
+  afterId: unknown,
+  afterIndex: unknown,
+  findId: (id: string) => number,
+): { at: number; error?: string } {
+  if (typeof afterId === "string" && afterId.trim()) {
+    const i = findId(afterId.trim());
+    if (i < 0) return { at: -1, error: `after* id "${afterId.trim()}" not found.` };
+    return { at: i + 1 };
+  }
+  if (typeof afterIndex === "number" && Number.isInteger(afterIndex)) {
+    if (afterIndex < -1 || afterIndex >= length) {
+      return {
+        at: -1,
+        error: `after* index ${afterIndex} out of range.`,
+      };
+    }
+    return { at: afterIndex + 1 };
+  }
+  return { at: length };
+}
+
+function checklistFromTexts(raw: unknown): PlanPhase["checklist"] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item, itemIndex) => {
+    if (typeof item === "string") {
+      return {
+        id: randomUUID(),
+        text: item.trim() || `Item ${itemIndex + 1}`,
+        done: false,
+      };
+    }
+    const c = (item ?? {}) as Record<string, unknown>;
+    return {
+      id: typeof c.id === "string" && c.id ? c.id : randomUUID(),
+      text:
+        typeof c.text === "string" && c.text.trim()
+          ? c.text.trim()
+          : `Item ${itemIndex + 1}`,
+      done: false,
+    };
+  });
+}
+
+function planMutationOk(
+  callId: string,
+  state: SessionState,
+  summary: string,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const next = clearPlanReady(state);
+  return {
+    callId,
+    state: next,
+    result: {
+      callId,
+      success: true,
+      summary,
+      output: {
+        planPhases: next.planPhases,
+        planQuestions: next.planQuestions,
+        planStatus: next.planStatus,
+        planReadyProposal: next.planReadyProposal,
+      },
+    },
+  };
+}
+
+function planMutationFail(
+  callId: string,
+  state: SessionState,
+  summary: string,
+): { state: SessionState; result: ToolResult; callId: string } {
+  return {
+    callId,
+    state,
+    result: {
+      callId,
+      success: false,
+      summary,
+      error: "Invalid arguments",
+    },
+  };
+}
+
+export function applyReadPlan(
+  state: SessionState,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  return {
+    callId,
+    state,
+    result: {
+      callId,
+      success: true,
+      summary: `Plan: ${state.planPhases.length} phase(s), ${state.planQuestions.filter((q) => q.status === "open").length} open question(s), status=${state.planStatus}.`,
+      output: {
+        planPhases: state.planPhases,
+        planQuestions: state.planQuestions,
+        planStatus: state.planStatus,
+        planReadyProposal: state.planReadyProposal,
+      },
+    },
+  };
+}
+
+export function applyAddPhase(
+  state: SessionState,
+  args: Record<string, unknown>,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  const blocked = planningOnlyGuard(state, callId, "add_phase");
+  if (blocked) return blocked;
+  const title =
+    typeof args.title === "string" && args.title.trim()
+      ? args.title.trim()
+      : "";
+  if (!title) return planMutationFail(callId, state, "add_phase requires title.");
+  const insert = insertAfterIndex(
+    state.planPhases.length,
+    args.afterPhaseId,
+    args.afterPhaseIndex,
+    (id) => state.planPhases.findIndex((p) => p.id === id),
+  );
+  if (insert.error) return planMutationFail(callId, state, insert.error);
+  const phase: PlanPhase = {
+    id: randomUUID(),
+    title,
+    status: "pending",
+    checklist: checklistFromTexts(args.checklist),
+  };
+  const phases = [...state.planPhases];
+  phases.splice(insert.at, 0, phase);
+  return planMutationOk(callId, { ...state, planPhases: phases, planSteps: [] }, `Added phase "${title}".`);
+}
+
+export function applyReplacePhase(
+  state: SessionState,
+  args: Record<string, unknown>,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  const blocked = planningOnlyGuard(state, callId, "replace_phase");
+  if (blocked) return blocked;
+  const resolved = resolvePhaseIndex(
+    state.planPhases,
+    args.phaseId ?? args.id,
+    args.phaseIndex,
+  );
+  if (resolved.error) return planMutationFail(callId, state, resolved.error);
+  const prev = state.planPhases[resolved.index]!;
+  const title =
+    typeof args.title === "string" && args.title.trim()
+      ? args.title.trim()
+      : prev.title;
+  const checklist =
+    args.checklist === undefined
+      ? prev.checklist
+      : checklistFromTexts(args.checklist).map((c, i) => {
+          const old = prev.checklist[i];
+          return old && old.text === c.text ? { ...c, id: old.id } : c;
+        });
+  const phases = state.planPhases.map((p, i) =>
+    i === resolved.index
+      ? { ...p, title, checklist, status: "pending" as const }
+      : p,
+  );
+  return planMutationOk(
+    callId,
+    { ...state, planPhases: phases, planSteps: [] },
+    `Replaced phase "${title}".`,
+  );
+}
+
+export function applyDeletePhase(
+  state: SessionState,
+  args: Record<string, unknown>,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  const blocked = planningOnlyGuard(state, callId, "delete_phase");
+  if (blocked) return blocked;
+  const resolved = resolvePhaseIndex(
+    state.planPhases,
+    args.phaseId ?? args.id,
+    args.phaseIndex,
+  );
+  if (resolved.error) return planMutationFail(callId, state, resolved.error);
+  const removed = state.planPhases[resolved.index]!;
+  const phases = state.planPhases.filter((_, i) => i !== resolved.index);
+  return planMutationOk(
+    callId,
+    { ...state, planPhases: phases, planSteps: [] },
+    `Deleted phase "${removed.title}".`,
+  );
+}
+
+export function applyAddCheck(
+  state: SessionState,
+  args: Record<string, unknown>,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  const blocked = planningOnlyGuard(state, callId, "add_check");
+  if (blocked) return blocked;
+  const resolved = resolvePhaseIndex(
+    state.planPhases,
+    args.phaseId,
+    args.phaseIndex,
+  );
+  if (resolved.error) return planMutationFail(callId, state, resolved.error);
+  const text =
+    typeof args.text === "string" && args.text.trim() ? args.text.trim() : "";
+  if (!text) return planMutationFail(callId, state, "add_check requires text.");
+  const phase = state.planPhases[resolved.index]!;
+  const insert = insertAfterIndex(
+    phase.checklist.length,
+    args.afterCheckId,
+    args.afterCheckIndex,
+    (id) => phase.checklist.findIndex((c) => c.id === id),
+  );
+  if (insert.error) return planMutationFail(callId, state, insert.error);
+  const item = { id: randomUUID(), text, done: false };
+  const checklist = [...phase.checklist];
+  checklist.splice(insert.at, 0, item);
+  const phases = state.planPhases.map((p, i) =>
+    i === resolved.index ? { ...p, checklist } : p,
+  );
+  return planMutationOk(
+    callId,
+    { ...state, planPhases: phases, planSteps: [] },
+    `Added checklist item to "${phase.title}".`,
+  );
+}
+
+export function applyReplaceCheck(
+  state: SessionState,
+  args: Record<string, unknown>,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  const blocked = planningOnlyGuard(state, callId, "replace_check");
+  if (blocked) return blocked;
+  const phaseRes = resolvePhaseIndex(
+    state.planPhases,
+    args.phaseId,
+    args.phaseIndex,
+  );
+  if (phaseRes.error) return planMutationFail(callId, state, phaseRes.error);
+  const phase = state.planPhases[phaseRes.index]!;
+  const checkRes = resolveCheckIndex(
+    phase.checklist,
+    args.checkId ?? args.id,
+    args.checkIndex,
+  );
+  if (checkRes.error) return planMutationFail(callId, state, checkRes.error);
+  const text =
+    typeof args.text === "string" && args.text.trim() ? args.text.trim() : "";
+  if (!text) return planMutationFail(callId, state, "replace_check requires text.");
+  const checklist = phase.checklist.map((c, i) =>
+    i === checkRes.index ? { ...c, text, done: false } : c,
+  );
+  const phases = state.planPhases.map((p, i) =>
+    i === phaseRes.index ? { ...p, checklist } : p,
+  );
+  return planMutationOk(
+    callId,
+    { ...state, planPhases: phases, planSteps: [] },
+    `Replaced checklist item in "${phase.title}".`,
+  );
+}
+
+export function applyDeleteCheck(
+  state: SessionState,
+  args: Record<string, unknown>,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  const blocked = planningOnlyGuard(state, callId, "delete_check");
+  if (blocked) return blocked;
+  const phaseRes = resolvePhaseIndex(
+    state.planPhases,
+    args.phaseId,
+    args.phaseIndex,
+  );
+  if (phaseRes.error) return planMutationFail(callId, state, phaseRes.error);
+  const phase = state.planPhases[phaseRes.index]!;
+  const checkRes = resolveCheckIndex(
+    phase.checklist,
+    args.checkId ?? args.id,
+    args.checkIndex,
+  );
+  if (checkRes.error) return planMutationFail(callId, state, checkRes.error);
+  const checklist = phase.checklist.filter((_, i) => i !== checkRes.index);
+  const phases = state.planPhases.map((p, i) =>
+    i === phaseRes.index ? { ...p, checklist } : p,
+  );
+  return planMutationOk(
+    callId,
+    { ...state, planPhases: phases, planSteps: [] },
+    `Deleted checklist item from "${phase.title}".`,
+  );
+}
+
+export function applySetQuestions(
+  state: SessionState,
+  args: Record<string, unknown>,
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  const blocked = planningOnlyGuard(state, callId, "set_questions");
+  if (blocked) return blocked;
+  if (!Array.isArray(args.questions)) {
+    return planMutationFail(
+      callId,
+      state,
+      "set_questions requires a questions array (use [] to clear).",
+    );
+  }
+  const questions = args.questions.map((raw, index) =>
+    mergePlanQuestionFromAgent(raw, index, state.planQuestions),
+  );
+  const openCount = questions.filter((q) => q.status === "open").length;
+  return planMutationOk(
+    callId,
+    { ...state, planQuestions: questions },
+    `Questions updated: ${questions.length} total, ${openCount} open.`,
+  );
+}
+
+/** Dispatch plan tools used by the agent loop. */
+export function applyPlanTool(
+  name: string,
+  state: SessionState,
+  args: Record<string, unknown>,
+  opts?: { userMessage?: string },
+): { state: SessionState; result: ToolResult; callId: string } {
+  switch (name) {
+    case "read_plan":
+      return applyReadPlan(state);
+    case "add_phase":
+      return applyAddPhase(state, args);
+    case "replace_phase":
+      return applyReplacePhase(state, args);
+    case "delete_phase":
+      return applyDeletePhase(state, args);
+    case "add_check":
+      return applyAddCheck(state, args);
+    case "replace_check":
+      return applyReplaceCheck(state, args);
+    case "delete_check":
+      return applyDeleteCheck(state, args);
+    case "set_questions":
+      return applySetQuestions(state, args);
+    case "propose_plan_ready":
+      return applyProposePlanReady(state, args);
+    case "propose_testing_ready":
+      return applyProposeTestingReady(state, args);
+    case "finalize_plan":
+      return applyFinalizePlan(state, args, {
+        userMessage: opts?.userMessage ?? "",
+      });
+    case "upsert_plan":
+    default:
+      return applyUpsertPlan(state, args);
+  }
+}
+
 /**
- * Building: plan structure is frozen. Only checklist done flags and phase
- * status may change — no add/remove/rename of phases or checklist texts.
+ * Building: plan structure is frozen. Only checklist done flags (monotonic:
+ * false→true only) and phase status may change — no add/remove/rename of
+ * phases or checklist texts, and no unchecking already-done items.
  */
 function applyBuildPlanProgress(
   state: SessionState,
@@ -677,13 +1167,28 @@ function applyBuildPlanProgress(
         };
       }
 
+      if (prevItem.done && incomingItem.done === false) {
+        return {
+          callId,
+          state,
+          result: {
+            callId,
+            success: false,
+            summary: `Cannot uncheck "${prevItem.text}" — already marked done. Keep done=true; resume from the next open item (spot-check only if unsure).`,
+            error: "Progress locked",
+          },
+        };
+      }
+
       checklist.push({
         id: prevItem.id,
         text: prevItem.text,
-        done:
-          typeof incomingItem.done === "boolean"
+        // Sticky progress: done=true cannot be cleared in build.
+        done: prevItem.done
+          ? true
+          : typeof incomingItem.done === "boolean"
             ? incomingItem.done
-            : prevItem.done,
+            : false,
       });
     }
 
@@ -695,6 +1200,20 @@ function applyBuildPlanProgress(
     });
   }
 
+  // Count newly completed items (batch allowed — prefer one-at-a-time as guidance only).
+  const newlyDone: string[] = [];
+  for (let pi = 0; pi < existing.length; pi++) {
+    const prevPhase = existing[pi]!;
+    const nextPhase = phases[pi]!;
+    for (let ci = 0; ci < prevPhase.checklist.length; ci++) {
+      const before = prevPhase.checklist[ci]!;
+      const after = nextPhase.checklist[ci]!;
+      if (!before.done && after.done) {
+        newlyDone.push(`${prevPhase.title} → ${after.text}`);
+      }
+    }
+  }
+
   const next: SessionState = {
     ...state,
     planPhases: phases,
@@ -703,17 +1222,27 @@ function applyBuildPlanProgress(
   };
 
   const { done, total } = sharedPlanChecklistProgress(next);
+  const open = Math.max(0, total - done);
+  const summary =
+    newlyDone.length === 0
+      ? `Phase statuses synced. Checklist ${done}/${total} done (${open} open).`
+      : newlyDone.length === 1
+        ? `Marked done: ${newlyDone[0]}. Checklist ${done}/${total} done (${open} open).`
+        : `Marked ${newlyDone.length} items done. Checklist ${done}/${total} done (${open} open).`;
   return {
     callId,
     state: next,
     result: {
       callId,
       success: true,
-      summary: `Progress updated: ${done}/${total} checklist · phase statuses synced.`,
+      summary,
       output: {
         planPhases: phases,
         planQuestions: next.planQuestions,
         planStatus: next.planStatus,
+        done,
+        total,
+        newlyDone,
       },
     },
   };
@@ -818,6 +1347,81 @@ export function applyProposePlanReady(
   };
 }
 
+/**
+ * Agent confirms the build is ready for the IDE Test gate.
+ * Allowed only when the checklist is complete.
+ */
+export function applyProposeTestingReady(
+  state: SessionState,
+  args: Record<string, unknown> = {},
+): { state: SessionState; result: ToolResult; callId: string } {
+  const callId = randomUUID();
+  if (state.mode === "plan" || state.planStatus === "drafting") {
+    return {
+      callId,
+      state,
+      result: {
+        callId,
+        success: false,
+        summary:
+          "propose_testing_ready is only available during Build after the checklist is done.",
+        error: "Wrong phase",
+      },
+    };
+  }
+  if (!planBuildComplete(state)) {
+    return {
+      callId,
+      state,
+      result: {
+        callId,
+        success: false,
+        summary:
+          "Cannot propose testing ready: checklist still has open work. Finish all items first.",
+        error: "Checklist incomplete",
+      },
+    };
+  }
+  if (state.buildCommitOffer || state.buildIntegrateOffer) {
+    return {
+      callId,
+      state,
+      result: {
+        callId,
+        success: false,
+        summary: "Commit/integrate is already offered — testing confirm is not needed.",
+        error: "Already past testing",
+      },
+    };
+  }
+
+  const note =
+    typeof args.summary === "string" && args.summary.trim()
+      ? args.summary.trim().slice(0, 500)
+      : undefined;
+  const confirmedAt = new Date().toISOString();
+  const next: SessionState = {
+    ...state,
+    testingConfirmedAt: confirmedAt,
+  };
+
+  return {
+    callId,
+    state: next,
+    result: {
+      callId,
+      success: true,
+      summary: note
+        ? `Testing confirmed. IDE will run the Test gate next. ${note}`
+        : "Testing confirmed. IDE will run the Test gate next.",
+      output: {
+        testingConfirmedAt: confirmedAt,
+        ...(note ? { summary: note } : {}),
+      },
+    },
+  };
+}
+
 /** IDE-only: user confirmed → Build mode. */
 export function applyStartBuilding(
   state: SessionState,
@@ -856,7 +1460,32 @@ export function applyStartBuilding(
       planStatus: "executing",
       planPhases: phases,
       planReadyProposal: null,
+      testRun: null,
+      testingConfirmedAt: null,
+      testGatePassedAt: null,
+      testGateAutoFixAttempts: 0,
+      testGateCircuitOpen: false,
+      testGateFailureFingerprint: null,
+      testGateSameFailureStreak: 0,
+      testGateEscalationLevel: 0,
+      testGateRecentSuiteKeys: [],
+      buildCommitOffer: null,
+      buildIntegrateOffer: null,
+      // buildBaseBranch is set by SessionManager.confirmPlan
     },
+  };
+}
+
+/** User rejected Start Build — clear readiness so they can revise via chat. */
+export function applyRejectPlanReady(state: SessionState): SessionState {
+  if (!state.planReadyProposal && state.planStatus === "drafting") {
+    return state;
+  }
+  return {
+    ...state,
+    planReadyProposal: null,
+    planStatus:
+      state.planStatus === "executing" ? "executing" : "drafting",
   };
 }
 
@@ -1099,7 +1728,16 @@ export function isPlanMutationTool(name: string): boolean {
   return (
     name === "upsert_plan" ||
     name === "propose_plan_ready" ||
-    name === "finalize_plan"
+    name === "propose_testing_ready" ||
+    name === "finalize_plan" ||
+    name === "read_plan" ||
+    name === "add_phase" ||
+    name === "replace_phase" ||
+    name === "delete_phase" ||
+    name === "add_check" ||
+    name === "replace_check" ||
+    name === "delete_check" ||
+    name === "set_questions"
   );
 }
 
@@ -1109,6 +1747,7 @@ export type PlanMutationPatch = {
   planStatus: PlanStatus;
   mode: AgentMode;
   planReadyProposal: SessionState["planReadyProposal"];
+  testingConfirmedAt?: SessionState["testingConfirmedAt"];
 };
 
 export function productPhaseForState(
@@ -1160,21 +1799,28 @@ export function isAgentTankMode(state: SessionState): boolean {
 
 export const CHECKLIST_CONTINUE_NUDGE = [
   "[IDE · TANK] Checklist still incomplete — do not stop.",
-  "Plan structure is locked: upsert_plan may only flip checklist done and phase status (no add/remove/rename).",
+  "Plan structure is locked; done checks are sticky (never uncheck [x] items).",
+  "Prefer Focus → Next open item; if you finished several items this round, mark them all done=true in one upsert_plan.",
+  "Resume from Focus — do not restart the plan from scratch.",
+  "Write required test files as you implement; do NOT run lint/test/typecheck suites yourself — the IDE Test gate runs after the checklist.",
   "Immediately with tools:",
-  "1) upsert_plan: mark finished items done=true; update phase status.",
-  "2) Execute the next open checklist item (write_file / run_command / …).",
+  "1) upsert_plan: set finished items done=true (keep prior done=true); update phase status.",
+  "2) Execute the next open checklist item with read_file / write_file / tools. For Node/npm sequences: reuse ONE terminal_* session (do not reopen per command). run_command only for short one-shots (not test suites).",
   "Prefer tools over narration. Keep going until the checklist is fully done.",
 ].join("\n");
 
 export const PLAN_CONTINUE_NUDGE = [
   "[IDE · TANK] Planning is not finished — do not stop on narration.",
   "Immediately with tools:",
-  "1) upsert_plan with concrete phases + checklist item texts (draft outline).",
-  "2) If anything is unclear, add open questions with selection + options (Plan Q&A UI).",
+  "1) If exploring: prefer search_graph / get_architecture / search_code (not list_dir tours), then add_phase / add_check (or upsert_plan once for a full draft).",
+  "2) If anything is unclear, set_questions with selection + options (Plan Q&A UI).",
   "3) When the plan is solid and questions are cleared, call propose_plan_ready.",
   "Do not only explore/list files. Produce plan structure or questions now.",
 ].join("\n");
 
-export { CHECKLIST_CONTINUE_USER_MESSAGE, PLAN_CONTINUE_USER_MESSAGE };
+export {
+  CHECKLIST_CONTINUE_USER_MESSAGE,
+  PLAN_CONTINUE_USER_MESSAGE,
+  TESTING_READY_CONTINUE_USER_MESSAGE,
+};
 

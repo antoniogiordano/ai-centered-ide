@@ -53,13 +53,19 @@ export const IPC_CHANNELS = {
   WORKSPACE_DIFF_FILES: "workspace:diff-files",
   WORKSPACE_DIFF_FILE: "workspace:diff-file",
   SESSION_CONFIRM_PLAN: "session:confirm-plan",
+  SESSION_REJECT_PLAN_READY: "session:reject-plan-ready",
   SESSION_DRAFT_BUILD_COMMIT: "session:draft-build-commit",
   SESSION_COMMIT_BUILD: "session:commit-build",
   SESSION_DISMISS_BUILD_COMMIT: "session:dismiss-build-commit",
+  SESSION_INTEGRATE_BUILD: "session:integrate-build",
+  SESSION_DISMISS_BUILD_INTEGRATE: "session:dismiss-build-integrate",
   PROVIDER_VERIFY: "provider:verify",
   PROVIDER_LIST_MODELS: "provider:list-models",
   PROVIDER_SAVE_CONFIG: "provider:save-config",
   PROVIDER_GET_CONFIG: "provider:get-config",
+  PROVIDER_LIST: "provider:list",
+  PROVIDER_SET_ACTIVE: "provider:set-active",
+  PROVIDER_DELETE: "provider:delete",
   GITHUB_STATUS: "github:status",
   GITHUB_LOGOUT: "github:logout",
   GITHUB_LOGIN_WEB: "github:login-web",
@@ -677,6 +683,19 @@ export type SessionConfirmPlanResponse = z.infer<
   typeof SessionConfirmPlanResponseSchema
 >;
 
+export const SessionRejectPlanReadyRequestSchema = z.object({});
+export type SessionRejectPlanReadyRequest = z.infer<
+  typeof SessionRejectPlanReadyRequestSchema
+>;
+
+export const SessionRejectPlanReadyResponseSchema = z.object({
+  ok: z.boolean(),
+  state: SessionStateSchema.optional(),
+});
+export type SessionRejectPlanReadyResponse = z.infer<
+  typeof SessionRejectPlanReadyResponseSchema
+>;
+
 export const SessionDraftBuildCommitRequestSchema = z.object({});
 export type SessionDraftBuildCommitRequest = z.infer<
   typeof SessionDraftBuildCommitRequestSchema
@@ -723,6 +742,36 @@ export type SessionDismissBuildCommitResponse = z.infer<
   typeof SessionDismissBuildCommitResponseSchema
 >;
 
+export const SessionIntegrateBuildRequestSchema = z.object({
+  action: z.enum(["pr", "merge"]),
+});
+export type SessionIntegrateBuildRequest = z.infer<
+  typeof SessionIntegrateBuildRequestSchema
+>;
+
+export const SessionIntegrateBuildResponseSchema = z.object({
+  ok: z.boolean(),
+  url: z.string().optional(),
+  state: SessionStateSchema.optional(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type SessionIntegrateBuildResponse = z.infer<
+  typeof SessionIntegrateBuildResponseSchema
+>;
+
+export const SessionDismissBuildIntegrateRequestSchema = z.object({});
+export type SessionDismissBuildIntegrateRequest = z.infer<
+  typeof SessionDismissBuildIntegrateRequestSchema
+>;
+
+export const SessionDismissBuildIntegrateResponseSchema = z.object({
+  ok: z.boolean(),
+  state: SessionStateSchema.optional(),
+});
+export type SessionDismissBuildIntegrateResponse = z.infer<
+  typeof SessionDismissBuildIntegrateResponseSchema
+>;
+
 export const ProviderVerifyRequestSchema = z.object({
   baseUrl: z.string().url(),
   /** Optional for local OpenAI-compatible servers (e.g. Ollama). */
@@ -756,9 +805,19 @@ export type ProviderListModelsResponse = z.infer<
 >;
 
 export const ProviderSaveConfigRequestSchema = z.object({
+  id: z.string().min(1).optional(),
+  name: z.string().min(1).max(80).optional(),
   baseUrl: z.string().url(),
   apiKey: z.string().default(""),
   defaultModel: z.string().min(1),
+  paid: z.boolean().optional(),
+  pricing: z
+    .object({
+      inputPer1M: z.number().nonnegative().optional(),
+      outputPer1M: z.number().nonnegative().optional(),
+    })
+    .optional(),
+  makeActive: z.boolean().optional(),
 });
 export type ProviderSaveConfigRequest = z.infer<
   typeof ProviderSaveConfigRequestSchema
@@ -766,6 +825,7 @@ export type ProviderSaveConfigRequest = z.infer<
 
 export const ProviderSaveConfigResponseSchema = z.object({
   saved: z.boolean(),
+  id: z.string().optional(),
 });
 export type ProviderSaveConfigResponse = z.infer<
   typeof ProviderSaveConfigResponseSchema
@@ -777,12 +837,73 @@ export type ProviderGetConfigRequest = z.infer<
 >;
 
 export const ProviderGetConfigResponseSchema = z.object({
+  id: z.string().nullable().optional(),
+  name: z.string().nullable().optional(),
   baseUrl: z.string().nullable(),
   defaultModel: z.string().nullable(),
   apiKey: z.string().nullable(),
+  paid: z.boolean().optional(),
+  pricing: z
+    .object({
+      inputPer1M: z.number().nonnegative().optional(),
+      outputPer1M: z.number().nonnegative().optional(),
+    })
+    .nullable()
+    .optional(),
 });
 export type ProviderGetConfigResponse = z.infer<
   typeof ProviderGetConfigResponseSchema
+>;
+
+export const ProviderListRequestSchema = z.object({});
+export type ProviderListRequest = z.infer<typeof ProviderListRequestSchema>;
+
+export const ProviderListResponseSchema = z.object({
+  activeId: z.string().nullable(),
+  providers: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      baseUrl: z.string(),
+      defaultModel: z.string(),
+      paid: z.boolean(),
+      pricing: z
+        .object({
+          inputPer1M: z.number().nonnegative().optional(),
+          outputPer1M: z.number().nonnegative().optional(),
+        })
+        .optional(),
+    }),
+  ),
+});
+export type ProviderListResponse = z.infer<typeof ProviderListResponseSchema>;
+
+export const ProviderSetActiveRequestSchema = z.object({
+  id: z.string().min(1),
+});
+export type ProviderSetActiveRequest = z.infer<
+  typeof ProviderSetActiveRequestSchema
+>;
+
+export const ProviderSetActiveResponseSchema = z.object({
+  ok: z.boolean(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type ProviderSetActiveResponse = z.infer<
+  typeof ProviderSetActiveResponseSchema
+>;
+
+export const ProviderDeleteRequestSchema = z.object({
+  id: z.string().min(1),
+});
+export type ProviderDeleteRequest = z.infer<typeof ProviderDeleteRequestSchema>;
+
+export const ProviderDeleteResponseSchema = z.object({
+  ok: z.boolean(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type ProviderDeleteResponse = z.infer<
+  typeof ProviderDeleteResponseSchema
 >;
 
 export const IpcRequestSchemas = {
@@ -828,14 +949,21 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.WORKSPACE_ARCHITECTURE_SAVE]:
     WorkspaceArchitectureSaveRequestSchema,
   [IPC_CHANNELS.SESSION_CONFIRM_PLAN]: SessionConfirmPlanRequestSchema,
+  [IPC_CHANNELS.SESSION_REJECT_PLAN_READY]: SessionRejectPlanReadyRequestSchema,
   [IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT]: SessionDraftBuildCommitRequestSchema,
   [IPC_CHANNELS.SESSION_COMMIT_BUILD]: SessionCommitBuildRequestSchema,
   [IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT]:
     SessionDismissBuildCommitRequestSchema,
+  [IPC_CHANNELS.SESSION_INTEGRATE_BUILD]: SessionIntegrateBuildRequestSchema,
+  [IPC_CHANNELS.SESSION_DISMISS_BUILD_INTEGRATE]:
+    SessionDismissBuildIntegrateRequestSchema,
   [IPC_CHANNELS.PROVIDER_VERIFY]: ProviderVerifyRequestSchema,
   [IPC_CHANNELS.PROVIDER_LIST_MODELS]: ProviderListModelsRequestSchema,
   [IPC_CHANNELS.PROVIDER_SAVE_CONFIG]: ProviderSaveConfigRequestSchema,
   [IPC_CHANNELS.PROVIDER_GET_CONFIG]: ProviderGetConfigRequestSchema,
+  [IPC_CHANNELS.PROVIDER_LIST]: ProviderListRequestSchema,
+  [IPC_CHANNELS.PROVIDER_SET_ACTIVE]: ProviderSetActiveRequestSchema,
+  [IPC_CHANNELS.PROVIDER_DELETE]: ProviderDeleteRequestSchema,
   [IPC_CHANNELS.GITHUB_STATUS]: GithubStatusRequestSchema,
   [IPC_CHANNELS.GITHUB_LOGOUT]: GithubLogoutRequestSchema,
   [IPC_CHANNELS.GITHUB_LOGIN_WEB]: GithubLoginWebRequestSchema,

@@ -409,6 +409,43 @@ export class GitService {
     await this.git.checkout(name);
   }
 
+  /** Merge `head` into current branch (caller should checkout the base first). */
+  async mergeBranch(head: string, message?: string): Promise<void> {
+    if (message?.trim()) {
+      await this.git.merge([head, "-m", message.trim()]);
+      return;
+    }
+    await this.git.merge([head, "--no-edit"]);
+  }
+
+  /**
+   * Checkout `base`, merge `head` into it. Fails if the worktree is dirty.
+   */
+  async mergeIntoBase(opts: {
+    base: string;
+    head: string;
+    message?: string;
+  }): Promise<void> {
+    if (await this.isDirty()) {
+      throw new Error("DIRTY_WORKTREE");
+    }
+    await this.checkoutExisting(opts.base);
+    await this.mergeBranch(opts.head, opts.message);
+  }
+
+  /** Push current branch to origin, setting upstream when missing. */
+  async pushCurrentUpstream(remote = "origin"): Promise<void> {
+    const info = await this.branchInfo();
+    const branch = info.localBranch;
+    if (!branch) throw new Error("DETACHED_HEAD");
+    const status = await this.git.status();
+    if (status.tracking) {
+      await this.git.push(remote, branch);
+      return;
+    }
+    await this.git.raw(["push", "-u", remote, branch]);
+  }
+
   /**
    * Create a feat branch from `base`, handling a dirty worktree via stash or
    * commit-on-base first.

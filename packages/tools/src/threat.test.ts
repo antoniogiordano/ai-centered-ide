@@ -3,6 +3,7 @@ import {
   analyzeCommand,
   evaluatePolicy,
   COMMAND_DENYLIST,
+  isShellFileInspectionCommand,
 } from "./policy.js";
 import { defaultRedact } from "./gateway.js";
 
@@ -32,6 +33,19 @@ describe("threat model: tool gateway", () => {
       category: "destructive",
     });
     expect("requiresApproval" in decision && decision.requiresApproval).toBe(true);
+  });
+
+  it("blocks shell cat/ls/find used as a file browser", () => {
+    expect(isShellFileInspectionCommand("ls -la")).toBe(true);
+    expect(
+      isShellFileInspectionCommand(
+        "cat app/layout.tsx && echo '===' && cat app/globals.css",
+      ),
+    ).toBe(true);
+    expect(isShellFileInspectionCommand("find . -name '*.ts'")).toBe(true);
+    expect(isShellFileInspectionCommand("pnpm install")).toBe(false);
+    expect(isShellFileInspectionCommand("npm ls")).toBe(false);
+    expect(isShellFileInspectionCommand("git status")).toBe(false);
   });
 
   it("redacts secrets in tool output", () => {

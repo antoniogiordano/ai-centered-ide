@@ -30,7 +30,11 @@ export type ChatChunk =
       argumentsDelta: string;
       index: number;
     }
-  | { type: "done"; finishReason: string }
+  | {
+      type: "done";
+      finishReason: string;
+      usage?: { inputTokens: number; outputTokens: number };
+    }
   | { type: "error"; error: AppError };
 
 export type ChatOptions = {

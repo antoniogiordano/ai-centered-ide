@@ -142,6 +142,9 @@ export function CommitBuildDialog(props: Props) {
           <p className="qa-dialog-lead">
             Commit the build on{" "}
             <strong>{offer.branch ?? "current branch"}</strong>
+            {offer.baseBranch
+              ? ` (started from ${offer.baseBranch})`
+              : ""}
             {offer.files.length
               ? ` · ${offer.files.length} changed file${offer.files.length === 1 ? "" : "s"}`
               : ""}

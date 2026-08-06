@@ -5,7 +5,6 @@ import type {
   ToolCall,
   ToolResult,
 } from "@ai-ide/shared";
-import { AppError } from "@ai-ide/shared";
 import type {
   CheckpointService,
   FilesystemService,
@@ -15,6 +14,7 @@ import {
   analyzeCommand,
   evaluatePolicy,
   getToolRisk,
+  isShellFileInspectionCommand,
   type ApprovalCategory,
 } from "./policy.js";
 import type { ToolRegistry } from "./registry.js";
@@ -41,6 +41,19 @@ export type ToolExecutionContext = {
   terminals?: TerminalHost;
   /** Codebase-memory-mcp host (desktop). Optional until indexed. */
   cbm?: CbmHost;
+  /** Full suite logs from the last IDE test gate (for read_test_log). */
+  testLogs?: {
+    get: (suiteId: string) => string | undefined;
+  };
+  /** Last IDE test-gate report + escalation (for get_test_report). */
+  testGate?: {
+    getReport: () => import("@ai-ide/shared").TestRunReport | null;
+    getMeta: () => {
+      escalationLevel: number;
+      circuitOpen: boolean;
+      sameFailureStreak: number;
+    };
+  };
 };
 
 export type GatewayResult =
@@ -58,20 +71,32 @@ export class ToolGateway {
   async executeTool(call: ToolCall, ctx: ToolExecutionContext): Promise<GatewayResult> {
     const tool = this.registry.get(call.name);
     if (!tool) {
-      throw new AppError({
-        code: "NOT_FOUND",
-        userMessage: "Unknown tool requested.",
-        technicalDetail: call.name,
-      });
+      return {
+        status: "ok",
+        result: {
+          callId: call.id,
+          success: false,
+          summary: `Unknown tool: ${call.name}`,
+          error: `Unknown tool requested: ${call.name}`,
+        },
+      };
     }
 
     const parsed = tool.argsSchema.safeParse(call.arguments);
     if (!parsed.success) {
-      throw new AppError({
-        code: "VALIDATION_ERROR",
-        userMessage: "Tool arguments are invalid.",
-        technicalDetail: parsed.error.message,
-      });
+      return {
+        status: "ok",
+        result: {
+          callId: call.id,
+          success: false,
+          summary: "Tool arguments are invalid — fix the args and retry.",
+          error: parsed.error.message,
+          output: {
+            tool: call.name,
+            issues: parsed.error.issues,
+          },
+        },
+      };
     }
 
     const riskLevel = tool.riskLevel ?? getToolRisk(call.name);
@@ -106,13 +131,32 @@ export class ToolGateway {
 
     if (call.name === "run_command") {
       const cmd = String(parsed.data.command ?? "");
+      if (isShellFileInspectionCommand(cmd)) {
+        return {
+          status: "ok",
+          result: {
+            callId: call.id,
+            success: false,
+            summary:
+              "Blocked shell file-inspection. Use list_dir / read_file / search_text / search_graph instead of cat/ls/find/head.",
+            error:
+              "Do not use shell cat/ls/find/head to inspect files. Use list_dir, read_file, search_text, or search_graph / get_code_snippet.",
+            output: { command: cmd, blocked: true, reason: "file_inspection" },
+          },
+        };
+      }
       const analysis = analyzeCommand(cmd);
       if (analysis.blocked) {
-        throw new AppError({
-          code: "TOOL_DENIED",
-          userMessage: "This command is blocked by policy.",
-          technicalDetail: analysis.matchedDeny ?? cmd,
-        });
+        return {
+          status: "ok",
+          result: {
+            callId: call.id,
+            success: false,
+            summary: "Command blocked by policy.",
+            error: `Blocked by policy: ${analysis.matchedDeny ?? cmd}`,
+            output: { command: cmd, blocked: true, reason: "denylist" },
+          },
+        };
       }
       if (analysis.needsApproval && !oneShot) {
         const decision = evaluatePolicy({
@@ -151,11 +195,16 @@ export class ToolGateway {
         };
       }
     } else if ("allowed" in decision && decision.allowed === false && "reason" in decision) {
-      throw new AppError({
-        code: "TOOL_DENIED",
-        userMessage: decision.reason,
-        technicalDetail: call.name,
-      });
+      return {
+        status: "ok",
+        result: {
+          callId: call.id,
+          success: false,
+          summary: decision.reason,
+          error: decision.reason,
+          output: { tool: call.name, blocked: true, reason: "policy" },
+        },
+      };
     }
 
     const started = Date.now();

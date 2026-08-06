@@ -143,6 +143,11 @@ export function registerIpcHandlers(
     });
   });
 
+  ipcMain.handle(IPC_CHANNELS.SESSION_REJECT_PLAN_READY, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.SESSION_REJECT_PLAN_READY, payload ?? {});
+    return session.rejectPlanReady();
+  });
+
   ipcMain.handle(IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT, async (_event, payload) => {
     safeValidate(IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT, payload ?? {});
     return session.draftBuildCommitMessage();
@@ -156,6 +161,16 @@ export function registerIpcHandlers(
   ipcMain.handle(IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT, (_event, payload) => {
     safeValidate(IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT, payload ?? {});
     return session.dismissBuildCommit();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_INTEGRATE_BUILD, async (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.SESSION_INTEGRATE_BUILD, payload);
+    return session.integrateBuild(req.action);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_DISMISS_BUILD_INTEGRATE, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.SESSION_DISMISS_BUILD_INTEGRATE, payload ?? {});
+    return session.dismissBuildIntegrate();
   });
 
   ipcMain.handle(IPC_CHANNELS.SESSION_SEND_MESSAGE, async (_event, payload) => {
@@ -640,13 +655,22 @@ export function registerIpcHandlers(
       }
       return { ok: true, models };
     } catch (error) {
+      const detail =
+        error instanceof AppError
+          ? error.technicalDetail || error.userMessage
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      const userMessage =
+        error instanceof AppError
+          ? error.userMessage
+          : "Could not list models from provider.";
       return {
         ok: false,
         error: {
           code: "PROVIDER_ERROR" as const,
-          userMessage: "Could not list models from provider.",
-          technicalDetail:
-            error instanceof Error ? error.message : String(error),
+          userMessage,
+          technicalDetail: detail,
         },
       };
     }
@@ -661,28 +685,136 @@ export function registerIpcHandlers(
 
   ipcMain.handle(IPC_CHANNELS.PROVIDER_SAVE_CONFIG, async (_event, payload) => {
     const req = safeValidate(IPC_CHANNELS.PROVIDER_SAVE_CONFIG, payload);
-    storage.setPreference("providerConfig", {
+    const store = session.getProviderStore();
+    if (!store) {
+      // Fallback legacy write
+      storage.setPreference("providerConfig", {
+        baseUrl: req.baseUrl,
+        defaultModel: req.defaultModel,
+      });
+      if (req.apiKey.trim()) {
+        await credentials.set(CREDENTIAL_SERVICE, "default", req.apiKey);
+      }
+      return { saved: true };
+    }
+    const paid =
+      req.paid ??
+      !["localhost", "127.0.0.1", "::1"].some((h) =>
+        req.baseUrl.includes(h),
+      );
+    const saved = store.upsertProvider({
+      ...(req.id ? { id: req.id } : {}),
+      name: req.name?.trim() || (paid ? "Cloud provider" : "Local provider"),
       baseUrl: req.baseUrl,
       defaultModel: req.defaultModel,
+      paid,
+      ...(req.pricing ? { pricing: req.pricing } : {}),
+      ...(req.apiKey.trim() ? { apiKey: req.apiKey } : {}),
+      makeActive: req.makeActive !== false,
     });
-    if (req.apiKey.trim()) {
-      await credentials.set(CREDENTIAL_SERVICE, "default", req.apiKey);
-    }
-    return { saved: true };
+    // Keep legacy preference in sync for older code paths.
+    storage.setPreference("providerConfig", {
+      baseUrl: saved.baseUrl,
+      defaultModel: saved.defaultModel,
+    });
+    session.syncProviderHud();
+    return { saved: true, id: saved.id };
   });
 
   ipcMain.handle(IPC_CHANNELS.PROVIDER_GET_CONFIG, async (_event, payload) => {
     safeValidate(IPC_CHANNELS.PROVIDER_GET_CONFIG, payload ?? {});
+    const store = session.getProviderStore();
+    if (store) {
+      const active = store.getActive();
+      if (active) {
+        const apiKey = await store.getApiKey(active.id);
+        return {
+          id: active.id,
+          name: active.name,
+          baseUrl: active.baseUrl,
+          defaultModel: active.defaultModel,
+          apiKey: apiKey || null,
+          paid: active.paid,
+          pricing: active.pricing ?? null,
+        };
+      }
+    }
     const cfg = storage.getPreference<{
       baseUrl?: string;
       defaultModel?: string;
     }>("providerConfig");
     const apiKey = await credentials.get(CREDENTIAL_SERVICE, "default");
     return {
+      id: null,
+      name: null,
       baseUrl: cfg?.baseUrl ?? null,
       defaultModel: cfg?.defaultModel ?? null,
       apiKey: apiKey ?? null,
+      paid: undefined,
+      pricing: null,
     };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDER_LIST, (_event, payload) => {
+    safeValidate(IPC_CHANNELS.PROVIDER_LIST, payload ?? {});
+    const store = session.getProviderStore();
+    const registry = store?.loadRegistry() ?? {
+      providers: [],
+      activeId: null,
+      usageByProviderId: {},
+    };
+    return {
+      activeId: registry.activeId,
+      providers: registry.providers.map((p) => ({
+        id: p.id,
+        name: p.name,
+        baseUrl: p.baseUrl,
+        defaultModel: p.defaultModel,
+        paid: p.paid,
+        ...(p.pricing ? { pricing: p.pricing } : {}),
+      })),
+    };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDER_SET_ACTIVE, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.PROVIDER_SET_ACTIVE, payload);
+    const store = session.getProviderStore();
+    if (!store?.setActive(req.id)) {
+      return {
+        ok: false,
+        error: {
+          code: "NOT_FOUND" as const,
+          userMessage: "Provider not found.",
+          technicalDetail: req.id,
+        },
+      };
+    }
+    const active = store.getActive();
+    if (active) {
+      storage.setPreference("providerConfig", {
+        baseUrl: active.baseUrl,
+        defaultModel: active.defaultModel,
+      });
+    }
+    session.syncProviderHud();
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDER_DELETE, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.PROVIDER_DELETE, payload);
+    const store = session.getProviderStore();
+    if (!store?.deleteProvider(req.id)) {
+      return {
+        ok: false,
+        error: {
+          code: "NOT_FOUND" as const,
+          userMessage: "Provider not found.",
+          technicalDetail: req.id,
+        },
+      };
+    }
+    session.syncProviderHud();
+    return { ok: true };
   });
 
   ipcMain.handle(IPC_CHANNELS.GITHUB_STATUS, async (_event, payload) => {

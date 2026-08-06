@@ -10,7 +10,12 @@ import {
   GitService,
 } from "@ai-ide/workspace";
 import {
+  applyAddCheck,
+  applyAddPhase,
+  applyDeleteCheck,
   applyProposePlanReady,
+  applyProposeTestingReady,
+  applyReplaceCheck,
   applyStartBuilding,
   applyUpsertPlan,
   buildContext,
@@ -288,6 +293,126 @@ describe("agent runtime", () => {
     expect(addPhase.result.success).toBe(false);
   });
 
+  it("build mode rejects unchecking already-done items", () => {
+    const base = {
+      ...newSession("s-sticky", "agent"),
+      mode: "agent" as const,
+      planStatus: "executing" as const,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Foundation",
+          status: "in_progress" as const,
+          checklist: [
+            { id: "c1", text: "Scaffold", done: true },
+            { id: "c2", text: "Tests", done: false },
+          ],
+        },
+      ],
+    };
+
+    const uncheck = applyUpsertPlan(base, {
+      phases: [
+        {
+          id: "p1",
+          title: "Foundation",
+          status: "in_progress",
+          checklist: [
+            { id: "c1", text: "Scaffold", done: false },
+            { id: "c2", text: "Tests", done: false },
+          ],
+        },
+      ],
+    });
+    expect(uncheck.result.success).toBe(false);
+    expect(uncheck.result.error).toBe("Progress locked");
+    expect(uncheck.state.planPhases[0]?.checklist[0]?.done).toBe(true);
+
+    const advance = applyUpsertPlan(base, {
+      phases: [
+        {
+          id: "p1",
+          title: "Foundation",
+          status: "completed",
+          checklist: [
+            { id: "c1", text: "Scaffold", done: true },
+            { id: "c2", text: "Tests", done: true },
+          ],
+        },
+      ],
+    });
+    expect(advance.result.success).toBe(true);
+    expect(advance.state.planPhases[0]?.checklist.map((c) => c.done)).toEqual([
+      true,
+      true,
+    ]);
+  });
+
+  it("build mode allows marking multiple newly finished checklist items per upsert", () => {
+    const base = {
+      ...newSession("s-one-check", "agent"),
+      mode: "agent" as const,
+      planStatus: "executing" as const,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Foundation",
+          status: "in_progress" as const,
+          checklist: [
+            { id: "c1", text: "Scaffold", done: false },
+            { id: "c2", text: "Tests", done: false },
+            { id: "c3", text: "Docs", done: false },
+          ],
+        },
+      ],
+    };
+
+    const batch = applyUpsertPlan(base, {
+      phases: [
+        {
+          id: "p1",
+          title: "Foundation",
+          status: "completed",
+          checklist: [
+            { id: "c1", text: "Scaffold", done: true },
+            { id: "c2", text: "Tests", done: true },
+            { id: "c3", text: "Docs", done: true },
+          ],
+        },
+      ],
+    });
+    expect(batch.result.success).toBe(true);
+    expect(batch.state.planPhases[0]?.checklist.every((c) => c.done)).toBe(true);
+    expect(batch.result.output).toMatchObject({
+      newlyDone: [
+        "Foundation → Scaffold",
+        "Foundation → Tests",
+        "Foundation → Docs",
+      ],
+    });
+
+    const one = applyUpsertPlan(base, {
+      phases: [
+        {
+          id: "p1",
+          title: "Foundation",
+          status: "in_progress",
+          checklist: [
+            { id: "c1", text: "Scaffold", done: true },
+            { id: "c2", text: "Tests", done: false },
+            { id: "c3", text: "Docs", done: false },
+          ],
+        },
+      ],
+    });
+    expect(one.result.success).toBe(true);
+    expect(one.state.planPhases[0]?.checklist.map((c) => c.done)).toEqual([
+      true,
+      false,
+      false,
+    ]);
+  });
+
   it("strips agent-invented clarifying answers", () => {
     const session = newSession("s-q", "plan");
     const applied = applyUpsertPlan(session, {
@@ -451,6 +576,93 @@ describe("agent runtime", () => {
     expect(started.state.mode).toBe("agent");
     expect(started.state.planStatus).toBe("executing");
     expect(started.state.planReadyProposal).toBeNull();
+    expect(started.state.testingConfirmedAt).toBeNull();
+  });
+
+  it("propose_testing_ready rejects open checklist and confirms when complete", () => {
+    const open = {
+      ...newSession("s-test-open", "agent"),
+      mode: "agent" as const,
+      planStatus: "executing" as const,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Phase 1",
+          status: "in_progress" as const,
+          checklist: [{ id: "c1", text: "Do thing", done: false }],
+        },
+      ],
+    };
+    const rejected = applyProposeTestingReady(open, {});
+    expect(rejected.result.success).toBe(false);
+    expect(rejected.state.testingConfirmedAt).toBeNull();
+
+    const complete = {
+      ...open,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Phase 1",
+          status: "completed" as const,
+          checklist: [{ id: "c1", text: "Do thing", done: true }],
+        },
+      ],
+    };
+    const ok = applyProposeTestingReady(complete, { summary: "Ready" });
+    expect(ok.result.success).toBe(true);
+    expect(ok.state.testingConfirmedAt).toBeTruthy();
+  });
+
+  it("plan micro CRUD clears readiness and edits by id/index", () => {
+    let state = newSession("s-crud", "plan");
+    const added = applyAddPhase(state, {
+      title: "Data",
+      checklist: ["Model openings", "Wire move engine"],
+    });
+    expect(added.result.success).toBe(true);
+    state = added.state;
+    expect(state.planPhases).toHaveLength(1);
+    expect(state.planPhases[0]?.checklist).toHaveLength(2);
+
+    const phaseId = state.planPhases[0]!.id;
+    const more = applyAddCheck(state, {
+      phaseId,
+      text: "Tests",
+      afterCheckIndex: 0,
+    });
+    expect(more.result.success).toBe(true);
+    state = more.state;
+    expect(state.planPhases[0]?.checklist.map((c) => c.text)).toEqual([
+      "Model openings",
+      "Tests",
+      "Wire move engine",
+    ]);
+
+    const proposed = applyProposePlanReady(state, {
+      suggestedBranch: "feat/crud",
+    });
+    expect(proposed.state.planReadyProposal).not.toBeNull();
+    state = proposed.state;
+
+    const renamed = applyReplaceCheck(state, {
+      phaseIndex: 0,
+      checkIndex: 1,
+      text: "Unit tests",
+    });
+    expect(renamed.result.success).toBe(true);
+    expect(renamed.state.planReadyProposal).toBeNull();
+    expect(renamed.state.planStatus).toBe("drafting");
+    state = renamed.state;
+
+    const deleted = applyDeleteCheck(state, {
+      phaseId,
+      checkId: state.planPhases[0]!.checklist[0]!.id,
+    });
+    expect(deleted.result.success).toBe(true);
+    expect(deleted.state.planPhases[0]?.checklist.map((c) => c.text)).toEqual([
+      "Unit tests",
+      "Wire move engine",
+    ]);
   });
 
   it("stops after max iterations", () => {
@@ -512,7 +724,8 @@ describe("agent runtime", () => {
 
     expect(chatCalls).toBe(1);
     expect(result.state.status).toBe("error");
-    expect(result.state.error).toBe("The AI provider returned an error.");
+    expect(result.state.error).toContain("The AI provider returned an error.");
+    expect(result.state.error).toContain("HTTP 500");
     expect(
       result.state.turns.some((t) => t.content.includes("Build paused")),
     ).toBe(true);

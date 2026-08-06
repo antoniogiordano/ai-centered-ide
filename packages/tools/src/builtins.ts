@@ -17,7 +17,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "list_dir",
     description:
-      "List files and folders in a workspace directory (hides node_modules/.git/dist/…). Paths are relative to the workspace root. Use path \".\" for the root. Prefer this over shell ls.",
+      "List files and folders in a workspace directory (hides node_modules/.git/dist/…). Paths relative to workspace root; \".\" = root. Prefer over shell ls. When the codebase graph is indexed, prefer search_graph / get_architecture / search_code first — use list_dir only for a known path, not to walk the tree.",
     riskLevel: "safe",
     phases: READ_TOOLS,
     argsSchema: z.object({
@@ -63,11 +63,13 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "read_file",
     description:
-      "Read a UTF-8 text file from the workspace. Path is relative to the workspace root (e.g. README.md, docs/DEVELOPMENT_PLAN.md).",
+      "Read a UTF-8 text file window from the workspace (path relative to root). Defaults to ~250 lines from startLine (1-based). Large files never fail with 'too large' — page with startLine using nextStartLine from the previous result. Prefer search_text / search_graph to locate before paging whole files.",
     riskLevel: "safe",
     phases: READ_TOOLS,
     argsSchema: z.object({
       path: z.string().min(1),
+      startLine: z.number().int().positive().optional(),
+      maxLines: z.number().int().positive().max(800).optional(),
     }) as z.ZodType<Record<string, unknown>>,
     parameters: {
       type: "object",
@@ -76,21 +78,62 @@ export function registerStarterTools(registry: ToolRegistry): void {
           type: "string",
           description: "File path relative to the workspace root.",
         },
+        startLine: {
+          type: "integer",
+          description:
+            "1-based line to start reading (default 1). Use nextStartLine from a prior truncated read.",
+        },
+        maxLines: {
+          type: "integer",
+          description: "Max lines to return (default 250, max 800).",
+        },
       },
       required: ["path"],
       additionalProperties: false,
     },
     execute: async (args, ctx) => {
       const path = String(args.path);
-      const content = ctx.fs.read(path);
-      return { summary: `Read ${path}`, output: content };
+      const startLine =
+        typeof args.startLine === "number" ? args.startLine : undefined;
+      const maxLines =
+        typeof args.maxLines === "number" ? args.maxLines : undefined;
+      const window = await ctx.fs.readWindow(path, {
+        ...(startLine != null ? { startLine } : {}),
+        ...(maxLines != null ? { maxLines } : {}),
+      });
+      const lineSpan =
+        window.endLine >= window.startLine
+          ? `L${window.startLine}-${window.endLine}`
+          : `L${window.startLine}`;
+      const totalHint =
+        window.totalLines != null
+          ? `${window.totalLines} lines`
+          : `${window.totalBytes} bytes`;
+      const summary = window.truncated
+        ? `Read ${path} ${lineSpan} (${totalHint}; truncated — nextStartLine=${window.nextStartLine})`
+        : `Read ${path} ${lineSpan} (${totalHint})`;
+      return {
+        summary,
+        output: {
+          path: window.path,
+          startLine: window.startLine,
+          endLine: window.endLine,
+          maxLines: window.maxLines,
+          totalLines: window.totalLines,
+          totalBytes: window.totalBytes,
+          truncated: window.truncated,
+          nextStartLine: window.nextStartLine,
+          contentTruncated: window.contentTruncated,
+          content: window.content,
+        },
+      };
     },
   });
 
   registry.register({
     name: "upsert_plan",
     description:
-      "Update the delivery plan. Planning: CRUD phases + checklist texts + clarifying questions for the Plan Q&A dialog (never ask those questions only in chat prose). Building: structure is LOCKED — only set checklist done and phase status (same phase/item ids and texts; no add/remove/rename). After EACH completed item, call with that item done=true. Always pass the full phases array.",
+      "Full-replace the delivery plan (or update build progress). Planning: prefer micro tools (add_phase, add_check, set_questions, …) for small edits; use upsert_plan for a full rewrite. Building: structure LOCKED; done checks sticky; prefer Focus → one item, but you may mark multiple newly finished items done=true in one call if you completed them together. Keep prior done items true. Always pass the full phases array when using this tool.",
     riskLevel: "safe",
     phases: PLANNING_AND_BUILDING,
     argsSchema: z.object({
@@ -103,7 +146,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
         phases: {
           type: "array",
           description:
-            "Ordered delivery phases. Planning: title + checklist text. Building: same structure as agreed — only change status and checklist done (ids/titles/texts must match).",
+            "Ordered delivery phases. Planning: title + checklist text. Building: same structure as agreed — only change status and checklist done=true (ids/titles/texts must match; never uncheck done items).",
           items: {
             type: "object",
             properties: {
@@ -144,7 +187,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
         questions: {
           type: "array",
           description:
-            "Clarifying questions for the keyboard Q&A dialog (USER answers). EVERY new question MUST include selection (single|multiple), 2–8 options, and status \"open\". Do NOT invent answer/selectedOptionIds. Omit or pass [] when none remain.",
+            "Clarifying questions for the keyboard Q&A dialog (USER answers). Prefer set_questions for question-only updates. EVERY new question MUST include selection (single|multiple), 2–8 options, and status \"open\". Do NOT invent answer/selectedOptionIds. Omit or pass [] when none remain.",
           items: {
             type: "object",
             properties: {
@@ -187,10 +230,233 @@ export function registerStarterTools(registry: ToolRegistry): void {
     }),
   });
 
+  const planStub = async () => ({
+    summary: "Plan mutation is handled by the agent runtime.",
+  });
+
+  registry.register({
+    name: "read_plan",
+    description:
+      "Read the current delivery plan (phases, checklist, clarifying questions, ready proposal). Prefer this before micro edits.",
+    riskLevel: "safe",
+    phases: PLANNING_AND_BUILDING,
+    argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
+    parameters: emptyObjectSchema,
+    execute: planStub,
+  });
+
+  registry.register({
+    name: "add_phase",
+    description:
+      "Planning only. Add one phase (optional checklist string[]). Prefer phaseId refs elsewhere; use afterPhaseId/afterPhaseIndex to insert.",
+    riskLevel: "safe",
+    phases: PLANNING_ONLY,
+    argsSchema: z.object({
+      title: z.string().min(1),
+      checklist: z.array(z.union([z.string(), z.record(z.unknown())])).optional(),
+      afterPhaseId: z.string().optional(),
+      afterPhaseIndex: z.number().int().optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        checklist: {
+          type: "array",
+          description: "Checklist item texts (strings) or {text} objects.",
+          items: {},
+        },
+        afterPhaseId: { type: "string" },
+        afterPhaseIndex: { type: "integer" },
+      },
+      required: ["title"],
+      additionalProperties: false,
+    },
+    execute: planStub,
+  });
+
+  registry.register({
+    name: "replace_phase",
+    description:
+      "Planning only. Replace a phase by phaseId (preferred) or phaseIndex. Optionally replace title and/or checklist.",
+    riskLevel: "safe",
+    phases: PLANNING_ONLY,
+    argsSchema: z.object({
+      phaseId: z.string().optional(),
+      phaseIndex: z.number().int().optional(),
+      title: z.string().optional(),
+      checklist: z.array(z.union([z.string(), z.record(z.unknown())])).optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        phaseId: { type: "string" },
+        phaseIndex: { type: "integer" },
+        title: { type: "string" },
+        checklist: { type: "array", items: {} },
+      },
+      additionalProperties: false,
+    },
+    execute: planStub,
+  });
+
+  registry.register({
+    name: "delete_phase",
+    description:
+      "Planning only. Delete a phase by phaseId (preferred) or phaseIndex.",
+    riskLevel: "safe",
+    phases: PLANNING_ONLY,
+    argsSchema: z.object({
+      phaseId: z.string().optional(),
+      phaseIndex: z.number().int().optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        phaseId: { type: "string" },
+        phaseIndex: { type: "integer" },
+      },
+      additionalProperties: false,
+    },
+    execute: planStub,
+  });
+
+  registry.register({
+    name: "add_check",
+    description:
+      "Planning only. Add one checklist item to a phase (phaseId preferred). Optional afterCheckId/afterCheckIndex.",
+    riskLevel: "safe",
+    phases: PLANNING_ONLY,
+    argsSchema: z.object({
+      phaseId: z.string().optional(),
+      phaseIndex: z.number().int().optional(),
+      text: z.string().min(1),
+      afterCheckId: z.string().optional(),
+      afterCheckIndex: z.number().int().optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        phaseId: { type: "string" },
+        phaseIndex: { type: "integer" },
+        text: { type: "string" },
+        afterCheckId: { type: "string" },
+        afterCheckIndex: { type: "integer" },
+      },
+      required: ["text"],
+      additionalProperties: false,
+    },
+    execute: planStub,
+  });
+
+  registry.register({
+    name: "replace_check",
+    description:
+      "Planning only. Replace one checklist item text (phaseId + checkId preferred; indexes allowed).",
+    riskLevel: "safe",
+    phases: PLANNING_ONLY,
+    argsSchema: z.object({
+      phaseId: z.string().optional(),
+      phaseIndex: z.number().int().optional(),
+      checkId: z.string().optional(),
+      checkIndex: z.number().int().optional(),
+      text: z.string().min(1),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        phaseId: { type: "string" },
+        phaseIndex: { type: "integer" },
+        checkId: { type: "string" },
+        checkIndex: { type: "integer" },
+        text: { type: "string" },
+      },
+      required: ["text"],
+      additionalProperties: false,
+    },
+    execute: planStub,
+  });
+
+  registry.register({
+    name: "delete_check",
+    description:
+      "Planning only. Delete one checklist item (phaseId + checkId preferred; indexes allowed).",
+    riskLevel: "safe",
+    phases: PLANNING_ONLY,
+    argsSchema: z.object({
+      phaseId: z.string().optional(),
+      phaseIndex: z.number().int().optional(),
+      checkId: z.string().optional(),
+      checkIndex: z.number().int().optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        phaseId: { type: "string" },
+        phaseIndex: { type: "integer" },
+        checkId: { type: "string" },
+        checkIndex: { type: "integer" },
+      },
+      additionalProperties: false,
+    },
+    execute: planStub,
+  });
+
+  registry.register({
+    name: "set_questions",
+    description:
+      "Planning only. Replace clarifying questions for the Plan Q&A dialog. Pass questions=[] to clear. Do NOT invent answers.",
+    riskLevel: "safe",
+    phases: PLANNING_ONLY,
+    argsSchema: z.object({
+      questions: z.array(z.record(z.unknown())),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        questions: {
+          type: "array",
+          description:
+            "Full questions array. Each open question needs selection, 2–8 options, status open.",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              text: { type: "string" },
+              selection: {
+                type: "string",
+                enum: ["single", "multiple"],
+              },
+              options: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    label: { type: "string" },
+                  },
+                  required: ["label"],
+                },
+              },
+              status: {
+                type: "string",
+                enum: ["open", "answered"],
+              },
+            },
+            required: ["text", "selection", "options"],
+          },
+        },
+      },
+      required: ["questions"],
+      additionalProperties: false,
+    },
+    execute: planStub,
+  });
+
   registry.register({
     name: "propose_plan_ready",
     description:
-      "Signal that the draft plan is ready for Start Build. Use when the plan is good enough OR the user wants to run shell/npm/git now (e.g. npm init). Pass a short feat/kebab-case suggestedBranch. Does NOT start development — the IDE opens Start Build. All open questions must already be cleared (questions=[]).",
+      "Signal that the draft plan is ready for Start Build. Use when the plan is good enough OR the user wants to run shell/npm/git now (e.g. npm init). Pass a short feat/kebab-case suggestedBranch. Does NOT start development — the IDE opens Start Build for USER confirmation. All open questions must already be cleared (set_questions questions=[]).",
     riskLevel: "safe",
     phases: PLANNING_ONLY,
     argsSchema: z.object({
@@ -215,6 +481,30 @@ export function registerStarterTools(registry: ToolRegistry): void {
     },
     execute: async () => ({
       summary: "Plan readiness is handled by the agent runtime.",
+    }),
+  });
+
+  registry.register({
+    name: "propose_testing_ready",
+    description:
+      "After the build checklist is fully done: confirm the work is complete so the IDE can run the Test gate (lint/typecheck/unit). Call this instead of narrating readiness. Does NOT run tests yourself — the IDE starts the gate after this tool succeeds. Rejected while checklist items remain open.",
+    riskLevel: "safe",
+    phases: BUILDING_ONLY,
+    argsSchema: z.object({
+      summary: z.string().max(500).optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        summary: {
+          type: "string",
+          description: "Optional one-line note that the build is ready for verification.",
+        },
+      },
+      additionalProperties: false,
+    },
+    execute: async () => ({
+      summary: "Testing readiness is handled by the agent runtime.",
     }),
   });
 
@@ -506,7 +796,8 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
 
   registry.register({
     name: "search_text",
-    description: "Search for text in workspace files.",
+    description:
+      "Search for text in workspace files. When the codebase graph is indexed, prefer search_code / search_graph instead.",
     riskLevel: "safe",
     phases: READ_TOOLS,
     argsSchema: z.object({ query: z.string().min(1) }) as z.ZodType<
@@ -529,7 +820,8 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
 
   registry.register({
     name: "write_file",
-    description: "Write a text file in the workspace.",
+    description:
+      "Write a text file in the workspace. Prefer small modules (~500–700 chars when practical); split/componentize instead of large blobs. Do not explode one checklist item into dozens of micro-files.",
     riskLevel: "reversible",
     phases: BUILDING_ONLY,
     argsSchema: z.object({
@@ -610,7 +902,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "run_command",
     description:
-      "Run a one-shot shell command (buffered, timeout + tree kill). Prefer terminal_* for interactive/long-running processes. Do NOT list node_modules/.git/dist (output is stripped); use list_dir or targeted paths instead of ls -R.",
+      "Short one-shot host shell (`bash -lc` in workspace). Auto-loads nvm/fnm and honors .nvmrc/.node-version for THAT process only — env does not persist to the next call. For multi-step Node/npm/pnpm/git work prefer terminal_open once and reuse terminal_write/terminal_read. Do NOT use cat/ls/head/find/tree to inspect the repo — those are blocked; use list_dir, read_file, search_text, or search_graph / get_code_snippet instead.",
     riskLevel: "sensitive",
     phases: BUILDING_ONLY,
     argsSchema: z.object({
@@ -641,16 +933,197 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
       const summary = result.timedOut
         ? `Timed out: ${args.command}`
         : result.truncated
-          ? `Exit ${result.exitCode}: ${args.command} (output sanitized/truncated)`
+          ? `Exit ${result.exitCode}: ${args.command} (output capped at collect limit)`
           : `Exit ${result.exitCode}: ${args.command}`;
       return { summary, output: result };
     },
   });
 
   registry.register({
+    name: "get_test_report",
+    description:
+      "Structured summary of the last IDE test-gate run: suite status, platform (jest/vitest/eslint/tsc/cypress…), pass/fail/skip counts when parsed, and failed-test titles. Use during test-fix after the checklist is done. Prefer this before read_test_log.",
+    riskLevel: "safe",
+    phases: BUILDING_ONLY,
+    argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    execute: async (_args, ctx) => {
+      const { formatAgentTestReport } = await import("@ai-ide/shared");
+      const report = ctx.testGate?.getReport() ?? null;
+      const meta = ctx.testGate?.getMeta() ?? {
+        escalationLevel: 0,
+        circuitOpen: false,
+        sameFailureStreak: 0,
+      };
+      const output = formatAgentTestReport(report, meta);
+      const status =
+        report?.status ??
+        (output.available === false ? "none" : "unknown");
+      return {
+        summary: `Test report: ${status}`,
+        output,
+      };
+    },
+  });
+
+  registry.register({
+    name: "list_failed_tests",
+    description:
+      "List individual failed test titles from the last IDE test gate, optionally filtered by suiteId (unit, lint, typecheck…). Pair with get_test_report for counts/platform.",
+    riskLevel: "safe",
+    phases: BUILDING_ONLY,
+    argsSchema: z.object({
+      suiteId: z.string().min(1).optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        suiteId: {
+          type: "string",
+          description: "Optional suite id filter (e.g. unit).",
+        },
+      },
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const report = ctx.testGate?.getReport() ?? null;
+      if (!report) {
+        return {
+          summary: "No test-gate report",
+          output: {
+            available: false,
+            failed: [],
+            hint: "Wait for the IDE test gate to finish, then retry.",
+          },
+        };
+      }
+      const suiteId =
+        typeof args.suiteId === "string" ? args.suiteId.trim() : "";
+      const suites = report.suites.filter((s) =>
+        suiteId ? s.id === suiteId : true,
+      );
+      const failed = suites.flatMap((s) =>
+        (s.failedTests ?? []).map((name) => ({
+          suiteId: s.id,
+          kind: s.kind,
+          platform: s.platform ?? null,
+          name,
+        })),
+      );
+      const suitesWithoutNames = suites.filter(
+        (s) =>
+          (s.status === "failed" || s.status === "timed_out") &&
+          !(s.failedTests ?? []).length,
+      );
+      return {
+        summary: failed.length
+          ? `${failed.length} failed test(s)`
+          : suitesWithoutNames.length
+            ? "Suite failed but titles not parsed — use read_test_log"
+            : "No failed test titles",
+        output: {
+          available: true,
+          suiteFilter: suiteId || null,
+          failed,
+          suitesWithoutParsedNames: suitesWithoutNames.map((s) => ({
+            suiteId: s.id,
+            kind: s.kind,
+            platform: s.platform ?? null,
+            status: s.status,
+            counts: s.counts ?? null,
+          })),
+        },
+      };
+    },
+  });
+
+  registry.register({
+    name: "read_test_log",
+    description:
+      "Read a chunk of an IDE test-gate suite log after a verification run. Prefer get_test_report / list_failed_tests first. Pass suiteId from the digest or report. Prefer chunkIndex (0-based); or offsetChars.",
+    riskLevel: "safe",
+    phases: BUILDING_ONLY,
+    argsSchema: z.object({
+      suiteId: z.string().min(1),
+      chunkIndex: z.number().int().nonnegative().optional(),
+      offsetChars: z.number().int().nonnegative().optional(),
+      maxChars: z.number().int().positive().max(32_000).optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        suiteId: {
+          type: "string",
+          description: "Suite id from the test gate digest (e.g. unit, lint).",
+        },
+        chunkIndex: {
+          type: "number",
+          description: "0-based chunk index (preferred).",
+        },
+        offsetChars: {
+          type: "number",
+          description: "Absolute char offset if not using chunkIndex.",
+        },
+        maxChars: {
+          type: "number",
+          description: "Chunk size override (default 8000, max 32000).",
+        },
+      },
+      required: ["suiteId"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const { TEST_LOG_CHUNK_CHARS, testLogChunkCount } = await import(
+        "@ai-ide/shared"
+      );
+      const suiteId = String(args.suiteId);
+      const log = ctx.testLogs?.get(suiteId);
+      if (log === undefined) {
+        return {
+          summary: `No log for suite "${suiteId}"`,
+          output: {
+            suiteId,
+            available: false,
+            hint: "Logs exist only after an IDE test-gate run in this session.",
+          },
+        };
+      }
+      const maxChars =
+        typeof args.maxChars === "number" ? args.maxChars : TEST_LOG_CHUNK_CHARS;
+      const totalChunks = testLogChunkCount(log.length, maxChars);
+      let offset = 0;
+      if (typeof args.chunkIndex === "number") {
+        offset = args.chunkIndex * maxChars;
+      } else if (typeof args.offsetChars === "number") {
+        offset = args.offsetChars;
+      }
+      const chunk = log.slice(offset, offset + maxChars);
+      const chunkIndex = Math.floor(offset / maxChars);
+      return {
+        summary: `Test log ${suiteId}: chunk ${chunkIndex + 1}/${Math.max(totalChunks, 1)} (${chunk.length} chars)`,
+        output: {
+          suiteId,
+          available: true,
+          offsetChars: offset,
+          maxChars,
+          chunkIndex,
+          totalChunks,
+          totalChars: log.length,
+          exhausted: offset + chunk.length >= log.length,
+          text: chunk,
+        },
+      };
+    },
+  });
+
+  registry.register({
     name: "terminal_open",
     description:
-      "Open a new interactive terminal (PTY) in the workspace. Multiple terminals are allowed. Returns terminalId for write/read/ask.",
+      "Open a persistent interactive terminal (PTY) in the workspace. Prefer ONE session for a toolchain stream: the IDE bootstraps nvm/fnm + .nvmrc on open so node/npm stay available. Reuse the returned terminalId with terminal_write / terminal_read — do not open a new terminal per command.",
     riskLevel: "safe",
     phases: BUILDING_ONLY,
     argsSchema: z.object({

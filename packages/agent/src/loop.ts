@@ -5,17 +5,17 @@ import type {
   ChatMessage,
 } from "@ai-ide/provider";
 import type { SessionState, ToolCall, ToolResult, Turn } from "@ai-ide/shared";
+import { formatAppErrorDisplay } from "@ai-ide/shared";
 import {
   ToolGateway,
   createDefaultRegistry,
   defaultRedact,
   CBM_TOOL_NAMES,
-  FS_READ_TOOL_NAMES,
+  formatToolResultForModel,
   type ToolExecutionContext,
 } from "@ai-ide/tools";
 import {
-  applyFinalizePlan,
-  applyProposePlanReady,
+  applyPlanTool,
   applyUpsertPlan,
   buildContext,
   bumpSessionSequence,
@@ -36,6 +36,104 @@ function isTankMode(state: SessionState): boolean {
   return isAgentTankMode(state);
 }
 
+function toolMessageContent(
+  toolName: string,
+  result: Pick<ToolResult, "summary" | "output" | "error">,
+): string {
+  return formatToolResultForModel({
+    toolName,
+    summary: result.summary,
+    output: result.output,
+    error: result.error ?? null,
+  });
+}
+
+const INDEXED_CODEBASE_RULES = [
+  "CODEBASE INDEX: READY — graph tools are available this turn.",
+  "Explore with search_graph / search_code / get_architecture / get_code_snippet / trace_path FIRST.",
+  "Do NOT walk the repo with repeated list_dir (src → components → …). list_dir/read_file/search_text stay allowed only after you have a concrete path from the graph or the user, or if a graph call fails.",
+  "Typical first move: search_graph (or get_architecture) on the user's terms, then get_code_snippet / read_file on hits, then plan tools.",
+].join("\n");
+
+function toolDescriptionForModel(
+  name: string,
+  description: string,
+  indexed: boolean,
+): string {
+  if (!indexed) return description;
+  if (name === "list_dir") {
+    return (
+      "FALLBACK directory listing when the graph is indexed. Prefer search_graph / get_architecture / search_code for discovery. " +
+      "Use list_dir only for a known path — do not chain list_dir to explore the tree."
+    );
+  }
+  if (name === "search_text") {
+    return (
+      "FALLBACK workspace text search when the graph is indexed. Prefer search_code / search_graph instead."
+    );
+  }
+  if (name === "read_file") {
+    return (
+      "Read a file window by path. When indexed, prefer get_code_snippet after search_graph; use read_file for a concrete path from graph hits or the user."
+    );
+  }
+  return description;
+}
+
+function buildModelToolDefs(
+  registry: ReturnType<typeof createDefaultRegistry>,
+  stateLike: Pick<SessionState, "mode" | "planStatus" | "sessionKind">,
+  indexed: boolean,
+): Array<{
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}> {
+  const tools = registry
+    .listForPhase(productPhaseForState(stateLike))
+    .filter((t) => {
+      const isCbm = CBM_TOOL_NAMES.includes(t.name);
+      // Keep FS read tools even when indexed — otherwise models fall back to shell.
+      if (!indexed && isCbm) return false;
+      return true;
+    });
+
+  const ranked = indexed
+    ? [
+        ...tools.filter((t) => CBM_TOOL_NAMES.includes(t.name)),
+        ...tools.filter((t) => !CBM_TOOL_NAMES.includes(t.name)),
+      ]
+    : tools;
+
+  return ranked.map((t) => ({
+    name: t.name,
+    description: toolDescriptionForModel(t.name, t.description, indexed),
+    parameters: t.parameters,
+  }));
+}
+
+async function appendIndexedCodebasePrompt(
+  contextTurns: Turn[],
+  cbm: ToolExecutionContext["cbm"] | undefined,
+): Promise<void> {
+  if (!cbm?.isIndexed()) return;
+  const system = contextTurns[0];
+  if (!system || system.role !== "system") return;
+  let extra = INDEXED_CODEBASE_RULES;
+  try {
+    const preseed = await cbm.architecturePreseed();
+    if (preseed?.trim()) {
+      extra = `${extra}\n\nIndexed codebase graph summary (pre-seed):\n${preseed.trim()}`;
+    }
+  } catch {
+    /* ignore preseed failures — rules still apply */
+  }
+  contextTurns[0] = {
+    ...system,
+    content: `${system.content}\n\n${extra}`,
+  };
+}
+
 /** Keep the build/plan loop alive — no max rounds while tank mode applies. */
 function pushTankContinue(
   workingState: SessionState,
@@ -46,9 +144,10 @@ function pushTankContinue(
   const nextRound = tankRounds + 1;
   const planning = productPhaseForState(workingState) === "planning";
   const { done, total } = planChecklistProgress(workingState);
+  const open = Math.max(0, total - done);
   const label = planning
     ? `Tank · planning · go ${nextRound}`
-    : `Tank · checklist ${done}/${total} · go ${nextRound}`;
+    : `Tank · ${done}/${total} done · ${open} open · go ${nextRound}`;
   let state = workingState;
   if (nextRound === 1 || nextRound % 5 === 0) {
     const notice: Turn = {
@@ -56,7 +155,7 @@ function pushTankContinue(
       role: "assistant",
       content: planning
         ? `**Tank mode** · planning still open — upsert_plan / questions / propose_plan_ready (round ${nextRound})…`
-        : `**Tank mode** · checklist ${done}/${total} still open — continuing with tools (round ${nextRound})…`,
+        : `**Tank mode** · checklist **${done}/${total} done** (${open} open) — continue from the next open item; do not uncheck or restart (round ${nextRound})…`,
       createdAt: new Date().toISOString(),
     };
     state = { ...state, turns: [...state.turns, notice] };
@@ -102,6 +201,11 @@ export type AgentProgressEvent =
   | { type: "activity"; label: string; status: SessionState["status"] }
   | { type: "token"; text: string }
   | {
+      type: "usage";
+      inputTokens: number;
+      outputTokens: number;
+    }
+  | {
       type: "tool_start";
       call: ToolCall;
       label: string;
@@ -128,6 +232,7 @@ export type AgentProgressEvent =
           | "planStatus"
           | "mode"
           | "planReadyProposal"
+          | "testingConfirmedAt"
           | "turns"
           | "activityLabel"
           | "status"
@@ -180,44 +285,17 @@ export async function runAgentTurn(
 
   const toolDefsFor = (
     stateLike: Pick<SessionState, "mode" | "planStatus" | "sessionKind">,
-  ) => {
-    const indexed = Boolean(deps.toolCtx?.cbm?.isIndexed());
-    return registry
-      .listForPhase(productPhaseForState(stateLike))
-      .filter((t) => {
-        const isFs = (FS_READ_TOOL_NAMES as readonly string[]).includes(t.name);
-        const isCbm = CBM_TOOL_NAMES.includes(t.name);
-        if (indexed) {
-          if (isFs) return false;
-          return true;
-        }
-        if (isCbm) return false;
-        return true;
-      })
-      .map((t) => ({
-        name: t.name,
-        description: t.description,
-        parameters: t.parameters,
-      }));
-  };
+  ) =>
+    buildModelToolDefs(
+      registry,
+      stateLike,
+      Boolean(deps.toolCtx?.cbm?.isIndexed()),
+    );
 
   let toolDefs = toolDefsFor(workingState);
 
   const contextTurns = buildContext(workingState, userMessage);
-  if (deps.toolCtx?.cbm?.isIndexed()) {
-    try {
-      const preseed = await deps.toolCtx.cbm.architecturePreseed();
-      const system = contextTurns[0];
-      if (preseed && system?.role === "system") {
-        contextTurns[0] = {
-          ...system,
-          content: `${system.content}\n\nIndexed codebase graph summary (pre-seed):\n${preseed}`,
-        };
-      }
-    } catch {
-      /* ignore preseed failures */
-    }
-  }
+  await appendIndexedCodebasePrompt(contextTurns, deps.toolCtx?.cbm);
   const messages: ChatMessage[] = contextTurns.map((t) => ({
     role: t.role === "system" || t.role === "user" ? t.role : "assistant",
     content: t.content,
@@ -229,7 +307,11 @@ export async function runAgentTurn(
 
   while (machine.nextIteration(isTankMode(workingState))) {
     if (deps.signal?.aborted) {
-      return fail(workingState, "Interrupted by user.");
+      return fail(workingState, "Interrupted by user.", {
+        assistantContent,
+        toolCalls: allToolCalls,
+        toolResults,
+      });
     }
 
     machine.phase = "awaiting_provider";
@@ -249,7 +331,11 @@ export async function runAgentTurn(
       ...(deps.signal ? { signal: deps.signal } : {}),
     })) {
       if (deps.signal?.aborted) {
-        return fail(workingState, "Interrupted by user.");
+        return fail(workingState, "Interrupted by user.", {
+        assistantContent,
+        toolCalls: allToolCalls,
+        toolResults,
+      });
       }
       if (chunk.type === "content") {
         if (!streamedThisRound) {
@@ -336,7 +422,22 @@ export async function runAgentTurn(
         }
       }
       if (chunk.type === "error") {
-        return fail(workingState, chunk.error.userMessage);
+        return fail(workingState, formatAppErrorDisplay(chunk.error), {
+          assistantContent,
+          toolCalls: allToolCalls,
+          toolResults,
+        });
+      }
+      if (
+        chunk.type === "done" &&
+        chunk.usage &&
+        (chunk.usage.inputTokens > 0 || chunk.usage.outputTokens > 0)
+      ) {
+        emit({
+          type: "usage",
+          inputTokens: chunk.usage.inputTokens,
+          outputTokens: chunk.usage.outputTokens,
+        });
       }
     }
 
@@ -404,12 +505,9 @@ export async function runAgentTurn(
       emit({ type: "activity", label, status: "tool" });
 
       if (isPlanMutationTool(call.name)) {
-        const applied =
-          call.name === "propose_plan_ready"
-            ? applyProposePlanReady(workingState, call.arguments)
-            : call.name === "finalize_plan"
-              ? applyFinalizePlan(workingState, call.arguments, { userMessage })
-              : applyUpsertPlan(workingState, call.arguments);
+        const applied = applyPlanTool(call.name, workingState, call.arguments, {
+          userMessage,
+        });
 
         // Keep the model-facing call id aligned with the tool message.
         const result: ToolResult = { ...applied.result, callId: call.id };
@@ -423,6 +521,7 @@ export async function runAgentTurn(
             planStatus: workingState.planStatus,
             mode: workingState.mode,
             planReadyProposal: workingState.planReadyProposal,
+            testingConfirmedAt: workingState.testingConfirmedAt,
           },
         });
         emit({
@@ -433,15 +532,7 @@ export async function runAgentTurn(
         messages.push({
           role: "tool",
           tool_call_id: call.id,
-          content: JSON.stringify(
-            {
-              summary: result.summary,
-              output: result.output ?? null,
-              error: result.error ?? null,
-            },
-            null,
-            2,
-          ),
+          content: toolMessageContent(call.name, result),
         });
         toolDefs = toolDefsFor(workingState);
         if (!machine.recordToolResult(call.name, result.success, isTankMode(workingState))) {
@@ -533,15 +624,7 @@ export async function runAgentTurn(
         label: outcome.result.success ? label : `${label} failed`,
       });
 
-      const toolContent = JSON.stringify(
-        {
-          summary: outcome.result.summary,
-          output: outcome.result.output ?? null,
-          error: outcome.result.error ?? null,
-        },
-        null,
-        2,
-      );
+      const toolContent = toolMessageContent(call.name, outcome.result);
       messages.push({
         role: "tool",
         tool_call_id: call.id,
@@ -558,6 +641,11 @@ export async function runAgentTurn(
       return fail(
         workingState,
         "Agent stopped: repeated tool failures or loop detected.",
+        {
+          assistantContent,
+          toolCalls: allToolCalls,
+          toolResults,
+        },
       );
     }
 
@@ -579,7 +667,7 @@ export async function runAgentTurn(
     state: bumpSessionSequence({
       ...workingState,
       status: "idle",
-      turns: appendIdleStallNotice(workingState, assistantTurn),
+      turns: appendAssistantTurn(workingState, assistantTurn),
       error: null,
       partialAssistantText: null,
       activityLabel: null,
@@ -594,19 +682,30 @@ export async function runAgentTurn(
 function toolActivityLabel(call: ToolCall): string {
   const path =
     typeof call.arguments.path === "string" ? call.arguments.path : null;
+  const command =
+    typeof call.arguments.command === "string" ? call.arguments.command : null;
+  const query =
+    typeof call.arguments.query === "string" ? call.arguments.query : null;
   switch (call.name) {
     case "read_file":
       return path ? `Reading ${path}…` : "Reading file…";
     case "list_dir":
       return path && path !== "." ? `Listing ${path}…` : "Listing files…";
     case "search_text":
-      return "Searching…";
+      return query
+        ? `Searching “${query.length > 48 ? `${query.slice(0, 45)}…` : query}”…`
+        : "Searching…";
     case "write_file":
       return path ? `Writing ${path}…` : "Writing file…";
-    case "run_command":
-      return "Running command…";
+    case "run_command": {
+      if (!command) return "Running command…";
+      const compact = command.trim().replace(/\s+/g, " ");
+      return `Running \`${compact.length > 64 ? `${compact.slice(0, 61)}…` : compact}\`…`;
+    }
     case "search_graph":
-      return "Searching codebase graph…";
+      return query
+        ? `Graph search “${query.length > 48 ? `${query.slice(0, 45)}…` : query}”…`
+        : "Searching codebase graph…";
     case "trace_path":
       return "Tracing call path…";
     case "get_code_snippet":
@@ -614,7 +713,9 @@ function toolActivityLabel(call: ToolCall): string {
     case "get_architecture":
       return "Reading architecture graph…";
     case "search_code":
-      return "Searching indexed code…";
+      return query
+        ? `Code search “${query.length > 48 ? `${query.slice(0, 45)}…` : query}”…`
+        : "Searching indexed code…";
     case "get_graph_schema":
       return "Reading graph schema…";
     case "detect_changes":
@@ -633,8 +734,26 @@ function toolActivityLabel(call: ToolCall): string {
       return "Closing terminal…";
     case "upsert_plan":
       return "Updating plan…";
+    case "read_plan":
+      return "Reading plan…";
+    case "add_phase":
+      return "Adding phase…";
+    case "replace_phase":
+      return "Updating phase…";
+    case "delete_phase":
+      return "Removing phase…";
+    case "add_check":
+      return "Adding checklist item…";
+    case "replace_check":
+      return "Updating checklist item…";
+    case "delete_check":
+      return "Removing checklist item…";
+    case "set_questions":
+      return "Updating questions…";
     case "propose_plan_ready":
       return "Marking plan ready…";
+    case "propose_testing_ready":
+      return "Confirming testing ready…";
     case "read_architecture":
       return "Reading architecture…";
     case "upsert_architecture":
@@ -646,8 +765,29 @@ function toolActivityLabel(call: ToolCall): string {
   }
 }
 
-function fail(state: SessionState, message: string): AgentLoopResult {
+function fail(
+  state: SessionState,
+  message: string,
+  opts?: {
+    assistantContent?: string;
+    toolCalls?: ToolCall[];
+    toolResults?: ToolResult[];
+  },
+): AgentLoopResult {
   const turns = [...state.turns];
+  const prose = opts?.assistantContent?.trim() ?? "";
+  const tools = opts?.toolCalls ?? [];
+  const results = opts?.toolResults ?? [];
+  if (prose || tools.length || results.length) {
+    turns.push({
+      id: randomUUID(),
+      role: "assistant",
+      content: prose || (tools.length ? "" : message),
+      ...(tools.length ? { toolCalls: tools } : {}),
+      ...(results.length ? { toolResults: results } : {}),
+      createdAt: new Date().toISOString(),
+    });
+  }
   const interrupted = message === "Interrupted by user.";
   if (
     !interrupted &&
@@ -655,16 +795,24 @@ function fail(state: SessionState, message: string): AgentLoopResult {
     planHasOpenWork(state)
   ) {
     const { done, total } = planChecklistProgress(state);
+    const open = Math.max(0, total - done);
     turns.push({
       id: randomUUID(),
       role: "assistant",
       content: [
-        `**Build paused** · checklist ${done}/${total}.`,
+        `**Build paused** · checklist **${done}/${total} done** (${open} open).`,
         "",
         message,
         "",
-        "Tank mode will not retry this automatically. Press **Resume** when you want to continue.",
+        "Press **Resume** when you want to continue.",
       ].join("\n"),
+      createdAt: new Date().toISOString(),
+    });
+  } else if (!interrupted && !prose && tools.length === 0) {
+    turns.push({
+      id: randomUUID(),
+      role: "assistant",
+      content: message,
       createdAt: new Date().toISOString(),
     });
   }
@@ -679,31 +827,13 @@ function fail(state: SessionState, message: string): AgentLoopResult {
       activeToolCallId: null,
       liveTools: [],
     }),
-    assistantContent: "",
-    toolResults: [],
+    assistantContent: opts?.assistantContent ?? "",
+    toolResults: results,
   };
 }
 
-function appendIdleStallNotice(
-  state: SessionState,
-  assistantTurn: Turn,
-): Turn[] {
-  const turns = [...state.turns, assistantTurn];
-  if (productPhaseForState(state) !== "building" || !planHasOpenWork(state)) {
-    return turns;
-  }
-  const { done, total } = planChecklistProgress(state);
-  turns.push({
-    id: randomUUID(),
-    role: "assistant",
-    content: [
-      `**Stopped** · checklist ${done}/${total} still open.`,
-      "",
-      "Tank mode normally keeps going until every check is done. Resume only if you hit Stop or the run was interrupted.",
-    ].join("\n"),
-    createdAt: new Date().toISOString(),
-  });
-  return turns;
+function appendAssistantTurn(state: SessionState, assistantTurn: Turn): Turn[] {
+  return [...state.turns, assistantTurn];
 }
 
 /**
@@ -724,26 +854,12 @@ export async function resumeAgentTurn(
 
   const toolDefsFor = (
     stateLike: Pick<SessionState, "mode" | "planStatus" | "sessionKind">,
-  ) => {
-    const indexed = Boolean(deps.toolCtx?.cbm?.isIndexed());
-    return registry
-      .listForPhase(productPhaseForState(stateLike))
-      .filter((t) => {
-        const isFs = (FS_READ_TOOL_NAMES as readonly string[]).includes(t.name);
-        const isCbm = CBM_TOOL_NAMES.includes(t.name);
-        if (indexed) {
-          if (isFs) return false;
-          return true;
-        }
-        if (isCbm) return false;
-        return true;
-      })
-      .map((t) => ({
-        name: t.name,
-        description: t.description,
-        parameters: t.parameters,
-      }));
-  };
+  ) =>
+    buildModelToolDefs(
+      registry,
+      stateLike,
+      Boolean(deps.toolCtx?.cbm?.isIndexed()),
+    );
 
   let workingState: SessionState = {
     ...state,
@@ -765,7 +881,11 @@ export async function resumeAgentTurn(
   let stop = false;
   for (const call of pause.remainingCalls) {
     if (deps.signal?.aborted) {
-      return fail(workingState, "Interrupted by user.");
+      return fail(workingState, "Interrupted by user.", {
+        assistantContent,
+        toolCalls: allToolCalls,
+        toolResults,
+      });
     }
     if (!allToolCalls.some((c) => c.id === call.id)) {
       allToolCalls.push(call);
@@ -775,12 +895,9 @@ export async function resumeAgentTurn(
     emit({ type: "activity", label, status: "tool" });
 
     if (isPlanMutationTool(call.name)) {
-      const applied =
-        call.name === "propose_plan_ready"
-          ? applyProposePlanReady(workingState, call.arguments)
-          : call.name === "finalize_plan"
-            ? applyFinalizePlan(workingState, call.arguments, { userMessage })
-            : applyUpsertPlan(workingState, call.arguments);
+      const applied = applyPlanTool(call.name, workingState, call.arguments, {
+        userMessage,
+      });
       const result: ToolResult = { ...applied.result, callId: call.id };
       workingState = applied.state;
       toolResults.push(result);
@@ -792,6 +909,7 @@ export async function resumeAgentTurn(
           planStatus: workingState.planStatus,
           mode: workingState.mode,
           planReadyProposal: workingState.planReadyProposal,
+          testingConfirmedAt: workingState.testingConfirmedAt,
         },
       });
       emit({
@@ -802,15 +920,7 @@ export async function resumeAgentTurn(
       messages.push({
         role: "tool",
         tool_call_id: call.id,
-        content: JSON.stringify(
-          {
-            summary: result.summary,
-            output: result.output ?? null,
-            error: result.error ?? null,
-          },
-          null,
-          2,
-        ),
+        content: toolMessageContent(call.name, result),
       });
       toolDefs = toolDefsFor(workingState);
       if (!machine.recordToolResult(call.name, result.success, isTankMode(workingState))) {
@@ -907,15 +1017,7 @@ export async function resumeAgentTurn(
     messages.push({
       role: "tool",
       tool_call_id: call.id,
-      content: JSON.stringify(
-        {
-          summary: outcome.result.summary,
-          output: outcome.result.output ?? null,
-          error: outcome.result.error ?? null,
-        },
-        null,
-        2,
-      ),
+      content: toolMessageContent(call.name, outcome.result),
     });
     if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
       stop = true;
@@ -927,13 +1029,22 @@ export async function resumeAgentTurn(
     return fail(
       workingState,
       "Agent stopped: repeated tool failures or loop detected.",
+      {
+        assistantContent,
+        toolCalls: allToolCalls,
+        toolResults,
+      },
     );
   }
 
   // Continue provider rounds (same as runAgentTurn after a tool batch).
   while (machine.nextIteration(isTankMode(workingState))) {
     if (deps.signal?.aborted) {
-      return fail(workingState, "Interrupted by user.");
+      return fail(workingState, "Interrupted by user.", {
+        assistantContent,
+        toolCalls: allToolCalls,
+        toolResults,
+      });
     }
 
     machine.phase = "awaiting_provider";
@@ -952,7 +1063,11 @@ export async function resumeAgentTurn(
       ...(deps.signal ? { signal: deps.signal } : {}),
     })) {
       if (deps.signal?.aborted) {
-        return fail(workingState, "Interrupted by user.");
+        return fail(workingState, "Interrupted by user.", {
+        assistantContent,
+        toolCalls: allToolCalls,
+        toolResults,
+      });
       }
       if (chunk.type === "content") {
         if (!streamedThisRound) {
@@ -990,7 +1105,22 @@ export async function resumeAgentTurn(
         }
       }
       if (chunk.type === "error") {
-        return fail(workingState, chunk.error.userMessage);
+        return fail(workingState, formatAppErrorDisplay(chunk.error), {
+          assistantContent,
+          toolCalls: allToolCalls,
+          toolResults,
+        });
+      }
+      if (
+        chunk.type === "done" &&
+        chunk.usage &&
+        (chunk.usage.inputTokens > 0 || chunk.usage.outputTokens > 0)
+      ) {
+        emit({
+          type: "usage",
+          inputTokens: chunk.usage.inputTokens,
+          outputTokens: chunk.usage.outputTokens,
+        });
       }
     }
 
@@ -1054,12 +1184,9 @@ export async function resumeAgentTurn(
       emit({ type: "activity", label, status: "tool" });
 
       if (isPlanMutationTool(call.name)) {
-        const applied =
-          call.name === "propose_plan_ready"
-            ? applyProposePlanReady(workingState, call.arguments)
-            : call.name === "finalize_plan"
-              ? applyFinalizePlan(workingState, call.arguments, { userMessage })
-              : applyUpsertPlan(workingState, call.arguments);
+        const applied = applyPlanTool(call.name, workingState, call.arguments, {
+          userMessage,
+        });
         const result: ToolResult = { ...applied.result, callId: call.id };
         workingState = applied.state;
         toolResults.push(result);
@@ -1071,6 +1198,7 @@ export async function resumeAgentTurn(
             planStatus: workingState.planStatus,
             mode: workingState.mode,
             planReadyProposal: workingState.planReadyProposal,
+            testingConfirmedAt: workingState.testingConfirmedAt,
           },
         });
         emit({
@@ -1081,15 +1209,7 @@ export async function resumeAgentTurn(
         messages.push({
           role: "tool",
           tool_call_id: call.id,
-          content: JSON.stringify(
-            {
-              summary: result.summary,
-              output: result.output ?? null,
-              error: result.error ?? null,
-            },
-            null,
-            2,
-          ),
+          content: toolMessageContent(call.name, result),
         });
         toolDefs = toolDefsFor(workingState);
         if (!machine.recordToolResult(call.name, result.success, isTankMode(workingState))) {
@@ -1183,15 +1303,7 @@ export async function resumeAgentTurn(
       messages.push({
         role: "tool",
         tool_call_id: call.id,
-        content: JSON.stringify(
-          {
-            summary: outcome.result.summary,
-            output: outcome.result.output ?? null,
-            error: outcome.result.error ?? null,
-          },
-          null,
-          2,
-        ),
+        content: toolMessageContent(call.name, outcome.result),
       });
       if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
         batchStop = true;
@@ -1203,6 +1315,11 @@ export async function resumeAgentTurn(
       return fail(
         workingState,
         "Agent stopped: repeated tool failures or loop detected.",
+        {
+          assistantContent,
+          toolCalls: allToolCalls,
+          toolResults,
+        },
       );
     }
     emit({ type: "activity", label: "Thinking…", status: "thinking" });
@@ -1222,7 +1339,7 @@ export async function resumeAgentTurn(
     state: bumpSessionSequence({
       ...workingState,
       status: "idle",
-      turns: appendIdleStallNotice(workingState, assistantTurn),
+      turns: appendAssistantTurn(workingState, assistantTurn),
       error: null,
       partialAssistantText: null,
       activityLabel: null,

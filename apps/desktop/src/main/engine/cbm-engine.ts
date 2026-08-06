@@ -50,6 +50,15 @@ const MODEL_TOOLS = new Set([
 
 const FS_FALLBACK_TOOLS = new Set(["list_dir", "read_file", "search_text"]);
 
+/**
+ * Stub / failed indexes only keep Project + Branch (~2 nodes).
+ * A useful TS/JS app index is typically dozens–thousands of nodes.
+ */
+const MIN_USEFUL_INDEX_NODES = 8;
+
+/** Skip back-to-back auto reindexes for the same workspace (ms). */
+const AUTO_INDEX_DEBOUNCE_MS = 20_000;
+
 function projectNameFromRoot(root: string): string {
   return basename(root).replace(/[^\w.-]+/g, "_") || "project";
 }
@@ -112,6 +121,11 @@ export class CbmEngine {
   private ensurePromise: Promise<void> | null = null;
   private indexAbort: AbortController | null = null;
   private restartAttempts = 0;
+  /** Last known graph node count from index_status / list_projects. */
+  private lastNodeCount = 0;
+  private lastAutoIndexAt = 0;
+  private lastAutoIndexRoot: string | null = null;
+  private autoIndexPromise: Promise<void> | null = null;
 
   subscribe(listener: EngineListener): () => void {
     this.listeners.add(listener);
@@ -245,10 +259,70 @@ export class CbmEngine {
       await this.ensureInstalled();
       await this.startClient(workspaceRoot);
       await this.refreshIndexState();
+      // Always refresh the graph on workspace open (fire-and-forget).
+      void this.ensureFreshIndex("attach");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.push({ phase: "error", error: message, indexed: false });
     }
+  }
+
+  /**
+   * Ensure the codebase graph is present and up to date.
+   * Triggered on workspace attach / app boot and on new chat.
+   */
+  async ensureFreshIndex(
+    reason: "attach" | "chat" | "boot",
+    opts?: { mode?: string },
+  ): Promise<void> {
+    if (!this.status.workspaceRoot || !this.status.platformSupported) return;
+    if (this.status.phase === "indexing" || this.status.phase === "downloading") {
+      return;
+    }
+    if (this.autoIndexPromise) return this.autoIndexPromise;
+
+    this.autoIndexPromise = (async () => {
+      try {
+        await this.ensureInstalled();
+        if (!this.client?.isRunning()) {
+          await this.startClient(this.status.workspaceRoot!);
+        }
+        await this.refreshIndexState();
+
+        const root = this.status.workspaceRoot!;
+        const stub = this.lastNodeCount > 0 && this.lastNodeCount < MIN_USEFUL_INDEX_NODES;
+        const missing = !this.status.indexed || this.lastNodeCount === 0;
+        const recentlyIndexed =
+          this.lastAutoIndexRoot === root &&
+          Date.now() - this.lastAutoIndexAt < AUTO_INDEX_DEBOUNCE_MS &&
+          this.status.indexed &&
+          !stub;
+
+        if (recentlyIndexed && !missing && !stub) {
+          return;
+        }
+
+        // attach/boot/chat: reindex. Stub/missing always reindex.
+        if (missing || stub || reason === "attach" || reason === "boot" || reason === "chat") {
+          this.push({
+            indexMessage: stub
+              ? `Index incomplete (${this.lastNodeCount} nodes) — reindexing…`
+              : reason === "chat"
+                ? "Refreshing index for new chat…"
+                : "Indexing repository…",
+          });
+          await this.startIndexing({ mode: opts?.mode ?? "fast" });
+          this.lastAutoIndexAt = Date.now();
+          this.lastAutoIndexRoot = root;
+        }
+      } catch {
+        /* status/error already pushed by startIndexing / ensureInstalled */
+      } finally {
+        this.autoIndexPromise = null;
+      }
+    })();
+
+    return this.autoIndexPromise;
   }
 
   async detachWorkspace(): Promise<void> {
@@ -309,12 +383,19 @@ export class CbmEngine {
     if (!root || !project) return;
     const client = await this.ensureClient();
     const listed = (await client.callTool("list_projects", {})) as {
-      projects?: Array<{ name?: string; project?: string; path?: string; root?: string }>;
+      projects?: Array<{
+        name?: string;
+        project?: string;
+        path?: string;
+        root?: string;
+        root_path?: string;
+        nodes?: number;
+      }>;
     };
     const projects = listed.projects ?? [];
     const match = projects.find((p) => {
       const name = p.name ?? p.project ?? "";
-      const path = p.path ?? p.root ?? "";
+      const path = p.path ?? p.root ?? p.root_path ?? "";
       return (
         name === project ||
         path === root ||
@@ -323,6 +404,7 @@ export class CbmEngine {
     });
 
     if (!match) {
+      this.lastNodeCount = 0;
       this.push({
         indexed: false,
         phase: "ready",
@@ -335,31 +417,51 @@ export class CbmEngine {
     try {
       const status = (await client.callTool("index_status", {
         project: name,
-      })) as { status?: string; state?: string; ready?: boolean };
-      const ready =
+      })) as {
+        status?: string;
+        state?: string;
+        ready?: boolean;
+        nodes?: number;
+      };
+      const nodes = Number(status.nodes ?? match.nodes ?? 0);
+      this.lastNodeCount = Number.isFinite(nodes) ? nodes : 0;
+      const statusReady =
         status.ready === true ||
         status.status === "ready" ||
         status.status === "indexed" ||
         status.state === "ready" ||
-        status.state === "indexed" ||
-        true; // presence in list_projects is enough
+        status.state === "indexed";
+      // Never treat Project+Branch stubs as a usable index.
+      const useful = this.lastNodeCount >= MIN_USEFUL_INDEX_NODES;
+      const ready = statusReady && useful;
       this.push({
         projectName: name,
-        indexed: Boolean(ready),
+        indexed: ready,
         phase: ready ? "indexed" : "ready",
-        indexMessage: ready ? "Index ready." : "Index present but not ready.",
+        indexMessage: ready
+          ? `Index ready (${this.lastNodeCount} nodes).`
+          : this.lastNodeCount > 0
+            ? `Index incomplete (${this.lastNodeCount} nodes) — reindex needed.`
+            : "Index present but not ready.",
       });
       if (ready) {
         await this.refreshArchitectureCache();
       }
     } catch {
+      const nodes = Number(match.nodes ?? 0);
+      this.lastNodeCount = Number.isFinite(nodes) ? nodes : 0;
+      const useful = this.lastNodeCount >= MIN_USEFUL_INDEX_NODES;
       this.push({
         projectName: name,
-        indexed: true,
-        phase: "indexed",
-        indexMessage: "Index ready.",
+        indexed: useful,
+        phase: useful ? "indexed" : "ready",
+        indexMessage: useful
+          ? `Index ready (${this.lastNodeCount} nodes).`
+          : `Index incomplete (${this.lastNodeCount} nodes) — reindex needed.`,
       });
-      await this.refreshArchitectureCache();
+      if (useful) {
+        await this.refreshArchitectureCache();
+      }
     }
   }
 
@@ -371,11 +473,16 @@ export class CbmEngine {
     this.indexAbort?.abort();
     this.indexAbort = new AbortController();
     const project = projectNameFromRoot(root);
+    // Keep serving a previous good index while a refresh runs.
+    const keepServing =
+      this.status.indexed && this.lastNodeCount >= MIN_USEFUL_INDEX_NODES;
     this.push({
       phase: "indexing",
-      indexed: false,
+      indexed: keepServing,
       projectName: project,
-      indexMessage: "Indexing repository…",
+      indexMessage: keepServing
+        ? "Refreshing index…"
+        : "Indexing repository…",
       error: null,
     });
 
@@ -389,23 +496,38 @@ export class CbmEngine {
         },
         600_000,
       );
+      const resultNodes =
+        typeof result === "object" &&
+        result &&
+        "nodes" in result &&
+        typeof (result as { nodes: unknown }).nodes === "number"
+          ? (result as { nodes: number }).nodes
+          : null;
+      if (resultNodes !== null) {
+        this.lastNodeCount = resultNodes;
+      }
       this.push({
         indexMessage:
           typeof result === "object" && result && "status" in result
-            ? `Index ${String((result as { status: unknown }).status)}`
+            ? `Index ${String((result as { status: unknown }).status)}${
+                resultNodes !== null ? ` (${resultNodes} nodes)` : ""
+              }`
             : "Index finished.",
       });
       await this.refreshIndexState();
-      if (!this.status.indexed) {
-        // Some versions return success without list_projects update immediately.
-        this.push({ indexed: true, phase: "indexed", indexMessage: "Index ready." });
+      if (!this.status.indexed && resultNodes !== null && resultNodes >= MIN_USEFUL_INDEX_NODES) {
+        this.push({
+          indexed: true,
+          phase: "indexed",
+          indexMessage: `Index ready (${resultNodes} nodes).`,
+        });
         await this.refreshArchitectureCache();
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.push({
         phase: "error",
-        indexed: false,
+        indexed: keepServing,
         error: message,
         indexMessage: "Indexing failed.",
       });
@@ -460,17 +582,21 @@ export class CbmEngine {
       ...args,
     });
     const output = await client.callTool(name, merged, 30_000);
-    const compact = compactResult(output);
-    return {
-      summary: `${name} ok`,
-      output: (() => {
-        try {
-          return JSON.parse(compact) as unknown;
-        } catch {
-          return compact;
-        }
-      })(),
-    };
+    // Keep full engine payload for the IDE tool log; the agent loop compacts
+    // via formatToolResultForModel before sending to the provider.
+    try {
+      const raw =
+        typeof output === "string" ? output : JSON.stringify(output, null, 2);
+      if (raw.length > 512_000) {
+        return {
+          summary: `${name} ok (output capped for storage)`,
+          output: `${raw.slice(0, 512_000)}\n… [capped for storage; ${raw.length - 512_000} chars omitted]`,
+        };
+      }
+      return { summary: `${name} ok`, output };
+    } catch {
+      return { summary: `${name} ok`, output };
+    }
   }
 
   async architecturePreseed(): Promise<string | null> {

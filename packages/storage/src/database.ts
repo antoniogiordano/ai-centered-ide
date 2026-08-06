@@ -219,6 +219,7 @@ export class ProjectStorage {
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
+    buildBaseBranch?: string | null;
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     createdAt: string;
@@ -251,6 +252,7 @@ export class ProjectStorage {
           planStatus: row.planStatus,
           planQuestions: row.planQuestions,
           planReadyProposal: row.planReadyProposal,
+          buildBaseBranch: row.buildBaseBranch ?? null,
           sessionKind: row.sessionKind,
           approvalGrants: row.approvalGrants,
         }),
@@ -268,6 +270,7 @@ export class ProjectStorage {
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
+    buildBaseBranch: string | null;
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     createdAt: string;
@@ -302,6 +305,7 @@ export class ProjectStorage {
             planStatus?: PlanStatus;
             planQuestions?: PlanQuestion[];
             planReadyProposal?: PlanReadyProposal | null;
+            buildBaseBranch?: string | null;
             sessionKind?: SessionKind;
             approvalGrants?: ApprovalGrant[];
           })
@@ -319,6 +323,7 @@ export class ProjectStorage {
         planStatus: meta.planStatus ?? "drafting",
         planQuestions: meta.planQuestions ?? [],
         planReadyProposal: meta.planReadyProposal ?? null,
+        buildBaseBranch: meta.buildBaseBranch ?? null,
         sessionKind: meta.sessionKind ?? "delivery",
         approvalGrants: meta.approvalGrants ?? [],
         createdAt: row.createdAt,
@@ -338,6 +343,7 @@ export class ProjectStorage {
     planStatus: PlanStatus;
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
+    buildBaseBranch: string | null;
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     createdAt: string;

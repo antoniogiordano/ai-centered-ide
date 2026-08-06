@@ -31,6 +31,9 @@ const TOOL_RISK: Record<string, RiskLevel> = {
   read_architecture: "safe",
   git_commit: "sensitive",
   run_command: "sensitive",
+  get_test_report: "safe",
+  list_failed_tests: "safe",
+  read_test_log: "safe",
   terminal_open: "safe",
   terminal_list: "safe",
   terminal_read: "safe",
@@ -151,4 +154,57 @@ export function analyzeCommand(command: string): {
     return { blocked: false, needsApproval: true, allowlisted: false };
   }
   return { blocked: false, needsApproval: true, allowlisted: false };
+}
+
+const SHELL_FILE_INSPECT_BIN = new Set([
+  "cat",
+  "ls",
+  "ll",
+  "la",
+  "dir",
+  "tree",
+  "head",
+  "tail",
+  "less",
+  "more",
+  "nl",
+  "tac",
+  "find",
+  "stat",
+  "file",
+  "wc",
+]);
+
+/**
+ * True when the shell is being used as a file browser (cat/ls/find/…).
+ * Those belong to list_dir / read_file / search_* / search_graph instead.
+ */
+export function isShellFileInspectionCommand(command: string): boolean {
+  const segments = command
+    .split(/(?:&&|\|\||;|\n)/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (segments.length === 0) return false;
+
+  let sawInspect = false;
+  for (const segment of segments) {
+    // Drop leading env assignments: FOO=1 BAR=2 cmd …
+    const withoutEnv = segment.replace(/^(?:\w+=\S+\s+)+/, "").trim();
+    // Drop pipe receiver focus: only look at the head of each segment.
+    const head = withoutEnv.split("|")[0]?.trim() ?? "";
+    const rawToken = head.split(/\s+/)[0] ?? "";
+    const token = rawToken.replace(/^.*[/\\]/, "").toLowerCase();
+    if (!token) continue;
+    if (SHELL_FILE_INSPECT_BIN.has(token)) {
+      sawInspect = true;
+      continue;
+    }
+    // echo / true between cats still counts as inspection chain if we saw inspect.
+    if (token === "echo" || token === "printf" || token === "true" || token === ":") {
+      continue;
+    }
+    // Mixed with a real command (e.g. npm) — not pure file inspection.
+    return false;
+  }
+  return sawInspect;
 }

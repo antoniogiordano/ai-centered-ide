@@ -7,12 +7,14 @@ import type {
   SessionSummary,
   WorkspaceRef,
 } from "@ai-ide/shared";
-import { createEmptySessionState, deriveProductPhase, planHasOpenWork, planBuildComplete, CHECKLIST_CONTINUE_USER_MESSAGE, PLAN_CONTINUE_USER_MESSAGE } from "@ai-ide/shared";
+import { createEmptySessionState, deriveProductPhase, planHasOpenWork, planBuildComplete, awaitsTestingConfirm, canStartTestGate, CHECKLIST_CONTINUE_USER_MESSAGE, PLAN_CONTINUE_USER_MESSAGE, TESTING_READY_CONTINUE_USER_MESSAGE, discoverTestRunSpecs, buildTestFailureDigest, decideTestGateAutoContinue, decideTestGateEscalation, fingerprintTestFailure, failedSuiteIds, TEST_FAILURE_CONTINUE_USER_MESSAGE } from "@ai-ide/shared";
 import type { ProjectStorage } from "@ai-ide/storage";
 import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
 import {
   applyPlanAnswers,
+  applyRejectPlanReady,
   applyStartBuilding,
+  isSyntheticUserPrompt,
   normalizeFeatBranchName,
   normalizePlanQuestions,
   runAgentTurn,
@@ -23,17 +25,21 @@ import {
   type PausedAgentTurn,
 } from "@ai-ide/agent";
 import {
+  ArchitectureStore,
   CheckpointService,
   FilesystemService,
   GitService,
+  GhCli,
 } from "@ai-ide/workspace";
 import type { TerminalHost } from "@ai-ide/tools";
-import { app } from "electron";
+import { runTestSuites } from "@ai-ide/tools";
+import { app, shell } from "electron";
 import type { CredentialStore } from "@ai-ide/storage";
 import { CREDENTIAL_SERVICE } from "@ai-ide/storage";
 import { TerminalManager } from "./terminals.js";
 import { CbmEngine } from "./engine/cbm-engine.js";
 import type { CbmHost } from "@ai-ide/tools";
+import { ProviderRegistryStore } from "./provider-registry.js";
 
 const TERMINAL_CONFIRM_MS = 3000;
 
@@ -52,11 +58,6 @@ type RecentWorkspace = {
   rootPath: string;
   name: string;
   lastOpenedAt: string;
-};
-
-type ProviderConfig = {
-  baseUrl: string;
-  defaultModel: string;
 };
 
 type SessionListener = (event: {
@@ -110,9 +111,34 @@ function summarizeStreamingToolArgs(
     if (phaseTitles[0]) bits.push(`latest: ${phaseTitles[phaseTitles.length - 1]}`);
     return bits.join(" · ");
   }
+  if (typeof args.path === "string" && args.path.trim()) {
+    return args.path.trim();
+  }
+  if (typeof args.command === "string" && args.command.trim()) {
+    const cmd = args.command.trim().replace(/\s+/g, " ");
+    return cmd.length > 120 ? `${cmd.slice(0, 117)}…` : cmd;
+  }
+  if (typeof args.query === "string" && args.query.trim()) {
+    const q = args.query.trim();
+    return q.length > 80 ? `“${q.slice(0, 77)}…”` : `“${q}”`;
+  }
+  if (typeof args.text === "string" && args.text.trim()) {
+    const t = args.text.trim().replace(/\s+/g, " ");
+    return t.length > 80 ? `${t.slice(0, 77)}…` : t;
+  }
   const keys = Object.keys(args);
   if (keys.length === 0) return "Streaming arguments…";
   return `args: ${keys.slice(0, 4).join(", ")}${keys.length > 4 ? "…" : ""}`;
+}
+
+function argsFromStreamingJson(
+  argumentsJson: string,
+): Record<string, unknown> | undefined {
+  const parsed = tryParsePartialJson(argumentsJson);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  return parsed as Record<string, unknown>;
 }
 
 export class SessionManager {
@@ -149,6 +175,25 @@ export class SessionManager {
   >();
   private liveSyncTimer: ReturnType<typeof setTimeout> | null = null;
   private pausedTurn: PausedAgentTurn | null = null;
+  /** After Cancel on Start Build — do not tank-continue until the user chats. */
+  private planningPausedUntilUserMessage = false;
+  private providerStore: ProviderRegistryStore | null = null;
+  /** Full logs from the last IDE test-gate run (suiteId → text). */
+  private testLogs = new Map<string, string>();
+  /** After a failed gate, only re-run once the agent mutates the workspace. */
+  private testDirtySinceLastRun = true;
+  private testGateInFlight = false;
+  private testAbort: AbortController | null = null;
+
+  private static readonly TEST_MUTATING_TOOLS = new Set([
+    "write_file",
+    "delete_file",
+    "run_command",
+    "git_commit",
+    "terminal_write",
+    "apply_patch",
+    "upsert_architecture",
+  ]);
 
   constructor(private readonly storage: ProjectStorage) {
     const boot = this.bootstrap();
@@ -531,6 +576,7 @@ export class SessionManager {
     planStatus: SessionState["planStatus"];
     planQuestions: SessionState["planQuestions"];
     planReadyProposal: SessionState["planReadyProposal"];
+    buildBaseBranch?: string | null;
     sessionKind?: SessionState["sessionKind"];
     approvalGrants: SessionState["approvalGrants"];
     createdAt: string;
@@ -550,6 +596,7 @@ export class SessionManager {
       planStatus: row.planStatus,
       planQuestions: normalizePlanQuestions(row.planQuestions),
       planReadyProposal: row.planReadyProposal ?? null,
+      buildBaseBranch: row.buildBaseBranch ?? null,
       approvalGrants: row.approvalGrants,
       turns,
       status: "idle",
@@ -560,6 +607,21 @@ export class SessionManager {
 
   setCredentials(store: CredentialStore): void {
     this.credentials = store;
+    this.providerStore = new ProviderRegistryStore(this.storage, store);
+    this.syncProviderHud(false);
+  }
+
+  getProviderStore(): ProviderRegistryStore | null {
+    return this.providerStore;
+  }
+
+  syncProviderHud(push = true): void {
+    if (!this.providerStore) return;
+    this.state = {
+      ...this.state,
+      providerHud: this.providerStore.buildHud(),
+    };
+    if (push) this.push();
   }
 
   getState(): SessionState {
@@ -604,6 +666,14 @@ export class SessionManager {
   }
 
   private push(fullSync = false): void {
+    // Keep the provider HUD attached on every push — agent turns / hydrate
+    // otherwise drop it and the top bar flickers.
+    if (this.providerStore) {
+      this.state = {
+        ...this.state,
+        providerHud: this.providerStore.buildHud(),
+      };
+    }
     this.state = { ...this.state, sequence: this.state.sequence + 1 };
     for (const listener of this.listeners) {
       listener({
@@ -629,6 +699,7 @@ export class SessionManager {
       planStatus: this.state.planStatus,
       planQuestions: this.state.planQuestions,
       planReadyProposal: this.state.planReadyProposal,
+      buildBaseBranch: this.state.buildBaseBranch,
       sessionKind: this.state.sessionKind,
       approvalGrants: this.state.approvalGrants,
       createdAt: this.createdAt,
@@ -646,6 +717,18 @@ export class SessionManager {
   }
 
   private handleProgress(event: AgentProgressEvent): void {
+    if (event.type === "usage") {
+      if (this.providerStore) {
+        const hud = this.providerStore.recordUsage({
+          inputTokens: event.inputTokens,
+          outputTokens: event.outputTokens,
+        });
+        this.state = { ...this.state, providerHud: hud };
+        this.push();
+      }
+      return;
+    }
+
     if (event.type === "activity") {
       this.clearTokenFlush();
       this.state = {
@@ -683,6 +766,7 @@ export class SessionManager {
           name: event.call.name,
           label: event.label,
           status: "running" as const,
+          arguments: event.call.arguments ?? {},
           ...(existing?.summary ? { summary: existing.summary } : {}),
         },
       ];
@@ -702,6 +786,7 @@ export class SessionManager {
         event.name,
         event.argumentsJson,
       );
+      const parsedArgs = argsFromStreamingJson(event.argumentsJson);
       const liveTools = this.state.liveTools.some((t) => t.id === event.callId)
         ? this.state.liveTools.map((t) =>
             t.id === event.callId
@@ -710,6 +795,7 @@ export class SessionManager {
                   label: event.label,
                   status: "running" as const,
                   ...(summary ? { summary } : {}),
+                  ...(parsedArgs ? { arguments: parsedArgs } : {}),
                 }
               : t,
           )
@@ -721,6 +807,7 @@ export class SessionManager {
               label: event.label,
               status: "running" as const,
               ...(summary ? { summary } : {}),
+              ...(parsedArgs ? { arguments: parsedArgs } : {}),
             },
           ];
       this.state = {
@@ -750,9 +837,24 @@ export class SessionManager {
                 : ("failed" as const),
               summary: event.result.summary,
               label: event.label,
+              ...(event.result.output !== undefined
+                ? { output: event.result.output }
+                : {}),
+              ...(event.result.error ? { error: event.result.error } : {}),
             }
           : t,
       );
+      const ended = liveTools.find((t) => t.id === event.result.callId);
+      if (
+        event.result.success &&
+        ended &&
+        SessionManager.TEST_MUTATING_TOOLS.has(ended.name)
+      ) {
+        this.testDirtySinceLastRun = true;
+        if (this.state.testGatePassedAt) {
+          this.state = { ...this.state, testGatePassedAt: null };
+        }
+      }
       this.state = {
         ...this.state,
         activityLabel: event.label,
@@ -798,6 +900,10 @@ export class SessionManager {
     this.createdAt = now;
     this.persist();
     this.push(true);
+    // New chat: refresh codebase graph so search_graph is not stuck on a stale/stub index.
+    if (workspace?.resolvedRootPath) {
+      void this.engine.ensureFreshIndex("chat");
+    }
     return this.state;
   }
 
@@ -884,6 +990,18 @@ export class SessionManager {
   }
 
   /**
+   * User cancelled Start Build — clear readiness and wait for chat revision.
+   * Does not tank-continue until the next sendMessage.
+   */
+  rejectPlanReady(): { ok: boolean; state: SessionState } {
+    this.planningPausedUntilUserMessage = true;
+    this.state = applyRejectPlanReady(this.state);
+    this.persist();
+    this.push();
+    return { ok: true, state: this.state };
+  }
+
+  /**
    * User confirmed the draft plan in the UI. Optionally create/checkout a feat/* branch,
    * then switch this chat to Build mode.
    */
@@ -899,6 +1017,7 @@ export class SessionManager {
     branch?: string | null;
     error?: { code: "VALIDATION_ERROR"; userMessage: string; technicalDetail: string };
   }> {
+    this.planningPausedUntilUserMessage = false;
     if (isBusy(this.state.status)) {
       return {
         ok: false,
@@ -912,6 +1031,7 @@ export class SessionManager {
 
     let createdBranch: string | null = null;
     let branchNote = "";
+    let rememberedBase: string | null = null;
     if (input.createBranch) {
       const normalized = normalizeFeatBranchName(input.branchName ?? "");
       if (!normalized) {
@@ -968,6 +1088,7 @@ export class SessionManager {
           },
         };
       }
+      rememberedBase = base;
       if (!(await git.localBranchExists(base))) {
         return {
           ok: false,
@@ -1023,6 +1144,7 @@ export class SessionManager {
         } else if (base !== info.localBranch) {
           branchNote = ` From \`${base}\`.`;
         }
+        branchNote += ` Remembered base \`${base}\` for merge/PR after tests.`;
       } catch (error) {
         const detail =
           error instanceof Error ? error.message : String(error);
@@ -1037,6 +1159,16 @@ export class SessionManager {
             technicalDetail: detail,
           },
         };
+      }
+    } else {
+      const root = this.state.workspace?.resolvedRootPath;
+      if (root) {
+        try {
+          const info = await new GitService(root).branchInfo();
+          rememberedBase = info.localBranch;
+        } catch {
+          rememberedBase = null;
+        }
       }
     }
 
@@ -1067,7 +1199,20 @@ export class SessionManager {
       status: "idle",
       error: null,
       buildCommitOffer: null,
+      buildIntegrateOffer: null,
+      buildBaseBranch: rememberedBase,
+      testRun: null,
+      testingConfirmedAt: null,
+      testGatePassedAt: null,
+      testGateAutoFixAttempts: 0,
+      testGateCircuitOpen: false,
+      testGateFailureFingerprint: null,
+      testGateSameFailureStreak: 0,
+      testGateEscalationLevel: 0,
+      testGateRecentSuiteKeys: [],
     };
+    this.testLogs.clear();
+    this.testDirtySinceLastRun = true;
     this.persist();
     this.push(true);
 
@@ -1181,6 +1326,8 @@ export class SessionManager {
   cancel(): void {
     this.abort?.abort();
     this.abort = null;
+    this.testAbort?.abort();
+    this.testAbort = null;
     this.clearTokenFlush();
     this.clearTerminalWaiters("cancel");
     this.pausedTurn = null;
@@ -1203,6 +1350,23 @@ export class SessionManager {
     content: string,
     options?: { planAnswers?: PlanAnswerInput[] },
   ): Promise<void> {
+    if (!isSyntheticUserPrompt(content)) {
+      this.planningPausedUntilUserMessage = false;
+    }
+    if (content.trim() === TEST_FAILURE_CONTINUE_USER_MESSAGE) {
+      this.testDirtySinceLastRun = true;
+      // Manual Resume clears the paid-provider circuit and grants another batch.
+      // Keep escalation fingerprint/streak so the next failure stays escalated.
+      this.state = {
+        ...this.state,
+        testGateCircuitOpen: false,
+        testGateAutoFixAttempts: 0,
+      };
+      const digest = this.state.testRun?.digest?.trim();
+      if (digest && !content.includes("[IDE · TEST GATE]")) {
+        content = `${digest}\n\n${TEST_FAILURE_CONTINUE_USER_MESSAGE}`;
+      }
+    }
     this.abort?.abort();
     this.abort = new AbortController();
     this.clearTokenFlush();
@@ -1254,6 +1418,10 @@ export class SessionManager {
                 checkpoint: new CheckpointService(root, checkpointRoot),
                 terminals: this.terminalHost,
                 cbm: this.cbmHost,
+                testLogs: {
+                  get: (suiteId: string) => this.testLogs.get(suiteId),
+                },
+                testGate: this.testGateToolApi(),
                 audit: (entry: {
                   toolName: string;
                   action: string;
@@ -1294,7 +1462,9 @@ export class SessionManager {
       // Never auto-rekick after errors / approvals — user must Resume.
       if (result.state.status === "idle" && !result.state.error) {
         if (!this.maybeTankContinueBuild()) {
-          void this.maybeOfferBuildCommit();
+          if (!this.maybePromptTestingReady()) {
+            void this.maybeRunTestGateThenCommit();
+          }
         }
       }
     } catch (error) {
@@ -1327,25 +1497,331 @@ export class SessionManager {
     const phase = deriveProductPhase(this.state);
     if (phase === "building") {
       if (!planHasOpenWork(this.state)) return false;
+      // Avoid idle→banner flash: mark thinking before the continue kick.
+      this.state = {
+        ...this.state,
+        status: "thinking",
+        activityLabel: "Continuing build…",
+        error: null,
+      };
+      this.push();
       void this.sendMessage(CHECKLIST_CONTINUE_USER_MESSAGE);
       return true;
     }
     if (phase === "planning") {
       if (this.state.mode !== "plan") return false;
+      if (this.planningPausedUntilUserMessage) return false;
       if (this.state.planReadyProposal) return false;
       if (this.state.planQuestions.some((q) => q.status === "open")) return false;
+      this.state = {
+        ...this.state,
+        status: "thinking",
+        activityLabel: "Continuing planning…",
+        error: null,
+      };
+      this.push();
       void this.sendMessage(PLAN_CONTINUE_USER_MESSAGE);
       return true;
     }
     return false;
   }
 
-  /** After a finished build, offer a local commit when there are changes. */
+  /**
+   * Checklist complete but agent has not called propose_testing_ready yet.
+   * @returns true when a continue message was dispatched.
+   */
+  private maybePromptTestingReady(): boolean {
+    if (this.state.status !== "idle") return false;
+    if (this.state.error) return false;
+    if (this.state.pendingApprovals.length > 0) return false;
+    if (!awaitsTestingConfirm(this.state)) return false;
+    this.state = {
+      ...this.state,
+      status: "thinking",
+      activityLabel: "Confirming testing…",
+      error: null,
+    };
+    this.push();
+    void this.sendMessage(TESTING_READY_CONTINUE_USER_MESSAGE);
+    return true;
+  }
+
+  /**
+   * After build checklist completion + propose_testing_ready: discover + run
+   * lint/typecheck/unit, then offer commit on green (or skip when no suites).
+   * On failure, return to the agent with a digest + read_test_log.
+   */
+  private async maybeRunTestGateThenCommit(): Promise<void> {
+    if (this.state.status !== "idle") return;
+    if (this.state.error) return;
+    if (this.state.buildCommitOffer) return;
+    if (!planBuildComplete(this.state)) return;
+    if (!canStartTestGate(this.state) && !this.state.testGatePassedAt) {
+      // Missing testingConfirmedAt — maybePromptTestingReady handles the nudge.
+      return;
+    }
+    if (this.testGateInFlight) return;
+    if (this.state.testGatePassedAt) {
+      await this.maybeOfferBuildCommit();
+      return;
+    }
+
+    const prior = this.state.testRun;
+    if (prior?.status === "failed" && !this.testDirtySinceLastRun) {
+      return;
+    }
+    if (prior?.status === "running") return;
+
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) return;
+
+    this.testGateInFlight = true;
+    try {
+      const profile = new ArchitectureStore(root).loadOrDetect().profile;
+      const specs = discoverTestRunSpecs(profile, { includeE2e: false });
+      if (specs.length === 0) {
+        const skippedAt = new Date().toISOString();
+        this.state = {
+          ...this.state,
+          testRun: {
+            startedAt: skippedAt,
+            finishedAt: skippedAt,
+            status: "skipped",
+            specs: [],
+            suites: [],
+            digest: "No lint/typecheck/unit commands in architecture profile.",
+          },
+          testGatePassedAt: skippedAt,
+          testGateAutoFixAttempts: 0,
+          testGateCircuitOpen: false,
+          testGateFailureFingerprint: null,
+          testGateSameFailureStreak: 0,
+          testGateEscalationLevel: 0,
+          testGateRecentSuiteKeys: [],
+        };
+        this.testLogs.clear();
+        this.testDirtySinceLastRun = false;
+        this.push();
+        await this.maybeOfferBuildCommit();
+        return;
+      }
+
+      const startedAt = new Date().toISOString();
+      this.testLogs.clear();
+      this.testDirtySinceLastRun = false;
+      this.testAbort?.abort();
+      this.testAbort = new AbortController();
+      this.state = {
+        ...this.state,
+        status: "running",
+        activityLabel: "Running test gate…",
+        testRun: {
+          startedAt,
+          status: "running",
+          specs,
+          suites: [],
+        },
+        testGatePassedAt: null,
+      };
+      this.push();
+
+      const outcome = await runTestSuites({
+        workspaceRoot: root,
+        specs,
+        failFast: true,
+        signal: this.testAbort.signal,
+        onSuiteStart: (spec) => {
+          this.state = {
+            ...this.state,
+            activityLabel: `Test gate · ${spec.id}…`,
+          };
+          this.push();
+        },
+        onSuiteEnd: (result) => {
+          const prev = this.state.testRun;
+          if (!prev || prev.status !== "running") return;
+          const suites = [
+            ...prev.suites.filter((s) => s.id !== result.id),
+            result,
+          ];
+          this.state = {
+            ...this.state,
+            testRun: {
+              ...prev,
+              suites,
+            },
+          };
+          this.push();
+        },
+      });
+
+      for (const [id, log] of outcome.logs) {
+        this.testLogs.set(id, log);
+      }
+
+      const finishedAt = new Date().toISOString();
+      if (!outcome.failed) {
+        this.state = {
+          ...this.state,
+          status: "idle",
+          activityLabel: null,
+          testRun: {
+            startedAt,
+            finishedAt,
+            status: "passed",
+            specs,
+            suites: outcome.suites,
+          },
+          testGatePassedAt: finishedAt,
+          testGateAutoFixAttempts: 0,
+          testGateCircuitOpen: false,
+          testGateFailureFingerprint: null,
+          testGateSameFailureStreak: 0,
+          testGateEscalationLevel: 0,
+          testGateRecentSuiteKeys: [],
+        };
+        this.push();
+        await this.maybeOfferBuildCommit();
+        return;
+      }
+
+      const logsRecord = Object.fromEntries(this.testLogs.entries());
+      const fingerprint = fingerprintTestFailure(
+        { suites: outcome.suites },
+        logsRecord,
+      );
+      const suiteKey = failedSuiteIds(outcome.suites).join("+") || "unknown";
+      const escalation = decideTestGateEscalation({
+        fingerprint,
+        previousFingerprint: this.state.testGateFailureFingerprint,
+        previousStreak: this.state.testGateSameFailureStreak,
+        previousSuiteKeys: this.state.testGateRecentSuiteKeys,
+        currentSuiteKey: suiteKey,
+      });
+      const digest = buildTestFailureDigest(
+        {
+          specs,
+          suites: outcome.suites,
+        },
+        { logs: logsRecord, escalation },
+      );
+      const decision = decideTestGateAutoContinue({
+        paidProvider: this.isPaidActiveProvider(),
+        previousAttempts: this.state.testGateAutoFixAttempts,
+      });
+      this.state = {
+        ...this.state,
+        status: "idle",
+        activityLabel: null,
+        testRun: {
+          startedAt,
+          finishedAt,
+          status: "failed",
+          specs,
+          suites: outcome.suites,
+          digest,
+        },
+        testGatePassedAt: null,
+        testGateAutoFixAttempts: decision.attempts,
+        testGateCircuitOpen: decision.circuitOpen,
+        testGateFailureFingerprint: escalation.fingerprint,
+        testGateSameFailureStreak: escalation.sameFailureStreak,
+        testGateEscalationLevel: escalation.level,
+        testGateRecentSuiteKeys: escalation.recentSuiteKeys,
+      };
+      this.push();
+      if (decision.autoContinue) {
+        void this.sendMessage(digest);
+      }
+    } catch (error) {
+      const decision = decideTestGateAutoContinue({
+        paidProvider: this.isPaidActiveProvider(),
+        previousAttempts: this.state.testGateAutoFixAttempts,
+      });
+      const errDigest = `Test gate error: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      const fingerprint = fingerprintTestFailure(
+        {
+          suites: [
+            {
+              id: "gate",
+              kind: "unit",
+              command: "test-gate",
+              status: "failed",
+              exitCode: 1,
+              durationMs: 0,
+              summary: errDigest,
+              logChars: 0,
+              logChunkSize: 8000,
+              logChunks: 0,
+              failedTests: [],
+            },
+          ],
+        },
+      );
+      const escalation = decideTestGateEscalation({
+        fingerprint,
+        previousFingerprint: this.state.testGateFailureFingerprint,
+        previousStreak: this.state.testGateSameFailureStreak,
+        previousSuiteKeys: this.state.testGateRecentSuiteKeys,
+        currentSuiteKey: "gate",
+      });
+      this.state = {
+        ...this.state,
+        status: "idle",
+        activityLabel: null,
+        testRun: {
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          status: "failed",
+          specs: this.state.testRun?.specs ?? [],
+          suites: this.state.testRun?.suites ?? [],
+          digest: errDigest,
+        },
+        testGatePassedAt: null,
+        testGateAutoFixAttempts: decision.attempts,
+        testGateCircuitOpen: decision.circuitOpen,
+        testGateFailureFingerprint: escalation.fingerprint,
+        testGateSameFailureStreak: escalation.sameFailureStreak,
+        testGateEscalationLevel: escalation.level,
+        testGateRecentSuiteKeys: escalation.recentSuiteKeys,
+      };
+      this.testDirtySinceLastRun = true;
+      this.push();
+      if (decision.autoContinue) {
+        void this.sendMessage(
+          this.state.testRun?.digest ?? TEST_FAILURE_CONTINUE_USER_MESSAGE,
+        );
+      }
+    } finally {
+      this.testGateInFlight = false;
+    }
+  }
+
+  private isPaidActiveProvider(): boolean {
+    if (this.state.providerHud?.paid === true) return true;
+    return this.providerStore?.getActive()?.paid === true;
+  }
+
+  private testGateToolApi() {
+    return {
+      getReport: () => this.state.testRun ?? null,
+      getMeta: () => ({
+        escalationLevel: this.state.testGateEscalationLevel ?? 0,
+        circuitOpen: Boolean(this.state.testGateCircuitOpen),
+        sameFailureStreak: this.state.testGateSameFailureStreak ?? 0,
+      }),
+    };
+  }
+
+  /** After a finished build + green test gate, offer a local commit when dirty. */
   private async maybeOfferBuildCommit(): Promise<void> {
     if (this.state.status !== "idle") return;
     if (this.state.error) return;
     if (this.state.buildCommitOffer) return;
     if (!planBuildComplete(this.state)) return;
+    if (!this.state.testGatePassedAt) return;
     const root = this.state.workspace?.resolvedRootPath;
     if (!root) return;
     try {
@@ -1354,18 +1830,55 @@ export class SessionManager {
       const files = [
         ...new Set([...status.modified, ...status.not_added]),
       ].filter(Boolean);
-      if (files.length === 0) return;
+      if (files.length === 0) {
+        await this.maybeOfferIntegrate();
+        return;
+      }
       this.state = {
         ...this.state,
         buildCommitOffer: {
           offeredAt: new Date().toISOString(),
           branch: status.current || null,
+          baseBranch: this.state.buildBaseBranch,
           files,
         },
       };
       this.push();
     } catch {
       /* ignore git errors */
+    }
+  }
+
+  /**
+   * After tests (and after commit/skip when applicable): offer remote PR or
+   * local merge into the Start Build base branch.
+   */
+  private async maybeOfferIntegrate(): Promise<void> {
+    if (this.state.status !== "idle") return;
+    if (this.state.error) return;
+    if (this.state.buildCommitOffer) return;
+    if (this.state.buildIntegrateOffer) return;
+    if (!this.state.testGatePassedAt) return;
+    const base = this.state.buildBaseBranch?.trim();
+    if (!base) return;
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) return;
+    try {
+      const git = new GitService(root);
+      const info = await git.branchInfo();
+      const head = info.localBranch;
+      if (!head || head === base) return;
+      this.state = {
+        ...this.state,
+        buildIntegrateOffer: {
+          offeredAt: new Date().toISOString(),
+          headBranch: head,
+          baseBranch: base,
+        },
+      };
+      this.push();
+    } catch {
+      /* ignore */
     }
   }
 
@@ -1437,6 +1950,16 @@ export class SessionManager {
       let text = "";
       for await (const chunk of provider.chat(messages)) {
         if (chunk.type === "content") text += chunk.delta;
+        if (
+          chunk.type === "done" &&
+          chunk.usage &&
+          this.providerStore &&
+          (chunk.usage.inputTokens > 0 || chunk.usage.outputTokens > 0)
+        ) {
+          const hud = this.providerStore.recordUsage(chunk.usage);
+          this.state = { ...this.state, providerHud: hud };
+          this.push();
+        }
         if (chunk.type === "error") {
           return {
             ok: false,
@@ -1550,6 +2073,7 @@ export class SessionManager {
       };
       this.persist();
       this.push();
+      await this.maybeOfferIntegrate();
       return { ok: true, commit, state: this.state };
     } catch (error) {
       return {
@@ -1567,16 +2091,137 @@ export class SessionManager {
   dismissBuildCommit(): { ok: boolean; state: SessionState } {
     this.state = { ...this.state, buildCommitOffer: null };
     this.push();
+    void this.maybeOfferIntegrate();
     return { ok: true, state: this.state };
   }
 
+  dismissBuildIntegrate(): { ok: boolean; state: SessionState } {
+    this.state = { ...this.state, buildIntegrateOffer: null };
+    this.push();
+    return { ok: true, state: this.state };
+  }
+
+  async integrateBuild(action: "pr" | "merge"): Promise<{
+    ok: boolean;
+    url?: string;
+    state?: SessionState;
+    error?: { code: string; userMessage: string; technicalDetail: string };
+  }> {
+    const offer = this.state.buildIntegrateOffer;
+    if (!offer) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "No integrate offer is pending.",
+          technicalDetail: "missing buildIntegrateOffer",
+        },
+      };
+    }
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Open a workspace first.",
+          technicalDetail: "no workspace",
+        },
+      };
+    }
+
+    try {
+      const git = new GitService(root);
+      if (action === "merge") {
+        await git.mergeIntoBase({
+          base: offer.baseBranch,
+          head: offer.headBranch,
+          message: `Merge branch '${offer.headBranch}' into ${offer.baseBranch}`,
+        });
+        const notice = {
+          id: randomUUID(),
+          role: "assistant" as const,
+          content: `Merged \`${offer.headBranch}\` into \`${offer.baseBranch}\` locally.`,
+          createdAt: new Date().toISOString(),
+        };
+        this.state = {
+          ...this.state,
+          buildIntegrateOffer: null,
+          turns: [...this.state.turns, notice],
+        };
+        this.persist();
+        this.push();
+        return { ok: true, state: this.state };
+      }
+
+      // Remote PR: push head, then gh pr create.
+      const info = await git.branchInfo();
+      if (info.localBranch !== offer.headBranch) {
+        await git.checkoutExisting(offer.headBranch);
+      }
+      await git.pushCurrentUpstream("origin");
+      const gh = new GhCli({ openUrl: (url) => shell.openExternal(url) });
+      const pr = await gh.createPullRequest({
+        cwd: root,
+        base: offer.baseBranch,
+        head: offer.headBranch,
+        title: offer.headBranch.replace(/^feat\//, "").replace(/-/g, " "),
+        body: `Opened after IDE Test gate on \`${offer.headBranch}\` (base \`${offer.baseBranch}\`).`,
+      });
+      void shell.openExternal(pr.url);
+      const notice = {
+        id: randomUUID(),
+        role: "assistant" as const,
+        content: `Opened pull request: ${pr.url} (\`${offer.headBranch}\` → \`${offer.baseBranch}\`).`,
+        createdAt: new Date().toISOString(),
+      };
+      this.state = {
+        ...this.state,
+        buildIntegrateOffer: null,
+        turns: [...this.state.turns, notice],
+      };
+      this.persist();
+      this.push();
+      return { ok: true, url: pr.url, state: this.state };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const userMessage =
+        detail === "DIRTY_WORKTREE"
+          ? "Working tree is dirty — commit or stash before merging."
+          : action === "pr"
+            ? "Could not open a pull request (push + gh)."
+            : "Local merge failed.";
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage,
+          technicalDetail: detail,
+        },
+      };
+    }
+  }
+
   private async createProvider() {
-    const cfg =
-      this.storage.getPreference<ProviderConfig>("providerConfig") ?? null;
+    const store = this.providerStore;
+    const active = store?.getActive() ?? null;
+    if (active) {
+      const apiKey = (await store!.getApiKey(active.id)) || "";
+      return new OpenAiCompatibleProvider({
+        baseUrl: active.baseUrl,
+        apiKey,
+        defaultModel: active.defaultModel || "gpt-4o-mini",
+      });
+    }
+
+    // Legacy fallback while migrating.
+    const cfg = this.storage.getPreference<{
+      baseUrl?: string;
+      defaultModel?: string;
+    }>("providerConfig");
     const apiKey = this.credentials
       ? await this.credentials.get(CREDENTIAL_SERVICE, "default")
       : null;
-
     if (cfg?.baseUrl) {
       return new OpenAiCompatibleProvider({
         baseUrl: cfg.baseUrl,
@@ -1658,6 +2303,10 @@ export class SessionManager {
                 checkpoint: new CheckpointService(root, checkpointRoot),
                 terminals: this.terminalHost,
                 cbm: this.cbmHost,
+                testLogs: {
+                  get: (suiteId: string) => this.testLogs.get(suiteId),
+                },
+                testGate: this.testGateToolApi(),
                 audit: (entry: {
                   toolName: string;
                   action: string;
@@ -1698,7 +2347,9 @@ export class SessionManager {
       // Never auto-rekick after errors / approvals — user must Resume.
       if (result.state.status === "idle" && !result.state.error) {
         if (!this.maybeTankContinueBuild()) {
-          void this.maybeOfferBuildCommit();
+          if (!this.maybePromptTestingReady()) {
+            void this.maybeRunTestGateThenCommit();
+          }
         }
       }
     } catch (error) {

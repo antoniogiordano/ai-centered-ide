@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { deriveProductPhase } from "@ai-ide/shared";
+import { deriveProductPhase, formatTokenCount, formatUsd } from "@ai-ide/shared";
 import { getBridge } from "./bridge";
 import { useBridgeReady, useSessionState } from "./hooks/useSessionState";
 import { OnboardingWizard } from "./components/OnboardingWizard";
@@ -11,8 +11,8 @@ import {
   PlanQaDialog,
   type PlanQaAnswer,
 } from "./components/PlanQaDialog";
-import { StartBuildDialog } from "./components/StartBuildDialog";
 import { CommitBuildDialog } from "./components/CommitBuildDialog";
+import { IntegrateBuildDialog } from "./components/IntegrateBuildDialog";
 import { NewProjectDialog } from "./components/NewProjectDialog";
 import {
   ArchitecturePane,
@@ -57,12 +57,12 @@ export function App() {
   const [qaOpen, setQaOpen] = useState(false);
   const [qaFocusRequestId, setQaFocusRequestId] = useState(0);
   const [qaDismissedKey, setQaDismissedKey] = useState<string | null>(null);
-  const [startBuildOpen, setStartBuildOpen] = useState(false);
   const [commitBuildOpen, setCommitBuildOpen] = useState(false);
   const [commitBuildDismissedKey, setCommitBuildDismissedKey] = useState<
     string | null
   >(null);
-  const [startBuildDismissedKey, setStartBuildDismissedKey] = useState<
+  const [integrateBuildOpen, setIntegrateBuildOpen] = useState(false);
+  const [integrateBuildDismissedKey, setIntegrateBuildDismissedKey] = useState<
     string | null
   >(null);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
@@ -115,44 +115,26 @@ export function App() {
   useEffect(() => {
     setQaDismissedKey(null);
     setQaOpen(false);
-    setStartBuildOpen(false);
-    setStartBuildDismissedKey(null);
     setCommitBuildOpen(false);
     setCommitBuildDismissedKey(null);
+    setIntegrateBuildOpen(false);
+    setIntegrateBuildDismissedKey(null);
   }, [activeSessionId]);
 
-  const planReady = Boolean(state?.planReadyProposal);
-  const planReadyKey = state?.planReadyProposal
-    ? `${state.sessionId}:${state.planReadyProposal.suggestedBranch}:${state.planReadyProposal.summary ?? ""}`
-    : null;
   const buildCommitOffer = state?.buildCommitOffer ?? null;
   const buildCommitKey = buildCommitOffer
     ? `${state?.sessionId}:${buildCommitOffer.offeredAt}`
     : null;
-  const openStartBuild = useCallback(() => {
-    if (!state?.planReadyProposal) return;
-    setStartBuildOpen(true);
-  }, [state?.planReadyProposal]);
+  const buildIntegrateOffer = state?.buildIntegrateOffer ?? null;
+  const buildIntegrateKey = buildIntegrateOffer
+    ? `${state?.sessionId}:${buildIntegrateOffer.offeredAt}`
+    : null;
 
-  // Auto-open Start Build when the agent proposes plan ready (same pattern as Plan Q&A).
-  useEffect(() => {
-    if (!planning || !planReady || !planReadyKey) {
-      if (!planReady) setStartBuildOpen(false);
-      return;
-    }
-    if (startBuildDismissedKey === planReadyKey) return;
-    if (qaOpen || providerOpen || newProjectOpen || commitBuildOpen) return;
-    setStartBuildOpen(true);
-  }, [
-    planning,
-    planReady,
-    planReadyKey,
-    startBuildDismissedKey,
-    qaOpen,
-    providerOpen,
-    newProjectOpen,
-    commitBuildOpen,
-  ]);
+  const refreshGitStatus = useCallback(() => {
+    void getBridge()?.workspace.gitStatus().then((info) => {
+      if (info) setGitStatus(info);
+    });
+  }, []);
 
   // Auto-open local commit dialog when build checklist is complete.
   useEffect(() => {
@@ -161,7 +143,7 @@ export function App() {
       return;
     }
     if (commitBuildDismissedKey === buildCommitKey) return;
-    if (providerOpen || newProjectOpen || startBuildOpen || qaOpen) return;
+    if (providerOpen || newProjectOpen || qaOpen || integrateBuildOpen) return;
     setCommitBuildOpen(true);
   }, [
     buildCommitOffer,
@@ -169,29 +151,27 @@ export function App() {
     commitBuildDismissedKey,
     providerOpen,
     newProjectOpen,
-    startBuildOpen,
     qaOpen,
+    integrateBuildOpen,
   ]);
 
+  // Auto-open integrate (PR / local merge) after tests (+ commit/skip).
   useEffect(() => {
-    if (!planning || !planReady || startBuildOpen || qaOpen || providerOpen) {
+    if (!buildIntegrateOffer || !buildIntegrateKey) {
+      setIntegrateBuildOpen(false);
       return;
     }
-    const onKey = (e: KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey) || e.key !== "Enter") return;
-      e.preventDefault();
-      e.stopPropagation();
-      openStartBuild();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    if (integrateBuildDismissedKey === buildIntegrateKey) return;
+    if (providerOpen || newProjectOpen || qaOpen || commitBuildOpen) return;
+    setIntegrateBuildOpen(true);
   }, [
-    planning,
-    planReady,
-    startBuildOpen,
-    qaOpen,
+    buildIntegrateOffer,
+    buildIntegrateKey,
+    integrateBuildDismissedKey,
     providerOpen,
-    openStartBuild,
+    newProjectOpen,
+    qaOpen,
+    commitBuildOpen,
   ]);
 
   useEffect(() => {
@@ -343,7 +323,11 @@ export function App() {
   return (
     <div
       className={`app-shell ${
-        phase === "planning" ? "app-shell-planning" : "app-shell-building"
+        phase === "planning"
+          ? "app-shell-planning"
+          : phase === "testing"
+            ? "app-shell-testing"
+            : "app-shell-building"
       }`}
     >
       <header className="chrome">
@@ -355,11 +339,46 @@ export function App() {
           <div className="topbar-right">
             <button
               type="button"
+              className={`provider-hud ${
+                state?.providerHud?.paid ? "provider-hud-paid" : ""
+              } ${!state?.providerHud?.id ? "provider-hud-empty" : ""}`}
+              onClick={openProviderSettings}
+              title={`Active provider (${modShortcutHint("P")})`}
+            >
+              {state?.providerHud?.paid ? (
+                <span className="provider-paid-sign" aria-label="Paid">
+                  $
+                </span>
+              ) : null}
+              <span className="provider-hud-name">
+                {state?.providerHud?.name ?? "No provider"}
+              </span>
+              {state?.providerHud?.model ? (
+                <span className="provider-hud-model">
+                  {state.providerHud.model}
+                </span>
+              ) : null}
+              <span className="provider-hud-usage">
+                in{" "}
+                {formatTokenCount(
+                  state?.providerHud?.session.inputTokens ?? 0,
+                )}{" "}
+                · out{" "}
+                {formatTokenCount(
+                  state?.providerHud?.session.outputTokens ?? 0,
+                )}
+                {state?.providerHud?.paid
+                  ? ` · ${formatUsd(state.providerHud.sessionCostUsd)}`
+                  : ""}
+              </span>
+            </button>
+            <button
+              type="button"
               className="btn btn-secondary btn-sm"
               onClick={openProviderSettings}
               title={`Provider settings (${modShortcutHint("P")})`}
             >
-              Provider · {modShortcutHint("P")}
+              Providers · {modShortcutHint("P")}
             </button>
             <button
               type="button"
@@ -478,6 +497,7 @@ export function App() {
             state={state}
             sessions={sessions}
             activeSessionId={activeSessionId}
+            onBuildStarted={refreshGitStatus}
           />
         </section>
         <section className="pane">
@@ -494,7 +514,6 @@ export function App() {
                 setQaDismissedKey(null);
                 setQaOpen(true);
               }}
-              onConfirmPlan={openStartBuild}
               onOpenArchitecture={openArchitecturePane}
             />
           )}
@@ -515,13 +534,7 @@ export function App() {
       />
 
       <PlanQaDialog
-        open={
-          qaOpen &&
-          qaEligible &&
-          !providerOpen &&
-          !startBuildOpen &&
-          !newProjectOpen
-        }
+        open={qaOpen && qaEligible && !providerOpen && !newProjectOpen}
         questions={openPlanQuestions}
         focusRequestId={qaFocusRequestId}
         onClose={() => {
@@ -531,31 +544,13 @@ export function App() {
         onSubmit={submitPlanAnswers}
       />
 
-      <StartBuildDialog
-        open={startBuildOpen && planReady && !providerOpen && !newProjectOpen}
-        suggestedBranch={
-          state?.planReadyProposal?.suggestedBranch ?? "feat/plan"
-        }
-        summary={state?.planReadyProposal?.summary}
-        onClose={() => {
-          setStartBuildOpen(false);
-          if (planReadyKey) setStartBuildDismissedKey(planReadyKey);
-        }}
-        onConfirmed={() => {
-          setStartBuildOpen(false);
-          void getBridge()?.workspace.gitStatus().then((info) => {
-            if (info) setGitStatus(info);
-          });
-        }}
-      />
-
       <CommitBuildDialog
         open={
           commitBuildOpen &&
           Boolean(buildCommitOffer) &&
           !providerOpen &&
           !newProjectOpen &&
-          !startBuildOpen
+          !integrateBuildOpen
         }
         offer={buildCommitOffer}
         onClose={() => {
@@ -565,6 +560,28 @@ export function App() {
         onCommitted={() => {
           setCommitBuildOpen(false);
           if (buildCommitKey) setCommitBuildDismissedKey(buildCommitKey);
+          void getBridge()?.workspace.gitStatus().then((info) => {
+            if (info) setGitStatus(info);
+          });
+        }}
+      />
+
+      <IntegrateBuildDialog
+        open={
+          integrateBuildOpen &&
+          Boolean(buildIntegrateOffer) &&
+          !providerOpen &&
+          !newProjectOpen &&
+          !commitBuildOpen
+        }
+        offer={buildIntegrateOffer}
+        onClose={() => {
+          setIntegrateBuildOpen(false);
+          if (buildIntegrateKey) setIntegrateBuildDismissedKey(buildIntegrateKey);
+        }}
+        onDone={() => {
+          setIntegrateBuildOpen(false);
+          if (buildIntegrateKey) setIntegrateBuildDismissedKey(buildIntegrateKey);
           void getBridge()?.workspace.gitStatus().then((info) => {
             if (info) setGitStatus(info);
           });
