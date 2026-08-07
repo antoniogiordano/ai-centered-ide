@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MockProvider } from "@ai-ide/provider";
+import { MockProvider, chatContentText } from "@ai-ide/provider";
 import { AppError } from "@ai-ide/shared";
 import {
   CheckpointService,
@@ -828,9 +828,13 @@ describe("agent runtime", () => {
     const compacted = compactProviderMessages(bloated, state, 6);
     expect(compacted[0]?.role).toBe("system");
     expect(compacted[0]?.content).toContain("Next open item: Ship it");
-    expect(compacted.some((m) => m.role === "user" && m.content.includes("Make the app"))).toBe(
-      true,
-    );
+    expect(
+      compacted.some(
+        (m) =>
+          m.role === "user" &&
+          chatContentText(m.content).includes("Make the app"),
+      ),
+    ).toBe(true);
     expect(compacted.length).toBeLessThanOrEqual(1 + 1 + 6);
     expect(compacted[compacted.length - 1]?.role).toBe("tool");
     expect(compacted[compacted.length - 2]?.role).toBe("assistant");

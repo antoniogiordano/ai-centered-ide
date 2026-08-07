@@ -130,7 +130,7 @@ export function formatTestGateForBuildPrompt(
       "- No lint/typecheck/unit commands detected in the architecture profile yet.",
       "- Still write appropriate automated tests for new behavior (match the project stack).",
       "- Do NOT run lint/test/typecheck suites yourself via run_command or terminal_* during Build — after the checklist, call propose_testing_ready so the IDE runs them.",
-      "- Install test runners/deps if the plan needs them; create test files with write_file; leave execution to the IDE gate.",
+      "- Install test runners/deps if the plan needs them; create/edit test files with replace_in_file (edits) or write_file (new files); leave execution to the IDE gate.",
     );
   } else {
     lines.push(
@@ -150,7 +150,7 @@ export function formatTestGateForBuildPrompt(
       "- UI component tests: prefer stable `data-testid` (or role+name that cannot collide). Avoid multiple controls sharing the same accessible name (e.g. family/variant/favorite all named like the opening).",
       "- Do NOT execute these verification commands via run_command or terminal_* during Build (no `npm test`, `pnpm lint`, `vitest`, etc. unless the user explicitly asks).",
       "- Shell is for installs, codegen, app/dev servers, and git — not for pre-empting the IDE Test gate.",
-      "- When the gate fails later: call get_test_report (suite status / platform / pass·fail counts) and list_failed_tests; use read_test_log for raw chunks. The IDE re-runs the suites — do not re-launch the full suite yourself.",
+      "- When the gate fails later (Testing phase): call get_test_report and list_failed_tests; use read_test_log for raw chunks. The IDE re-runs the suites — do not re-launch the full suite yourself.",
       "- If the IDE marks the failure as ESCALATED, change strategy (rewrite brittle tests / coherent test+impl edit). You may run ONLY the single failing suite command from the digest once for diagnosis.",
     );
   }

@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { basename, join } from "node:path";
 import type {
   AgentMode,
+  AttachmentMeta,
+  AttachmentPayload,
   SessionState,
   SessionSummary,
   WorkspaceRef,
@@ -68,6 +70,70 @@ type SessionListener = (event: {
 }) => void;
 
 const ACTIVE_SESSION_KEY = "activeSessionId";
+
+type StoredAttachment = {
+  id: string;
+  kind: "image" | "file";
+  name: string;
+  path?: string;
+  mime?: string;
+  bytes: Buffer;
+};
+
+function resolveAttachmentBytes(att: AttachmentPayload): Buffer | null {
+  if (att.dataBase64) {
+    try {
+      return Buffer.from(att.dataBase64, "base64");
+    } catch {
+      return null;
+    }
+  }
+  if (att.path && existsSync(att.path)) {
+    try {
+      return readFileSync(att.path);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function enrichMessageWithAttachments(
+  content: string,
+  attachments: AttachmentPayload[],
+): string {
+  const parts: string[] = [];
+  const trimmed = content.trim();
+  if (trimmed) parts.push(trimmed);
+
+  const files = attachments.filter((a) => a.kind === "file");
+  const images = attachments.filter((a) => a.kind === "image");
+
+  if (files.length || images.length) {
+    const lines = ["[Attachments]"];
+    for (const f of files) {
+      const loc = f.path ? f.path : f.name;
+      lines.push(`- file id=${f.id} name=${f.name} path=${loc}`);
+      if (f.textPreview?.trim()) {
+        lines.push("```");
+        lines.push(f.textPreview.trim());
+        lines.push("```");
+      } else {
+        lines.push(
+          "  (large or binary — use import_attachment then read_file to page)",
+        );
+      }
+    }
+    for (const img of images) {
+      lines.push(
+        `- image id=${img.id} name=${img.name}${img.path ? ` path=${img.path}` : ""} (vision when supported; use import_attachment to copy into the workspace)`,
+      );
+    }
+    parts.push(lines.join("\n"));
+  }
+
+  return parts.join("\n\n") || "(attachments only)";
+}
 
 function titleFromTurns(turns: SessionState["turns"]): string {
   const firstUser = turns.find((t) => t.role === "user");
@@ -184,9 +250,13 @@ export class SessionManager {
   private testDirtySinceLastRun = true;
   private testGateInFlight = false;
   private testAbort: AbortController | null = null;
+  /** Session-scoped attachment blobs for vision + import_attachment. */
+  private attachmentStore = new Map<string, StoredAttachment>();
 
   private static readonly TEST_MUTATING_TOOLS = new Set([
     "write_file",
+    "replace_in_file",
+    "import_attachment",
     "delete_file",
     "run_command",
     "git_commit",
@@ -1348,7 +1418,10 @@ export class SessionManager {
 
   async sendMessage(
     content: string,
-    options?: { planAnswers?: PlanAnswerInput[] },
+    options?: {
+      planAnswers?: PlanAnswerInput[];
+      attachments?: AttachmentPayload[];
+    },
   ): Promise<void> {
     if (!isSyntheticUserPrompt(content)) {
       this.planningPausedUntilUserMessage = false;
@@ -1376,11 +1449,50 @@ export class SessionManager {
       ? applyPlanAnswers(this.state, options.planAnswers)
       : this.state;
 
+    const incoming = options?.attachments ?? [];
+    const visionImages: Array<{ mime: string; dataBase64: string }> = [];
+    const turnMeta: AttachmentMeta[] = [];
+
+    for (const att of incoming) {
+      const bytes = resolveAttachmentBytes(att);
+      if (!bytes) continue;
+      const stored: StoredAttachment = {
+        id: att.id,
+        kind: att.kind,
+        name: att.name,
+        bytes,
+        ...(att.path ? { path: att.path } : {}),
+        ...(att.mime ? { mime: att.mime } : {}),
+      };
+      this.attachmentStore.set(att.id, stored);
+      const meta: AttachmentMeta = {
+        id: att.id,
+        kind: att.kind,
+        name: att.name,
+        ...(att.path ? { path: att.path } : {}),
+        ...(att.mime ? { mime: att.mime } : {}),
+        ...(att.previewDataUrl ? { previewDataUrl: att.previewDataUrl } : {}),
+      };
+      turnMeta.push(meta);
+      if (att.kind === "image") {
+        visionImages.push({
+          mime: att.mime || "image/png",
+          dataBase64: bytes.toString("base64"),
+        });
+      }
+    }
+
+    const enriched =
+      incoming.length > 0
+        ? enrichMessageWithAttachments(content, incoming)
+        : content;
+
     const userTurn = {
       id: randomUUID(),
       role: "user" as const,
-      content,
+      content: enriched,
       createdAt: new Date().toISOString(),
+      ...(turnMeta.length ? { attachments: turnMeta } : {}),
     };
 
     this.state = {
@@ -1405,10 +1517,11 @@ export class SessionManager {
         this.state.workspace?.projectId ?? "none",
       );
 
-      const result = await runAgentTurn(this.state, content, {
+      const result = await runAgentTurn(this.state, enriched, {
         provider,
         signal: this.abort.signal,
         onProgress: (event) => this.handleProgress(event),
+        ...(visionImages.length ? { visionImages } : {}),
         ...(root
           ? {
               toolCtx: {
@@ -1422,6 +1535,17 @@ export class SessionManager {
                   get: (suiteId: string) => this.testLogs.get(suiteId),
                 },
                 testGate: this.testGateToolApi(),
+                attachments: {
+                  get: (id: string) => this.attachmentStore.get(id),
+                  list: () =>
+                    [...this.attachmentStore.values()].map((a) => ({
+                      id: a.id,
+                      kind: a.kind,
+                      name: a.name,
+                      ...(a.mime ? { mime: a.mime } : {}),
+                      ...(a.path ? { path: a.path } : {}),
+                    })),
+                },
                 audit: (entry: {
                   toolName: string;
                   action: string;
@@ -2211,6 +2335,8 @@ export class SessionManager {
         baseUrl: active.baseUrl,
         apiKey,
         defaultModel: active.defaultModel || "gpt-4o-mini",
+        thinking: active.thinking,
+        reasoningEffort: active.reasoningEffort,
       });
     }
 
@@ -2251,7 +2377,7 @@ export class SessionManager {
       const category =
         name === "git_commit"
           ? "git_commit"
-          : name === "write_file"
+          : name === "write_file" || name === "replace_in_file"
             ? "env_write"
             : "command";
       grants.push({
@@ -2307,6 +2433,17 @@ export class SessionManager {
                   get: (suiteId: string) => this.testLogs.get(suiteId),
                 },
                 testGate: this.testGateToolApi(),
+                attachments: {
+                  get: (id: string) => this.attachmentStore.get(id),
+                  list: () =>
+                    [...this.attachmentStore.values()].map((a) => ({
+                      id: a.id,
+                      kind: a.kind,
+                      name: a.name,
+                      ...(a.mime ? { mime: a.mime } : {}),
+                      ...(a.path ? { path: a.path } : {}),
+                    })),
+                },
                 audit: (entry: {
                   toolName: string;
                   action: string;

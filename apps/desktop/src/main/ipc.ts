@@ -180,10 +180,10 @@ export function registerIpcHandlers(
       answer: a.answer,
       ...(a.selectedOptionIds ? { selectedOptionIds: a.selectedOptionIds } : {}),
     }));
-    await session.sendMessage(
-      req.content,
-      planAnswers ? { planAnswers } : undefined,
-    );
+    await session.sendMessage(req.content, {
+      ...(planAnswers ? { planAnswers } : {}),
+      ...(req.attachments?.length ? { attachments: req.attachments } : {}),
+    });
     return { accepted: true };
   });
 
@@ -709,6 +709,10 @@ export function registerIpcHandlers(
       defaultModel: req.defaultModel,
       paid,
       ...(req.pricing ? { pricing: req.pricing } : {}),
+      ...(req.thinking !== undefined ? { thinking: req.thinking } : {}),
+      ...(req.reasoningEffort
+        ? { reasoningEffort: req.reasoningEffort }
+        : {}),
       ...(req.apiKey.trim() ? { apiKey: req.apiKey } : {}),
       makeActive: req.makeActive !== false,
     });
@@ -736,6 +740,8 @@ export function registerIpcHandlers(
           apiKey: apiKey || null,
           paid: active.paid,
           pricing: active.pricing ?? null,
+          thinking: active.thinking,
+          reasoningEffort: active.reasoningEffort,
         };
       }
     }
@@ -752,6 +758,8 @@ export function registerIpcHandlers(
       apiKey: apiKey ?? null,
       paid: undefined,
       pricing: null,
+      thinking: false,
+      reasoningEffort: "high" as const,
     };
   });
 
@@ -771,6 +779,8 @@ export function registerIpcHandlers(
         baseUrl: p.baseUrl,
         defaultModel: p.defaultModel,
         paid: p.paid,
+        thinking: p.thinking,
+        reasoningEffort: p.reasoningEffort,
         ...(p.pricing ? { pricing: p.pricing } : {}),
       })),
     };

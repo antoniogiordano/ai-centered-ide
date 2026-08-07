@@ -51,6 +51,8 @@ function actionLabel(toolName: string): string {
   switch (toolName) {
     case "write_file":
       return "Write file";
+    case "replace_in_file":
+      return "Replace in file";
     case "run_command":
       return "Run command";
     case "get_test_report":
@@ -131,7 +133,7 @@ function toolTargetPreview(
   return null;
 }
 
-/** Args for the expandable log — keep full write_file content (scrollable in UI). */
+/** Args for the expandable log — keep full write_file / replace_in_file payloads. */
 function formatToolArgsForLog(
   _toolName: string,
   args: Record<string, unknown> | undefined,
@@ -883,6 +885,29 @@ export function ConversationPane(props: {
               {turn.role === "user" ? (
                 <div className="transcript-user">
                   <TranscriptLabel tone="user">You</TranscriptLabel>
+                  {turn.attachments?.length ? (
+                    <div className="transcript-attachments" aria-label="Attachments">
+                      {turn.attachments.map((att) =>
+                        att.kind === "image" && att.previewDataUrl ? (
+                          <img
+                            key={att.id}
+                            className="transcript-thumb"
+                            src={att.previewDataUrl}
+                            alt={att.name}
+                            title={att.name}
+                          />
+                        ) : (
+                          <span
+                            key={att.id}
+                            className="transcript-file-chip"
+                            title={att.path ?? att.name}
+                          >
+                            {att.name}
+                          </span>
+                        ),
+                      )}
+                    </div>
+                  ) : null}
                   <CollapsibleUserText content={turn.content} />
                 </div>
               ) : null}
@@ -990,6 +1015,13 @@ function formatApprovalArgs(toolCall: ToolCall): string | null {
         ? args.content.slice(0, 400)
         : undefined;
     return content ? `${args.path}\n\n${content}` : args.path;
+  }
+  if (toolCall.name === "replace_in_file" && typeof args.path === "string") {
+    const search =
+      typeof args.search === "string" ? args.search.slice(0, 200) : "";
+    const replace =
+      typeof args.replace === "string" ? args.replace.slice(0, 200) : "";
+    return `${args.path}\n\n- ${search}\n+ ${replace}`;
   }
   try {
     const json = JSON.stringify(args, null, 2);
@@ -1155,6 +1187,7 @@ function BuildCockpit(props: {
       for (const call of turn.toolCalls ?? []) {
         if (
           call.name === "write_file" ||
+          call.name === "replace_in_file" ||
           call.name === "run_command" ||
           call.name === "git_commit"
         ) {

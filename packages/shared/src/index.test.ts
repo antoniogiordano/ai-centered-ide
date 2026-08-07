@@ -34,4 +34,20 @@ describe("shared schemas", () => {
       validateIpcRequest(IPC_CHANNELS.SESSION_SEND_MESSAGE, { content: "" }),
     ).toThrow();
   });
+
+  it("accepts attachment-only send messages", () => {
+    const req = validateIpcRequest(IPC_CHANNELS.SESSION_SEND_MESSAGE, {
+      content: "",
+      attachments: [
+        {
+          id: "a1",
+          kind: "image",
+          name: "shot.png",
+          mime: "image/png",
+          dataBase64: "YWJj",
+        },
+      ],
+    });
+    expect(req.attachments?.[0]?.id).toBe("a1");
+  });
 });

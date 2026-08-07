@@ -104,6 +104,8 @@ export class ProviderRegistryStore {
     defaultModel: string;
     paid: boolean;
     pricing?: SavedProvider["pricing"];
+    thinking?: boolean;
+    reasoningEffort?: SavedProvider["reasoningEffort"];
     apiKey?: string;
     makeActive?: boolean;
   }): SavedProvider {
@@ -125,6 +127,9 @@ export class ProviderRegistryStore {
       baseUrl: input.baseUrl.trim(),
       defaultModel: input.defaultModel.trim(),
       paid: Boolean(input.paid),
+      thinking: input.thinking ?? prior?.thinking ?? false,
+      reasoningEffort:
+        input.reasoningEffort ?? prior?.reasoningEffort ?? "high",
       ...(mergedPricing && Object.keys(mergedPricing).length
         ? { pricing: mergedPricing }
         : {}),

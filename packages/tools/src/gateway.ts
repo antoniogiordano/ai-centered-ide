@@ -54,6 +54,26 @@ export type ToolExecutionContext = {
       sameFailureStreak: number;
     };
   };
+  /** User message attachments for import_attachment (session-scoped). */
+  attachments?: {
+    get: (id: string) =>
+      | {
+          id: string;
+          kind: "image" | "file";
+          name: string;
+          mime?: string;
+          path?: string;
+          bytes: Buffer;
+        }
+      | undefined;
+    list: () => Array<{
+      id: string;
+      kind: "image" | "file";
+      name: string;
+      mime?: string;
+      path?: string;
+    }>;
+  };
 };
 
 export type GatewayResult =
@@ -102,7 +122,10 @@ export class ToolGateway {
     const riskLevel = tool.riskLevel ?? getToolRisk(call.name);
     let category: ApprovalCategory = "command";
     if (call.name === "git_commit") category = "git_commit";
-    if (call.name === "write_file" && String(parsed.data.path ?? "").includes(".env")) {
+    if (
+      (call.name === "write_file" || call.name === "replace_in_file") &&
+      String(parsed.data.path ?? "").includes(".env")
+    ) {
       category = "env_write";
     }
 
@@ -120,6 +143,9 @@ export class ToolGateway {
       }
       if (call.name === "write_file") {
         return `Write file: ${String(parsed.data.path ?? "")}`;
+      }
+      if (call.name === "replace_in_file") {
+        return `Replace in file: ${String(parsed.data.path ?? "")}`;
       }
       try {
         const args = JSON.stringify(parsed.data, null, 2);

@@ -105,10 +105,53 @@ export const PlanAnswerSchema = z.object({
 });
 export type PlanAnswer = z.infer<typeof PlanAnswerSchema>;
 
-export const SessionSendMessageRequestSchema = z.object({
-  content: z.string().min(1).max(100_000),
-  planAnswers: z.array(PlanAnswerSchema).optional(),
+/** Max base64 length ≈ 4MB binary (4/3 * 4e6). */
+export const ATTACHMENT_MAX_BASE64_CHARS = 5_600_000;
+export const ATTACHMENT_MAX_COUNT = 10;
+export const ATTACHMENT_MAX_IMAGES = 5;
+
+export const AttachmentPayloadSchema = z.object({
+  id: z.string().min(1),
+  kind: z.enum(["image", "file"]),
+  name: z.string().min(1).max(500),
+  path: z.string().max(4_000).optional(),
+  mime: z.string().max(200).optional(),
+  dataBase64: z.string().max(ATTACHMENT_MAX_BASE64_CHARS).optional(),
+  /** Optional small text preview already inlined by the renderer. */
+  textPreview: z.string().max(20_000).optional(),
+  /** Optional thumbnail data URL for transcript (images). */
+  previewDataUrl: z.string().max(200_000).optional(),
 });
+export type AttachmentPayload = z.infer<typeof AttachmentPayloadSchema>;
+
+export const SessionSendMessageRequestSchema = z
+  .object({
+    content: z.string().max(100_000).default(""),
+    planAnswers: z.array(PlanAnswerSchema).optional(),
+    attachments: z
+      .array(AttachmentPayloadSchema)
+      .max(ATTACHMENT_MAX_COUNT)
+      .optional(),
+  })
+  .superRefine((val, ctx) => {
+    const hasText = val.content.trim().length > 0;
+    const hasAtt = (val.attachments?.length ?? 0) > 0;
+    if (!hasText && !hasAtt) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Message must include text or attachments.",
+        path: ["content"],
+      });
+    }
+    const images = (val.attachments ?? []).filter((a) => a.kind === "image");
+    if (images.length > ATTACHMENT_MAX_IMAGES) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `At most ${ATTACHMENT_MAX_IMAGES} images per message.`,
+        path: ["attachments"],
+      });
+    }
+  });
 export type SessionSendMessageRequest = z.infer<
   typeof SessionSendMessageRequestSchema
 >;
@@ -817,6 +860,8 @@ export const ProviderSaveConfigRequestSchema = z.object({
       outputPer1M: z.number().nonnegative().optional(),
     })
     .optional(),
+  thinking: z.boolean().optional(),
+  reasoningEffort: z.enum(["low", "high", "max"]).optional(),
   makeActive: z.boolean().optional(),
 });
 export type ProviderSaveConfigRequest = z.infer<
@@ -850,6 +895,8 @@ export const ProviderGetConfigResponseSchema = z.object({
     })
     .nullable()
     .optional(),
+  thinking: z.boolean().optional(),
+  reasoningEffort: z.enum(["low", "high", "max"]).optional(),
 });
 export type ProviderGetConfigResponse = z.infer<
   typeof ProviderGetConfigResponseSchema
@@ -867,6 +914,8 @@ export const ProviderListResponseSchema = z.object({
       baseUrl: z.string(),
       defaultModel: z.string(),
       paid: z.boolean(),
+      thinking: z.boolean().optional(),
+      reasoningEffort: z.enum(["low", "high", "max"]).optional(),
       pricing: z
         .object({
           inputPer1M: z.number().nonnegative().optional(),

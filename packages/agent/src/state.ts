@@ -21,9 +21,12 @@ import {
   isTestGateSyntheticPrompt,
   formatTestGateForBuildPrompt,
   formatTestGateEscalationSystemRules,
+  deriveProductPhase,
+  type ProductPhase,
 } from "@ai-ide/shared";
 import { ArchitectureStore } from "@ai-ide/workspace";
 import type { ChatMessage } from "@ai-ide/provider";
+import { chatContentText } from "@ai-ide/provider";
 
 export type TurnPhase =
   | "idle"
@@ -221,8 +224,8 @@ export function buildSystemPrompt(state: SessionState): string {
 
   const planningRules = [
     "PHASE: PLANNING — the plan is being created (not executed).",
-    "Available tools: when indexed — search_graph / search_code / get_architecture / get_code_snippet / trace_path (primary), plus list_dir/read_file/search_text (fallback), plus read_architecture, upsert_architecture, read_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, upsert_plan (full rewrite), propose_plan_ready.",
-    "Unavailable: write_file, git_*, run_command, terminal_*, checkpoint_restore.",
+    "Available tools: when indexed — search_graph / search_code / get_architecture / get_code_snippet / trace_path (primary), plus list_dir/read_file/search_text (fallback), plus read_architecture, upsert_architecture, import_attachment (copy chat attachments into the workspace), read_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, upsert_plan (full rewrite), propose_plan_ready.",
+    "Unavailable: write_file, replace_in_file, git_*, run_command, terminal_*, checkpoint_restore, get_test_report, list_failed_tests, read_test_log.",
     "IMPORTANT: Never tell the user you cannot run shell commands. Commands run only after Start Build. When the user asks to run npm/git/shell now, call propose_plan_ready so the IDE can switch to Build — then you will get run_command / terminal_*.",
     "",
     architectureBlock,
@@ -269,6 +272,10 @@ export function buildSystemPrompt(state: SessionState): string {
     ...(escalationBlock ? [escalationBlock] : []),
     "The plan structure was agreed in planning. Implement it phase by phase using tools (including write/git/commands/terminals).",
     "On the first build turn after Start Build: take action immediately — run tools for the first incomplete checklist item. Do not only acknowledge Build mode.",
+    "File edits (critical — prefer surgical changes):",
+    "- For changes to an EXISTING file: ALWAYS use replace_in_file (exact search→replace). Include enough context so search matches once. Use replaceAll only when intentional.",
+    "- Use write_file ONLY to create a new file, or when you intentionally overwrite an entire existing file.",
+    "- Do not rewrite whole files with write_file for small edits — it wastes tokens and risks drift.",
     "Code reading (critical — do not use the shell as a file browser):",
     "- When indexed: search_graph → get_code_snippet / trace_path / search_code first. Do not discover files via repeated list_dir.",
     "- For a known path (from graph or user): use read_file / list_dir / search_text. NEVER run cat/ls/head/find via run_command to inspect source — those commands are blocked.",
@@ -298,7 +305,7 @@ export function buildSystemPrompt(state: SessionState): string {
     "- Always pass the full phases array with the same ids/titles/texts; change only done and status.",
     "- Prefer focusing on Focus → Next open item, then mark it done. If you genuinely finished several checklist items in the same round, you MAY flip multiple done=true in one upsert_plan (keep prior done items true).",
     "- RESUME / same chat: items already marked [x] / done=true are authoritative progress. Do NOT reset them or redo the whole plan from scratch. Continue from Focus → Next open item. You may briefly verify a done item still holds; if something is wrong, fix the code — leave the check done=true.",
-    "- After the checklist is fully done, call propose_testing_ready (do not only narrate). The IDE then runs the Test gate before offering commit. If it fails: get_test_report (counts/platform per suite) → list_failed_tests → read_test_log only if needed. Do not invent a parallel test phase unless the plan already required it.",
+    "- After the checklist is fully done, call propose_testing_ready (do not only narrate). That enters Testing — the IDE runs the Test gate. get_test_report / list_failed_tests / read_test_log are Testing-only tools (not available here).",
     "- Update phase status (in_progress / completed) as work moves forward. Do not reopen completed phases without cause.",
     "Keep the plan truthful: only mark items done when the work is actually done (including required test files written, not executed).",
     "TANK MODE: while any checklist item is open, NEVER stop with prose only — keep calling tools (upsert_plan progress + implementation) until every item is done=true and phases are completed. The IDE will keep re-prompting forever until the checklist is complete (or the user hits Stop). No waiting for the user.",
@@ -306,10 +313,30 @@ export function buildSystemPrompt(state: SessionState): string {
     formatPlanForPrompt(state),
   ];
 
+  const testingRules = [
+    "PHASE: TESTING — checklist is closed. Verify failures and bug-fix until the IDE Test gate passes.",
+    architectureBlock,
+    testGateBlock,
+    ...(escalationBlock ? [escalationBlock] : []),
+    "Plan is READ-ONLY: use read_plan if you need context. Do NOT call upsert_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, or checkpoint_restore.",
+    "Start with get_test_report (and list_failed_tests). Use read_test_log only when you need raw log chunks.",
+    "Fix with replace_in_file (preferred) or write_file (new / full rewrite). You may use git_*, run_command, and terminal_* for diagnosis — do NOT re-launch the full IDE Test gate suites yourself; the IDE re-runs them after your fixes.",
+    "File edits (critical — prefer surgical changes):",
+    "- For changes to an EXISTING file: ALWAYS use replace_in_file (exact search→replace). Include enough context so search matches once.",
+    "- Use write_file ONLY to create a new file, or when you intentionally overwrite an entire existing file.",
+    "Code reading: when indexed prefer search_graph / get_code_snippet; otherwise read_file / search_text. Never cat/ls/find via shell.",
+    "Keep going until failures are fixed — prefer tools over narration.",
+    formatPlanForPrompt(state),
+  ];
+
   return [
     ...identity,
     ...workspaceLine,
-    ...(planning ? planningRules : buildRules),
+    ...(phase === "planning"
+      ? planningRules
+      : phase === "testing"
+        ? testingRules
+        : buildRules),
   ].join("\n");
 }
 
@@ -323,7 +350,8 @@ export function buildContext(state: SessionState, userMessage: string): Turn[] {
   };
 
   const building = productPhaseForState(state) === "building";
-  if (!building) {
+  const testing = productPhaseForState(state) === "testing";
+  if (!building && !testing) {
     const history = state.turns.filter(
       (t) => t.role === "user" || t.role === "assistant",
     );
@@ -457,7 +485,12 @@ export function compactProviderMessages(
 
   const body = messages.filter((m) => {
     if (m.role === "system") return false;
-    if (m.role === "user" && m.content.startsWith("Original goal:")) return false;
+    if (
+      m.role === "user" &&
+      chatContentText(m.content).startsWith("Original goal:")
+    ) {
+      return false;
+    }
     return true;
   });
   const tail = takeSafeMessageTail(body, tailMax);
@@ -553,6 +586,20 @@ export function applyUpsertPlan(
   }
 
   const planning = productPhaseForState(state) === "planning";
+
+  if (productPhaseForState(state) === "testing") {
+    return {
+      callId,
+      state,
+      result: {
+        callId,
+        success: false,
+        summary:
+          "Plan is frozen in Testing — use read_plan only. Fix failures with replace_in_file / write_file; do not mutate the checklist.",
+        error: "Plan read-only in Testing",
+      },
+    };
+  }
 
   if (!planning) {
     return applyBuildPlanProgress(state, rawPhases, args, callId);
@@ -1751,11 +1798,9 @@ export type PlanMutationPatch = {
 };
 
 export function productPhaseForState(
-  state: Pick<SessionState, "mode" | "planStatus" | "sessionKind">,
-): "planning" | "building" {
-  void state.sessionKind;
-  if (state.mode === "plan" || state.planStatus === "drafting") return "planning";
-  return "building";
+  state: Parameters<typeof deriveProductPhase>[0],
+): ProductPhase {
+  return deriveProductPhase(state);
 }
 
 /** True when build plan still has unfinished checklist items or open phases. */
@@ -1782,11 +1827,16 @@ export function hasOpenPlanQuestions(
  * Keep the agent loop running without user input:
  * - building: until checklist/phases are complete
  * - planning (mode=plan): until propose_plan_ready (Start Build) or open questions await the user
+ * - testing: while the gate is running/failed and commit is not yet offered (fix loop)
  */
 export function isAgentTankMode(state: SessionState): boolean {
   const phase = productPhaseForState(state);
   if (phase === "building") {
     return sharedPlanHasOpenWork(state);
+  }
+  if (phase === "testing") {
+    // Stay in tank while verifying / fixing until commit/PR offer appears.
+    return !state.buildCommitOffer && !state.buildIntegrateOffer;
   }
   // Only the Plan workflow tanks — not casual ask/autonomous with drafting status.
   if (phase === "planning" && state.mode === "plan") {
@@ -1805,7 +1855,7 @@ export const CHECKLIST_CONTINUE_NUDGE = [
   "Write required test files as you implement; do NOT run lint/test/typecheck suites yourself — the IDE Test gate runs after the checklist.",
   "Immediately with tools:",
   "1) upsert_plan: set finished items done=true (keep prior done=true); update phase status.",
-  "2) Execute the next open checklist item with read_file / write_file / tools. For Node/npm sequences: reuse ONE terminal_* session (do not reopen per command). run_command only for short one-shots (not test suites).",
+  "2) Execute the next open checklist item with read_file / replace_in_file (preferred for edits) / write_file (new or full rewrite) / tools. For Node/npm sequences: reuse ONE terminal_* session (do not reopen per command). run_command only for short one-shots (not test suites).",
   "Prefer tools over narration. Keep going until the checklist is fully done.",
 ].join("\n");
 
@@ -1816,6 +1866,16 @@ export const PLAN_CONTINUE_NUDGE = [
   "2) If anything is unclear, set_questions with selection + options (Plan Q&A UI).",
   "3) When the plan is solid and questions are cleared, call propose_plan_ready.",
   "Do not only explore/list files. Produce plan structure or questions now.",
+].join("\n");
+
+export const TEST_CONTINUE_NUDGE = [
+  "[IDE · TANK] Testing is not finished — do not stop on narration.",
+  "Plan is frozen (read_plan only). No upsert_plan / phase CRUD / checkpoint_restore.",
+  "Immediately with tools:",
+  "1) get_test_report (+ list_failed_tests). read_test_log only if you need raw chunks.",
+  "2) Fix with replace_in_file (preferred) or write_file (new / full rewrite).",
+  "3) Do not re-run the full IDE Test gate suites yourself — the IDE re-runs after your fixes.",
+  "Prefer tools over narration until the gate passes.",
 ].join("\n");
 
 export {

@@ -43,6 +43,10 @@ export function OnboardingWizard(props: {
   const [paid, setPaid] = useState(false);
   const [inputPer1M, setInputPer1M] = useState("");
   const [outputPer1M, setOutputPer1M] = useState("");
+  const [thinking, setThinking] = useState(false);
+  const [reasoningEffort, setReasoningEffort] = useState<"low" | "high" | "max">(
+    "high",
+  );
   const [busy, setBusy] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -58,6 +62,8 @@ export function OnboardingWizard(props: {
     paid,
     inputPer1M,
     outputPer1M,
+    thinking,
+    reasoningEffort,
     editingId,
     providers,
     onCancel,
@@ -73,6 +79,8 @@ export function OnboardingWizard(props: {
     paid,
     inputPer1M,
     outputPer1M,
+    thinking,
+    reasoningEffort,
     editingId,
     providers,
     onCancel,
@@ -112,6 +120,8 @@ export function OnboardingWizard(props: {
             ? String(cfg.pricing.outputPer1M)
             : "",
         );
+        setThinking(Boolean(cfg?.thinking));
+        setReasoningEffort(cfg?.reasoningEffort ?? "high");
         setModel(cfg?.defaultModel ?? "");
         setModels([]);
         setEditingId(cfg?.id ?? null);
@@ -136,6 +146,8 @@ export function OnboardingWizard(props: {
     setPaid(false);
     setInputPer1M("");
     setOutputPer1M("");
+    setThinking(false);
+    setReasoningEffort("high");
     setError(null);
     setStep("baseUrl");
   }
@@ -162,6 +174,8 @@ export function OnboardingWizard(props: {
           ? String(cfg.pricing.outputPer1M)
           : "",
       );
+      setThinking(Boolean(cfg?.thinking));
+      setReasoningEffort(cfg?.reasoningEffort ?? "high");
       setStep("baseUrl");
       await refreshList();
     } finally {
@@ -273,6 +287,8 @@ export function OnboardingWizard(props: {
         defaultModel: s.model.trim(),
         paid: s.paid,
         ...(pricing && Object.keys(pricing).length ? { pricing } : {}),
+        thinking: s.thinking,
+        reasoningEffort: s.reasoningEffort,
         makeActive: true,
       });
       await refreshList();
@@ -328,6 +344,34 @@ export function OnboardingWizard(props: {
           e.preventDefault();
           void activate(stateRef.current.providers[digit - 1]!.id);
           return;
+        }
+      }
+
+      if (
+        stateRef.current.step === "model" &&
+        !isTypingTarget(e.target)
+      ) {
+        if (e.key.toLowerCase() === "t") {
+          e.preventDefault();
+          setThinking((v) => !v);
+          return;
+        }
+        if (stateRef.current.thinking) {
+          if (e.key === "1") {
+            e.preventDefault();
+            setReasoningEffort("low");
+            return;
+          }
+          if (e.key === "2") {
+            e.preventDefault();
+            setReasoningEffort("high");
+            return;
+          }
+          if (e.key === "3") {
+            e.preventDefault();
+            setReasoningEffort("max");
+            return;
+          }
         }
       }
 
@@ -581,6 +625,48 @@ export function OnboardingWizard(props: {
                   onChange={(e) => setOutputPer1M(e.target.value)}
                 />
               </label>
+            </div>
+          ) : null}
+
+          <label className="start-build-check" style={{ marginTop: 12 }}>
+            <input
+              type="checkbox"
+              checked={thinking}
+              onChange={(e) => setThinking(e.target.checked)}
+            />
+            <span>
+              Thinking mode · T — DeepSeek-style chain-of-thought (
+              <code>thinking</code> + <code>reasoning_effort</code>)
+            </span>
+          </label>
+
+          {thinking ? (
+            <div className="provider-effort-row" role="group" aria-label="Reasoning effort">
+              {(
+                [
+                  ["low", "1"],
+                  ["high", "2"],
+                  ["max", "3"],
+                ] as const
+              ).map(([value, sc]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={
+                    reasoningEffort === value
+                      ? "btn btn-sm"
+                      : "btn btn-secondary btn-sm"
+                  }
+                  onClick={() => setReasoningEffort(value)}
+                >
+                  {value === "low"
+                    ? "Low"
+                    : value === "high"
+                      ? "High"
+                      : "Max"}{" "}
+                  · {sc}
+                </button>
+              ))}
             </div>
           ) : null}
 

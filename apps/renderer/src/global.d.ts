@@ -52,6 +52,16 @@ export type DesktopBridge = {
           answer: string;
           selectedOptionIds?: string[];
         }>;
+        attachments?: Array<{
+          id: string;
+          kind: "image" | "file";
+          name: string;
+          path?: string;
+          mime?: string;
+          dataBase64?: string;
+          textPreview?: string;
+          previewDataUrl?: string;
+        }>;
       },
     ) => Promise<SessionSendMessageResponse>;
     setMode: (mode: string) => Promise<SessionSetModeResponse>;
@@ -173,6 +183,8 @@ export type DesktopBridge = {
       defaultModel: string;
       paid?: boolean;
       pricing?: { inputPer1M?: number; outputPer1M?: number };
+      thinking?: boolean;
+      reasoningEffort?: "low" | "high" | "max";
       makeActive?: boolean;
     }) => Promise<ProviderSaveConfigResponse>;
   };

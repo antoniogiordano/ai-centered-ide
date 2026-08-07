@@ -1,6 +1,7 @@
 import { AppError } from "@ai-ide/shared";
 import {
   assertHttpsForRemote,
+  chatContentText,
   DEFAULT_TIMEOUT_MS,
   providerUrl,
   withRetry,
@@ -12,12 +13,18 @@ import {
   type ModelInfo,
 } from "./types.js";
 
+export type ReasoningEffort = "low" | "high" | "max";
+
 export type OpenAiProviderConfig = {
   baseUrl: string;
   apiKey: string;
   defaultModel?: string;
   timeoutMs?: number;
   extraHeaders?: Record<string, string>;
+  /** DeepSeek-style thinking / chain-of-thought. */
+  thinking?: boolean;
+  /** Effort when thinking is enabled. */
+  reasoningEffort?: ReasoningEffort;
 };
 
 type ToolCallAccumulator = {
@@ -28,6 +35,8 @@ type ToolCallAccumulator = {
 
 export class OpenAiCompatibleProvider implements AiProvider {
   private abortController: AbortController | null = null;
+  /** Cached after first vision rejection — skip image_url on later turns. */
+  private visionSupported: boolean | null = null;
 
   constructor(private readonly config: OpenAiProviderConfig) {
     assertHttpsForRemote(config.baseUrl);
@@ -72,39 +81,11 @@ export class OpenAiCompatibleProvider implements AiProvider {
     const url = providerUrl(this.config.baseUrl, "/v1/chat/completions");
     const model = options?.model ?? this.config.defaultModel ?? "gpt-4o-mini";
 
-    const body: Record<string, unknown> = {
-      model,
-      messages: messages.map(toOpenAiMessage),
-      stream: true,
-    };
-    // Many local servers reject unknown fields; cloud OpenAI-compatible APIs
-    // need this to emit a final usage chunk on the stream.
-    try {
-      const host = new URL(this.config.baseUrl).hostname;
-      const local =
-        host === "localhost" || host === "127.0.0.1" || host === "::1";
-      if (!local) {
-        body.stream_options = { include_usage: true };
-      }
-    } catch {
-      body.stream_options = { include_usage: true };
-    }
-    if (options?.tools?.length) {
-      body.tools = options.tools.map((t) => ({
-        type: "function",
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters,
-        },
-      }));
-      body.tool_choice = "auto";
-      // gpt-5 / reasoning models reject tools unless reasoning_effort is none
-      // on /v1/chat/completions (otherwise they require /v1/responses).
-      if (requiresReasoningEffortNoneWithTools(model)) {
-        body.reasoning_effort = "none";
-      }
-    }
+    const hasVision = messagesHaveVision(messages);
+    const tryVision = hasVision && this.visionSupported !== false;
+    let activeMessages =
+      hasVision && !tryVision ? flattenVisionToText(messages) : messages;
+    let body = this.buildChatBody(activeMessages, model, options);
 
     let response: Response;
     try {
@@ -119,6 +100,40 @@ export class OpenAiCompatibleProvider implements AiProvider {
     } catch (error) {
       yield { type: "error", error: this.toAppError(error) };
       return;
+    }
+
+    if (!response.ok && tryVision) {
+      const errText = await response.text();
+      if (isVisionUnsupportedError(response.status, errText)) {
+        this.visionSupported = false;
+        activeMessages = flattenVisionToText(messages);
+        body = this.buildChatBody(activeMessages, model, options);
+        try {
+          response = await withRetry(() =>
+            this.fetchWithTimeout(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+              signal,
+            }),
+          );
+        } catch (error) {
+          yield { type: "error", error: this.toAppError(error) };
+          return;
+        }
+      } else {
+        yield {
+          type: "error",
+          error: new AppError({
+            code: "PROVIDER_ERROR",
+            userMessage: formatHttpUserMessage(response.status, errText),
+            technicalDetail: `HTTP ${response.status}: ${errText.slice(0, 4000)}`,
+          }),
+        };
+        return;
+      }
+    } else if (tryVision && response.ok) {
+      this.visionSupported = true;
     }
 
     if (!response.ok) {
@@ -186,6 +201,7 @@ export class OpenAiCompatibleProvider implements AiProvider {
                 finish_reason?: string | null;
                 delta?: {
                   content?: string | null;
+                  reasoning_content?: string | null;
                   tool_calls?: Array<{
                     index?: number;
                     id?: string;
@@ -204,6 +220,9 @@ export class OpenAiCompatibleProvider implements AiProvider {
             const choice = parsed.choices?.[0];
             if (choice?.finish_reason) finishReason = choice.finish_reason;
             const delta = choice?.delta;
+            if (delta?.reasoning_content) {
+              yield { type: "reasoning", delta: delta.reasoning_content };
+            }
             if (delta?.content) yield { type: "content", delta: delta.content };
             for (const tc of delta?.tool_calls ?? []) {
               const index = tc.index ?? 0;
@@ -256,6 +275,52 @@ export class OpenAiCompatibleProvider implements AiProvider {
     this.abortController?.abort();
   }
 
+  private buildChatBody(
+    messages: ChatMessage[],
+    model: string,
+    options?: ChatOptions,
+  ): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      model,
+      messages: messages.map(toOpenAiMessage),
+      stream: true,
+    };
+    // Many local servers reject unknown fields; cloud OpenAI-compatible APIs
+    // need this to emit a final usage chunk on the stream.
+    try {
+      const host = new URL(this.config.baseUrl).hostname;
+      const local =
+        host === "localhost" || host === "127.0.0.1" || host === "::1";
+      if (!local) {
+        body.stream_options = { include_usage: true };
+      }
+    } catch {
+      body.stream_options = { include_usage: true };
+    }
+    applyProviderThinkingFields(body, {
+      ...(this.config.thinking !== undefined
+        ? { thinking: this.config.thinking }
+        : {}),
+      ...(this.config.reasoningEffort !== undefined
+        ? { reasoningEffort: this.config.reasoningEffort }
+        : {}),
+      model,
+      hasTools: Boolean(options?.tools?.length),
+    });
+    if (options?.tools?.length) {
+      body.tools = options.tools.map((t) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters,
+        },
+      }));
+      body.tool_choice = "auto";
+    }
+    return body;
+  }
+
   private fetchWithTimeout(
     url: string,
     init: RequestInit,
@@ -286,14 +351,9 @@ export class OpenAiCompatibleProvider implements AiProvider {
 
   private async httpError(response: Response): Promise<AppError> {
     const text = await response.text();
-    const providerMessage = extractProviderErrorMessage(text);
-    const statusHint = httpStatusHint(response.status);
-    const userMessage = providerMessage
-      ? `Provider error (HTTP ${response.status}): ${providerMessage}`
-      : `Provider error (HTTP ${response.status})${statusHint ? `: ${statusHint}` : "."}`;
     return new AppError({
       code: "PROVIDER_ERROR",
-      userMessage,
+      userMessage: formatHttpUserMessage(response.status, text),
       technicalDetail: `HTTP ${response.status}: ${text.slice(0, 4000)}`,
     });
   }
@@ -315,6 +375,58 @@ export class OpenAiCompatibleProvider implements AiProvider {
       cause: error,
     });
   }
+}
+
+function formatHttpUserMessage(status: number, body: string): string {
+  const providerMessage = extractProviderErrorMessage(body);
+  const statusHint = httpStatusHint(status);
+  return providerMessage
+    ? `Provider error (HTTP ${status}): ${providerMessage}`
+    : `Provider error (HTTP ${status})${statusHint ? `: ${statusHint}` : "."}`;
+}
+
+/** True when any user/system message includes image_url parts. */
+export function messagesHaveVision(messages: ChatMessage[]): boolean {
+  for (const m of messages) {
+    if (m.role !== "user" && m.role !== "system") continue;
+    if (typeof m.content === "string") continue;
+    if (m.content.some((p) => p.type === "image_url")) return true;
+  }
+  return false;
+}
+
+/** Drop image parts; keep text + a note so the agent can import_attachment. */
+export function flattenVisionToText(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((m) => {
+    if (m.role !== "user" && m.role !== "system") return m;
+    if (typeof m.content === "string") return m;
+    const imageCount = m.content.filter((p) => p.type === "image_url").length;
+    const text = chatContentText(m.content);
+    if (imageCount === 0) return { ...m, content: text };
+    const note = `\n\n[IDE] ${imageCount} image(s) were attached but this model/endpoint cannot view images (no vision). The pixels were NOT sent to you — only this text. Ask the user to describe the screenshot, or use import_attachment if you need the file bytes in the workspace.`;
+    return { role: m.role, content: `${text}${note}` };
+  });
+}
+
+export function isVisionUnsupportedError(
+  status: number,
+  body: string,
+): boolean {
+  if (status !== 400 && status !== 422) return false;
+  const b = body.toLowerCase();
+  if (b.includes("image_url") && b.includes("unknown variant")) return true;
+  if (b.includes("image_url") && b.includes("expected") && b.includes("text")) {
+    return true;
+  }
+  if (
+    (b.includes("vision") || b.includes("image")) &&
+    (b.includes("not support") ||
+      b.includes("unsupported") ||
+      b.includes("does not support"))
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function extractProviderErrorMessage(body: string): string | null {
@@ -377,6 +489,31 @@ export function requiresReasoningEffortNoneWithTools(model: string): boolean {
   );
 }
 
+/**
+ * Mutates chat body with DeepSeek-style thinking and/or gpt-5 tools workaround.
+ * Only sets thinking fields when enabled (avoid 400s on non-DeepSeek endpoints).
+ */
+export function applyProviderThinkingFields(
+  body: Record<string, unknown>,
+  opts: {
+    thinking?: boolean;
+    reasoningEffort?: ReasoningEffort;
+    model: string;
+    hasTools: boolean;
+  },
+): void {
+  if (opts.thinking) {
+    body.thinking = { type: "enabled" };
+    body.reasoning_effort = opts.reasoningEffort ?? "high";
+    return;
+  }
+  // gpt-5 / reasoning models reject tools unless reasoning_effort is none
+  // on /v1/chat/completions (otherwise they require /v1/responses).
+  if (opts.hasTools && requiresReasoningEffortNoneWithTools(opts.model)) {
+    body.reasoning_effort = "none";
+  }
+}
+
 function toOpenAiMessage(message: ChatMessage): Record<string, unknown> {
   if (message.role === "tool") {
     return {
@@ -397,10 +534,16 @@ function toOpenAiMessage(message: ChatMessage): Record<string, unknown> {
         function: { name: tc.name, arguments: tc.arguments },
       }));
     }
+    if (message.reasoning_content) {
+      out.reasoning_content = message.reasoning_content;
+    }
     return out;
   }
   return { role: message.role, content: message.content };
 }
+
+/** @internal exported for tests */
+export { toOpenAiMessage };
 
 export function parseSseDataLines(raw: string): string[] {
   return raw

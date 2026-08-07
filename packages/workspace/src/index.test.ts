@@ -65,6 +65,47 @@ describe("FilesystemService", () => {
     rmSync(dir, { recursive: true });
   });
 
+  it("patch replaces a unique substring", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const fs = new FilesystemService(dir);
+    fs.write("a.ts", "const x = 1;\nconst y = 2;\n");
+    expect(fs.patch("a.ts", "const y = 2;", "const y = 3;")).toEqual({
+      matches: 1,
+    });
+    expect(fs.read("a.ts")).toBe("const x = 1;\nconst y = 3;\n");
+    rmSync(dir, { recursive: true });
+  });
+
+  it("patch rejects ambiguous search unless replaceAll", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const fs = new FilesystemService(dir);
+    fs.write("a.ts", "foo\nfoo\n");
+    expect(() => fs.patch("a.ts", "foo", "bar")).toThrow(/matched 2 times/);
+    expect(fs.patch("a.ts", "foo", "bar", { replaceAll: true })).toEqual({
+      matches: 2,
+    });
+    expect(fs.read("a.ts")).toBe("bar\nbar\n");
+    rmSync(dir, { recursive: true });
+  });
+
+  it("patch does not interpret $ in replace", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const fs = new FilesystemService(dir);
+    fs.write("a.ts", "price");
+    fs.patch("a.ts", "price", "$1.00");
+    expect(fs.read("a.ts")).toBe("$1.00");
+    rmSync(dir, { recursive: true });
+  });
+
+  it("writeBinary writes attachment bytes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const fs = new FilesystemService(dir);
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    fs.writeBinary("shot.png", bytes);
+    expect(existsSync(join(dir, "shot.png"))).toBe(true);
+    rmSync(dir, { recursive: true });
+  });
+
   it("readWindow pages lines and reports nextStartLine", async () => {
     const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
     const fs = new FilesystemService(dir);

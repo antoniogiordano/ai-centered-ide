@@ -12,17 +12,46 @@ export type AssistantToolCall = {
   arguments: string;
 };
 
+export type TextContentPart = {
+  type: "text";
+  text: string;
+};
+
+export type ImageUrlContentPart = {
+  type: "image_url";
+  image_url: { url: string };
+};
+
+export type ContentPart = TextContentPart | ImageUrlContentPart;
+
+export type UserOrSystemContent = string | ContentPart[];
+
 export type ChatMessage =
-  | { role: "system" | "user"; content: string }
+  | { role: "system" | "user"; content: UserOrSystemContent }
   | {
       role: "assistant";
       content: string | null;
       tool_calls?: AssistantToolCall[];
+      /**
+       * DeepSeek-style chain-of-thought. Must be echoed back on later turns
+       * when the assistant message included tool_calls (else HTTP 400).
+       */
+      reasoning_content?: string;
     }
   | { role: "tool"; tool_call_id: string; content: string };
 
+/** Flatten text from multimodal content for compaction / goal heuristics. */
+export function chatContentText(content: UserOrSystemContent): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((p): p is TextContentPart => p.type === "text")
+    .map((p) => p.text)
+    .join("\n");
+}
+
 export type ChatChunk =
   | { type: "content"; delta: string }
+  | { type: "reasoning"; delta: string }
   | {
       type: "tool_call";
       id: string;

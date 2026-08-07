@@ -13,6 +13,9 @@ export const ProviderUsageSchema = z.object({
 });
 export type ProviderUsage = z.infer<typeof ProviderUsageSchema>;
 
+export const ReasoningEffortSchema = z.enum(["low", "high", "max"]);
+export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
+
 export const SavedProviderSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1).max(80),
@@ -21,6 +24,13 @@ export const SavedProviderSchema = z.object({
   /** Paid / metered endpoint — show $ in the HUD. */
   paid: z.boolean().default(false),
   pricing: ProviderPricingSchema.optional(),
+  /**
+   * DeepSeek-style thinking / chain-of-thought.
+   * When true, requests send `thinking: { type: "enabled" }` + `reasoning_effort`.
+   */
+  thinking: z.boolean().default(false),
+  /** Effort when thinking is on (DeepSeek maps these per model). */
+  reasoningEffort: ReasoningEffortSchema.default("high"),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 });
@@ -168,6 +178,8 @@ export function migrateLegacyProviderConfig(
     baseUrl,
     defaultModel: model,
     paid,
+    thinking: false,
+    reasoningEffort: "high",
     createdAt: now,
     updatedAt: now,
   });

@@ -87,6 +87,7 @@ export function PlanQaDialog(props: {
   focusRequestId?: number;
 }) {
   const { open, questions, onClose, onSubmit, focusRequestId = 0 } = props;
+  const dialogRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
   const [step, setStep] = useState<Step>(0);
   const [drafts, setDrafts] = useState<Record<string, DraftAnswer>>({});
@@ -127,6 +128,10 @@ export function PlanQaDialog(props: {
     setDrafts(next);
   }, [open, questionIds]);
 
+  const focusDialog = useCallback(() => {
+    dialogRef.current?.focus({ preventScroll: true });
+  }, []);
+
   const focusText = useCallback(() => {
     const el = textRef.current;
     if (!el) return;
@@ -135,9 +140,22 @@ export function PlanQaDialog(props: {
     el.setSelectionRange(len, len);
   }, []);
 
+  // Steal focus from the composer so A–Z / 1–9 aren't treated as typing there.
+  useEffect(() => {
+    if (!open) return;
+    const id = window.requestAnimationFrame(() => {
+      // Don't yank focus out of the custom-answer field while the user types.
+      if (document.activeElement === textRef.current) return;
+      focusDialog();
+    });
+    return () => window.cancelAnimationFrame(id);
+  }, [open, questionIds, step, focusDialog]);
+
+  // Explicit focus request (⌘I / Focus Composer while Q&A is open) → textarea.
   useEffect(() => {
     if (!open || focusRequestId <= 0) return;
-    requestAnimationFrame(() => focusText());
+    const id = window.requestAnimationFrame(() => focusText());
+    return () => window.cancelAnimationFrame(id);
   }, [open, focusRequestId, focusText]);
 
   const current =
@@ -278,17 +296,19 @@ export function PlanQaDialog(props: {
       }
 
       const target = e.target as HTMLElement | null;
-      const typingInField =
-        target?.tagName === "TEXTAREA" ||
-        target?.tagName === "INPUT" ||
-        Boolean(target?.isContentEditable);
+      const typingInDialogField =
+        Boolean(target) &&
+        Boolean(dialogRef.current?.contains(target)) &&
+        (target!.tagName === "TEXTAREA" ||
+          target!.tagName === "INPUT" ||
+          Boolean(target!.isContentEditable));
 
       if (ctx.step === "recap") {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
           e.stopPropagation();
           void confirmRecap();
-        } else if (e.key === "Backspace" && !typingInField) {
+        } else if (e.key === "Backspace" && !typingInDialogField) {
           e.preventDefault();
           setError(null);
           setStep(Math.max(0, ctx.openQuestions.length - 1));
@@ -301,14 +321,14 @@ export function PlanQaDialog(props: {
       if (!question) return;
       const d = ctx.drafts[question.id] ?? emptyDraft();
 
-      if (e.key === "Backspace" && !typingInField && !d.freeText) {
+      if (e.key === "Backspace" && !typingInDialogField && !d.freeText) {
         e.preventDefault();
         setError(null);
         if (ctx.step > 0) setStep(ctx.step - 1);
         return;
       }
 
-      if (typingInField) {
+      if (typingInDialogField) {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
           e.stopPropagation();
@@ -379,10 +399,12 @@ export function PlanQaDialog(props: {
       }}
     >
       <div
+        ref={dialogRef}
         className="qa-dialog"
         role="dialog"
         aria-modal="true"
         aria-labelledby="qa-dialog-title"
+        tabIndex={-1}
       >
         <header className="qa-dialog-header">
           <div>

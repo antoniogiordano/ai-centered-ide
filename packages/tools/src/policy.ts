@@ -27,6 +27,8 @@ const TOOL_RISK: Record<string, RiskLevel> = {
   git_status: "safe",
   git_diff: "safe",
   write_file: "reversible",
+  replace_in_file: "reversible",
+  import_attachment: "safe",
   upsert_architecture: "safe",
   read_architecture: "safe",
   git_commit: "sensitive",

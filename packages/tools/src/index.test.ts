@@ -32,6 +32,7 @@ describe("policy matrix", () => {
 
   it("classifies tool risk", () => {
     expect(getToolRisk("read_file")).toBe("safe");
+    expect(getToolRisk("import_attachment")).toBe("safe");
     expect(getToolRisk("git_commit")).toBe("sensitive");
   });
 
@@ -84,20 +85,26 @@ describe("phase tool gating", () => {
         "propose_plan_ready",
         "read_architecture",
         "upsert_architecture",
+        "import_attachment",
       ]),
     );
     expect(names).not.toContain("write_file");
+    expect(names).not.toContain("replace_in_file");
     expect(names).not.toContain("git_status");
     expect(names).not.toContain("run_command");
     expect(names).not.toContain("terminal_open");
+    expect(names).not.toContain("get_test_report");
+    expect(names).not.toContain("checkpoint_restore");
   });
 
-  it("building exposes implementation tools", () => {
+  it("building exposes implementation tools but not test-report tools", () => {
     const registry = createDefaultRegistry();
     const names = registry.listForPhase("building").map((t) => t.name);
     expect(names).toEqual(
       expect.arrayContaining([
         "write_file",
+        "replace_in_file",
+        "import_attachment",
         "git_status",
         "run_command",
         "terminal_open",
@@ -109,10 +116,45 @@ describe("phase tool gating", () => {
         "upsert_plan",
         "propose_testing_ready",
         "read_architecture",
+        "checkpoint_restore",
       ]),
     );
     expect(names).not.toContain("propose_plan_ready");
     expect(names).not.toContain("add_phase");
     expect(names).not.toContain("set_questions");
+    expect(names).not.toContain("get_test_report");
+    expect(names).not.toContain("list_failed_tests");
+    expect(names).not.toContain("read_test_log");
+  });
+
+  it("testing exposes report + fix tools but freezes plan and checkpoints", () => {
+    const registry = createDefaultRegistry();
+    const names = registry.listForPhase("testing").map((t) => t.name);
+    expect(names).toEqual(
+      expect.arrayContaining([
+        "read_plan",
+        "get_test_report",
+        "list_failed_tests",
+        "read_test_log",
+        "replace_in_file",
+        "write_file",
+        "run_command",
+        "terminal_open",
+        "git_status",
+        "read_file",
+        "search_graph",
+      ]),
+    );
+    expect(names).not.toContain("upsert_plan");
+    expect(names).not.toContain("add_phase");
+    expect(names).not.toContain("replace_phase");
+    expect(names).not.toContain("delete_phase");
+    expect(names).not.toContain("add_check");
+    expect(names).not.toContain("replace_check");
+    expect(names).not.toContain("delete_check");
+    expect(names).not.toContain("set_questions");
+    expect(names).not.toContain("propose_plan_ready");
+    expect(names).not.toContain("propose_testing_ready");
+    expect(names).not.toContain("checkpoint_restore");
   });
 });

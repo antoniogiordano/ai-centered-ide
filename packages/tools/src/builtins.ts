@@ -8,10 +8,15 @@ const emptyObjectSchema = {
   additionalProperties: false,
 } as const;
 
-const PLANNING_AND_BUILDING: ToolPhase[] = ["planning", "building"];
 const PLANNING_ONLY: ToolPhase[] = ["planning"];
 const BUILDING_ONLY: ToolPhase[] = ["building"];
-const READ_TOOLS: ToolPhase[] = ["planning", "building"];
+const TESTING_ONLY: ToolPhase[] = ["testing"];
+/** Plan progress (Build) + draft (Plan) — never Testing. */
+const PLANNING_AND_BUILDING: ToolPhase[] = ["planning", "building"];
+/** Implementation + bugfix (no plan mutation). */
+const BUILDING_AND_TESTING: ToolPhase[] = ["building", "testing"];
+/** Explore / read across all product phases. */
+const ALL_PHASES: ToolPhase[] = ["planning", "building", "testing"];
 
 export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
@@ -19,7 +24,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
     description:
       "List files and folders in a workspace directory (hides node_modules/.git/dist/…). Paths relative to workspace root; \".\" = root. Prefer over shell ls. When the codebase graph is indexed, prefer search_graph / get_architecture / search_code first — use list_dir only for a known path, not to walk the tree.",
     riskLevel: "safe",
-    phases: READ_TOOLS,
+    phases: ALL_PHASES,
     argsSchema: z.object({
       path: z.string().optional().default("."),
     }) as z.ZodType<Record<string, unknown>>,
@@ -65,7 +70,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
     description:
       "Read a UTF-8 text file window from the workspace (path relative to root). Defaults to ~250 lines from startLine (1-based). Large files never fail with 'too large' — page with startLine using nextStartLine from the previous result. Prefer search_text / search_graph to locate before paging whole files.",
     riskLevel: "safe",
-    phases: READ_TOOLS,
+    phases: ALL_PHASES,
     argsSchema: z.object({
       path: z.string().min(1),
       startLine: z.number().int().positive().optional(),
@@ -133,7 +138,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "upsert_plan",
     description:
-      "Full-replace the delivery plan (or update build progress). Planning: prefer micro tools (add_phase, add_check, set_questions, …) for small edits; use upsert_plan for a full rewrite. Building: structure LOCKED; done checks sticky; prefer Focus → one item, but you may mark multiple newly finished items done=true in one call if you completed them together. Keep prior done items true. Always pass the full phases array when using this tool.",
+      "Full-replace the delivery plan (or update build progress). Planning: prefer micro tools (add_phase, add_check, set_questions, …) for small edits; use upsert_plan for a full rewrite. Building: structure LOCKED; done checks sticky; prefer Focus → one item, but you may mark multiple newly finished items done=true in one call if you completed them together. Keep prior done items true. Always pass the full phases array when using this tool. Not available in Testing — plan is frozen; use read_plan only.",
     riskLevel: "safe",
     phases: PLANNING_AND_BUILDING,
     argsSchema: z.object({
@@ -237,9 +242,9 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "read_plan",
     description:
-      "Read the current delivery plan (phases, checklist, clarifying questions, ready proposal). Prefer this before micro edits.",
+      "Read the current delivery plan (phases, checklist, clarifying questions, ready proposal). Prefer this before micro edits. In Testing the plan is read-only.",
     riskLevel: "safe",
-    phases: PLANNING_AND_BUILDING,
+    phases: ALL_PHASES,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
     parameters: emptyObjectSchema,
     execute: planStub,
@@ -513,7 +518,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
     description:
       "Read effective architecture: detected stack from the repo ⊕ sparse overrides/intent in .aifi/ARCHITECTURE.md.",
     riskLevel: "safe",
-    phases: READ_TOOLS,
+    phases: ALL_PHASES,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
     parameters: emptyObjectSchema,
     execute: async (_args, ctx) => {
@@ -547,7 +552,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
     description:
       "Merge sparse overrides into .aifi/ARCHITECTURE.md frontmatter (optional intent markdown body). Does not replace repo detection. Canonical keys only; wrong keys fail with a field guide.",
     riskLevel: "safe",
-    phases: READ_TOOLS,
+    phases: ALL_PHASES,
     argsSchema: z.object({
       patch: z.record(z.unknown()).optional(),
       intent: z.string().optional(),
@@ -799,7 +804,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Search for text in workspace files. When the codebase graph is indexed, prefer search_code / search_graph instead.",
     riskLevel: "safe",
-    phases: READ_TOOLS,
+    phases: ALL_PHASES,
     argsSchema: z.object({ query: z.string().min(1) }) as z.ZodType<
       Record<string, unknown>
     >,
@@ -821,9 +826,9 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "write_file",
     description:
-      "Write a text file in the workspace. Prefer small modules (~500–700 chars when practical); split/componentize instead of large blobs. Do not explode one checklist item into dozens of micro-files.",
+      "Create a new text file OR fully overwrite an existing one (pass the entire file content). For edits to an existing file, ALWAYS prefer replace_in_file (exact search→replace) — it uses fewer tokens and avoids accidental drift. Use write_file only for brand-new paths or intentional full rewrites.",
     riskLevel: "reversible",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({
       path: z.string().min(1),
       content: z.string(),
@@ -844,10 +849,123 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   });
 
   registry.register({
+    name: "replace_in_file",
+    description:
+      "PREFERRED edit for existing files: exact substring replace (search → replace). search must match exactly once unless replaceAll=true. Include enough surrounding context to keep search unique. Prefer this over write_file for any partial change — cheaper and safer than rewriting the whole file.",
+    riskLevel: "reversible",
+    phases: BUILDING_AND_TESTING,
+    argsSchema: z.object({
+      path: z.string().min(1),
+      search: z.string().min(1),
+      replace: z.string(),
+      replaceAll: z.boolean().optional(),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Existing file path relative to the workspace root.",
+        },
+        search: {
+          type: "string",
+          description:
+            "Exact text to find (must be unique in the file unless replaceAll).",
+        },
+        replace: {
+          type: "string",
+          description: "Replacement text (may be empty to delete the match).",
+        },
+        replaceAll: {
+          type: "boolean",
+          description:
+            "If true, replace every non-overlapping match. Default false (require unique search).",
+        },
+      },
+      required: ["path", "search", "replace"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const path = String(args.path);
+      const search = String(args.search);
+      const replace = String(args.replace);
+      const replaceAll = args.replaceAll === true;
+      const { matches } = ctx.fs.patch(path, search, replace, {
+        ...(replaceAll ? { replaceAll: true } : {}),
+      });
+      return {
+        summary: replaceAll
+          ? `Replaced ${matches} match(es) in ${path}`
+          : `Replaced text in ${path}`,
+        output: { path, matches, replaceAll },
+      };
+    },
+  });
+
+  registry.register({
+    name: "import_attachment",
+    description:
+      "Copy a user-attached file or image (from the current chat attachments) into the workspace at destPath. Use attachmentId from the user message / attachment list. After importing text files, page them with read_file (startLine/maxLines).",
+    riskLevel: "safe",
+    phases: ALL_PHASES,
+    argsSchema: z.object({
+      attachmentId: z.string().min(1),
+      destPath: z.string().min(1),
+    }) as z.ZodType<Record<string, unknown>>,
+    parameters: {
+      type: "object",
+      properties: {
+        attachmentId: {
+          type: "string",
+          description: "Id of the attachment from the user message.",
+        },
+        destPath: {
+          type: "string",
+          description: "Destination path relative to the workspace root.",
+        },
+      },
+      required: ["attachmentId", "destPath"],
+      additionalProperties: false,
+    },
+    execute: async (args, ctx) => {
+      const attachmentId = String(args.attachmentId);
+      const destPath = String(args.destPath);
+      const att = ctx.attachments?.get(attachmentId);
+      if (!att) {
+        const available = ctx.attachments?.list() ?? [];
+        return {
+          summary: `Attachment not found: ${attachmentId}`,
+          output: {
+            error: "not_found",
+            available: available.map((a) => ({
+              id: a.id,
+              kind: a.kind,
+              name: a.name,
+              path: a.path,
+            })),
+          },
+        };
+      }
+      ctx.fs.writeBinary(destPath, att.bytes);
+      return {
+        summary: `Imported ${att.name} → ${destPath}`,
+        output: {
+          attachmentId: att.id,
+          name: att.name,
+          kind: att.kind,
+          mime: att.mime,
+          destPath,
+          bytes: att.bytes.byteLength,
+        },
+      };
+    },
+  });
+
+  registry.register({
     name: "git_status",
     description: "Get git status for the workspace.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
     parameters: emptyObjectSchema,
     execute: async (_args, ctx) => {
@@ -860,7 +978,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     name: "git_diff",
     description: "Get git diff for the workspace.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({ staged: z.boolean().optional() }) as z.ZodType<
       Record<string, unknown>
     >,
@@ -881,7 +999,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     name: "git_commit",
     description: "Create a git commit with staged changes.",
     riskLevel: "sensitive",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({ message: z.string().min(1) }) as z.ZodType<
       Record<string, unknown>
     >,
@@ -904,7 +1022,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Short one-shot host shell (`bash -lc` in workspace). Auto-loads nvm/fnm and honors .nvmrc/.node-version for THAT process only — env does not persist to the next call. For multi-step Node/npm/pnpm/git work prefer terminal_open once and reuse terminal_write/terminal_read. Do NOT use cat/ls/head/find/tree to inspect the repo — those are blocked; use list_dir, read_file, search_text, or search_graph / get_code_snippet instead.",
     riskLevel: "sensitive",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({
       command: z.string().min(1),
       cwd: z.string().optional(),
@@ -942,9 +1060,9 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "get_test_report",
     description:
-      "Structured summary of the last IDE test-gate run: suite status, platform (jest/vitest/eslint/tsc/cypress…), pass/fail/skip counts when parsed, and failed-test titles. Use during test-fix after the checklist is done. Prefer this before read_test_log.",
+      "Testing only. Structured summary of the last IDE test-gate run: suite status, platform (jest/vitest/eslint/tsc/cypress…), pass/fail/skip counts when parsed, and failed-test titles. Prefer this before read_test_log.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: TESTING_ONLY,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
     parameters: {
       type: "object",
@@ -973,9 +1091,9 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "list_failed_tests",
     description:
-      "List individual failed test titles from the last IDE test gate, optionally filtered by suiteId (unit, lint, typecheck…). Pair with get_test_report for counts/platform.",
+      "Testing only. List individual failed test titles from the last IDE test gate, optionally filtered by suiteId (unit, lint, typecheck…). Pair with get_test_report for counts/platform.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: TESTING_ONLY,
     argsSchema: z.object({
       suiteId: z.string().min(1).optional(),
     }) as z.ZodType<Record<string, unknown>>,
@@ -1044,9 +1162,9 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "read_test_log",
     description:
-      "Read a chunk of an IDE test-gate suite log after a verification run. Prefer get_test_report / list_failed_tests first. Pass suiteId from the digest or report. Prefer chunkIndex (0-based); or offsetChars.",
+      "Testing only. Read a chunk of an IDE test-gate suite log after a verification run. Prefer get_test_report / list_failed_tests first. Pass suiteId from the digest or report. Prefer chunkIndex (0-based); or offsetChars.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: TESTING_ONLY,
     argsSchema: z.object({
       suiteId: z.string().min(1),
       chunkIndex: z.number().int().nonnegative().optional(),
@@ -1125,7 +1243,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Open a persistent interactive terminal (PTY) in the workspace. Prefer ONE session for a toolchain stream: the IDE bootstraps nvm/fnm + .nvmrc on open so node/npm stay available. Reuse the returned terminalId with terminal_write / terminal_read — do not open a new terminal per command.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({
       title: z.string().optional(),
       cwd: z.string().optional(),
@@ -1157,7 +1275,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     name: "terminal_list",
     description: "List interactive terminals (id, title, status, pid).",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
     parameters: emptyObjectSchema,
     execute: async (_args, ctx) => {
@@ -1177,7 +1295,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Read recent streamed output from a terminal. Use after writes or while a process is running.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({
       terminalId: z.string().min(1),
       maxChars: z.number().int().positive().optional(),
@@ -1218,7 +1336,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Send exact text to a terminal. The user gets 3s to confirm/cancel/edit (auto-approve on timeout). Prefer this for interactive commands; use terminal_ask when the user must choose.",
     riskLevel: "reversible",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({
       terminalId: z.string().min(1),
       text: z.string(),
@@ -1274,7 +1392,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Ask the user an exclusive A/B/C… choice (+ optional free text). You may suggest stdin text; the user can confirm or edit. Optionally writes the final text to the terminal (no extra 3s confirm).",
     riskLevel: "reversible",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({
       terminalId: z.string().min(1),
       prompt: z.string().min(1),
@@ -1355,7 +1473,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     name: "terminal_close",
     description: "Close an interactive terminal and kill its process tree.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({
       terminalId: z.string().min(1),
     }) as z.ZodType<Record<string, unknown>>,

@@ -188,12 +188,25 @@ export const ApprovalGrantSchema = z.object({
 });
 export type ApprovalGrant = z.infer<typeof ApprovalGrantSchema>;
 
+/** Metadata shown in transcript / composer (no heavy payloads). */
+export const AttachmentMetaSchema = z.object({
+  id: z.string().min(1),
+  kind: z.enum(["image", "file"]),
+  name: z.string().min(1),
+  path: z.string().optional(),
+  mime: z.string().optional(),
+  /** Small data URL for image thumbnails in the UI. */
+  previewDataUrl: z.string().optional(),
+});
+export type AttachmentMeta = z.infer<typeof AttachmentMetaSchema>;
+
 export const TurnSchema = z.object({
   id: z.string().min(1),
   role: z.enum(["user", "assistant", "system", "tool"]),
   content: z.string(),
   toolCalls: z.array(ToolCallSchema).optional(),
   toolResults: z.array(ToolResultSchema).optional(),
+  attachments: z.array(AttachmentMetaSchema).optional(),
   createdAt: z.string().datetime(),
 });
 export type Turn = z.infer<typeof TurnSchema>;

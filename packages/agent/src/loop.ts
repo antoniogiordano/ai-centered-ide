@@ -3,7 +3,9 @@ import type {
   AiProvider,
   AssistantToolCall,
   ChatMessage,
+  ContentPart,
 } from "@ai-ide/provider";
+import { chatContentText } from "@ai-ide/provider";
 import type { SessionState, ToolCall, ToolResult, Turn } from "@ai-ide/shared";
 import { formatAppErrorDisplay } from "@ai-ide/shared";
 import {
@@ -27,6 +29,7 @@ import {
   planChecklistProgress,
   planHasOpenWork,
   PLAN_CONTINUE_NUDGE,
+  TEST_CONTINUE_NUDGE,
   productPhaseForState,
   tryParsePartialJson,
   TurnStateMachine,
@@ -34,6 +37,68 @@ import {
 
 function isTankMode(state: SessionState): boolean {
   return isAgentTankMode(state);
+}
+
+function buildToolExecutionContext(
+  baseCtx: Partial<ToolExecutionContext>,
+  workingState: SessionState,
+  extras?: { oneShotApprovedIds?: Set<string> },
+): ToolExecutionContext {
+  if (
+    !baseCtx.workspaceRoot ||
+    !baseCtx.fs ||
+    !baseCtx.git ||
+    !baseCtx.checkpoint
+  ) {
+    throw new Error("Tool context incomplete");
+  }
+  return {
+    workspaceRoot: baseCtx.workspaceRoot,
+    mode: workingState.mode,
+    grants: workingState.approvalGrants,
+    fs: baseCtx.fs,
+    git: baseCtx.git,
+    checkpoint: baseCtx.checkpoint,
+    audit: baseCtx.audit ?? (() => undefined),
+    redact: baseCtx.redact ?? defaultRedact,
+    approvedCategories: baseCtx.approvedCategories ?? new Set(),
+    ...(extras?.oneShotApprovedIds
+      ? { oneShotApprovedIds: extras.oneShotApprovedIds }
+      : {}),
+    ...(baseCtx.terminals ? { terminals: baseCtx.terminals } : {}),
+    ...(baseCtx.cbm ? { cbm: baseCtx.cbm } : {}),
+    ...(baseCtx.testLogs ? { testLogs: baseCtx.testLogs } : {}),
+    ...(baseCtx.testGate ? { testGate: baseCtx.testGate } : {}),
+    ...(baseCtx.attachments ? { attachments: baseCtx.attachments } : {}),
+  };
+}
+
+/** Attach image_url parts to the latest user message (current turn only). */
+function attachVisionToLatestUserMessage(
+  messages: ChatMessage[],
+  visionImages: Array<{ mime: string; dataBase64: string }> | undefined,
+): void {
+  if (!visionImages?.length) return;
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+  if (lastUserIdx < 0) return;
+  const msg = messages[lastUserIdx]!;
+  if (msg.role !== "user") return;
+  const text = chatContentText(msg.content);
+  const parts: ContentPart[] = [{ type: "text", text }];
+  for (const img of visionImages) {
+    const mime = img.mime || "image/png";
+    parts.push({
+      type: "image_url",
+      image_url: { url: `data:${mime};base64,${img.dataBase64}` },
+    });
+  }
+  messages[lastUserIdx] = { role: "user", content: parts };
 }
 
 function toolMessageContent(
@@ -82,7 +147,7 @@ function toolDescriptionForModel(
 
 function buildModelToolDefs(
   registry: ReturnType<typeof createDefaultRegistry>,
-  stateLike: Pick<SessionState, "mode" | "planStatus" | "sessionKind">,
+  stateLike: SessionState,
   indexed: boolean,
 ): Array<{
   name: string;
@@ -142,12 +207,16 @@ function pushTankContinue(
   emit: (event: AgentProgressEvent) => void,
 ): { state: SessionState; tankRounds: number } {
   const nextRound = tankRounds + 1;
-  const planning = productPhaseForState(workingState) === "planning";
+  const phase = productPhaseForState(workingState);
+  const planning = phase === "planning";
+  const testing = phase === "testing";
   const { done, total } = planChecklistProgress(workingState);
   const open = Math.max(0, total - done);
   const label = planning
     ? `Tank · planning · go ${nextRound}`
-    : `Tank · ${done}/${total} done · ${open} open · go ${nextRound}`;
+    : testing
+      ? `Tank · testing · go ${nextRound}`
+      : `Tank · ${done}/${total} done · ${open} open · go ${nextRound}`;
   let state = workingState;
   if (nextRound === 1 || nextRound % 5 === 0) {
     const notice: Turn = {
@@ -155,7 +224,9 @@ function pushTankContinue(
       role: "assistant",
       content: planning
         ? `**Tank mode** · planning still open — upsert_plan / questions / propose_plan_ready (round ${nextRound})…`
-        : `**Tank mode** · checklist **${done}/${total} done** (${open} open) — continue from the next open item; do not uncheck or restart (round ${nextRound})…`,
+        : testing
+          ? `**Tank mode** · testing — get_test_report / fix failures (round ${nextRound})…`
+          : `**Tank mode** · checklist **${done}/${total} done** (${open} open) — continue from the next open item; do not uncheck or restart (round ${nextRound})…`,
       createdAt: new Date().toISOString(),
     };
     state = { ...state, turns: [...state.turns, notice] };
@@ -179,7 +250,11 @@ function pushTankContinue(
   messages.length = 0;
   messages.push(...compacted, {
     role: "user",
-    content: planning ? PLAN_CONTINUE_NUDGE : CHECKLIST_CONTINUE_NUDGE,
+    content: planning
+      ? PLAN_CONTINUE_NUDGE
+      : testing
+        ? TEST_CONTINUE_NUDGE
+        : CHECKLIST_CONTINUE_NUDGE,
   });
   return { state, tankRounds: nextRound };
 }
@@ -248,6 +323,8 @@ export type AgentLoopDeps = {
   toolCtx?: Partial<ToolExecutionContext>;
   signal?: AbortSignal;
   onProgress?: (event: AgentProgressEvent) => void;
+  /** Vision for the current user message only (not re-sent on later turns). */
+  visionImages?: Array<{ mime: string; dataBase64: string }>;
 };
 
 /** In-memory snapshot so Approve can resume the tool loop. */
@@ -283,9 +360,7 @@ export async function runAgentTurn(
   const registry = createDefaultRegistry();
   const gateway = deps.gateway ?? new ToolGateway(registry);
 
-  const toolDefsFor = (
-    stateLike: Pick<SessionState, "mode" | "planStatus" | "sessionKind">,
-  ) =>
+  const toolDefsFor = (stateLike: SessionState) =>
     buildModelToolDefs(
       registry,
       stateLike,
@@ -300,6 +375,7 @@ export async function runAgentTurn(
     role: t.role === "system" || t.role === "user" ? t.role : "assistant",
     content: t.content,
   }));
+  attachVisionToLatestUserMessage(messages, deps.visionImages);
 
   let assistantContent = "";
   const toolResults: ToolResult[] = [];
@@ -318,6 +394,7 @@ export async function runAgentTurn(
     emit({ type: "activity", label: "Thinking…", status: "thinking" });
 
     let roundContent = "";
+    let roundReasoning = "";
     const pendingToolCalls = new Map<
       number,
       { id: string; name: string; arguments: string; started: boolean }
@@ -336,6 +413,9 @@ export async function runAgentTurn(
         toolCalls: allToolCalls,
         toolResults,
       });
+      }
+      if (chunk.type === "reasoning") {
+        roundReasoning += chunk.delta;
       }
       if (chunk.type === "content") {
         if (!streamedThisRound) {
@@ -466,10 +546,13 @@ export async function runAgentTurn(
 
     if (toolCalls.length === 0) {
       // Keep provider history coherent when the model narrates without tools.
-      if (roundContent.trim()) {
+      if (roundContent.trim() || roundReasoning.trim()) {
         messages.push({
           role: "assistant",
-          content: roundContent,
+          content: roundContent || null,
+          ...(roundReasoning
+            ? { reasoning_content: roundReasoning }
+            : {}),
         });
       }
       if (isTankMode(workingState)) {
@@ -494,6 +577,7 @@ export async function runAgentTurn(
       role: "assistant",
       content: roundContent || null,
       tool_calls: openAiToolCalls,
+      ...(roundReasoning ? { reasoning_content: roundReasoning } : {}),
     });
 
     let stop = false;
@@ -568,19 +652,7 @@ export async function runAgentTurn(
         continue;
       }
 
-      const ctx: ToolExecutionContext = {
-        workspaceRoot: baseCtx.workspaceRoot,
-        mode: workingState.mode,
-        grants: workingState.approvalGrants,
-        fs: baseCtx.fs,
-        git: baseCtx.git,
-        checkpoint: baseCtx.checkpoint,
-        audit: baseCtx.audit ?? (() => undefined),
-        redact: baseCtx.redact ?? defaultRedact,
-        approvedCategories: baseCtx.approvedCategories ?? new Set(),
-        ...(baseCtx.terminals ? { terminals: baseCtx.terminals } : {}),
-        ...(baseCtx.cbm ? { cbm: baseCtx.cbm } : {}),
-      };
+      const ctx = buildToolExecutionContext(baseCtx, workingState);
 
       const outcome = await gateway.executeTool(call, ctx);
       if (outcome.status === "approval_required") {
@@ -697,6 +769,8 @@ function toolActivityLabel(call: ToolCall): string {
         : "Searching…";
     case "write_file":
       return path ? `Writing ${path}…` : "Writing file…";
+    case "replace_in_file":
+      return path ? `Editing ${path}…` : "Editing file…";
     case "run_command": {
       if (!command) return "Running command…";
       const compact = command.trim().replace(/\s+/g, " ");
@@ -852,9 +926,7 @@ export async function resumeAgentTurn(
   const registry = createDefaultRegistry();
   const gateway = deps.gateway ?? new ToolGateway(registry);
 
-  const toolDefsFor = (
-    stateLike: Pick<SessionState, "mode" | "planStatus" | "sessionKind">,
-  ) =>
+  const toolDefsFor = (stateLike: SessionState) =>
     buildModelToolDefs(
       registry,
       stateLike,
@@ -956,20 +1028,9 @@ export async function resumeAgentTurn(
       continue;
     }
 
-    const ctx: ToolExecutionContext = {
-      workspaceRoot: baseCtx.workspaceRoot,
-      mode: workingState.mode,
-      grants: workingState.approvalGrants,
-      fs: baseCtx.fs,
-      git: baseCtx.git,
-      checkpoint: baseCtx.checkpoint,
-      audit: baseCtx.audit ?? (() => undefined),
-      redact: baseCtx.redact ?? defaultRedact,
-      approvedCategories: baseCtx.approvedCategories ?? new Set(),
+    const ctx = buildToolExecutionContext(baseCtx, workingState, {
       oneShotApprovedIds: oneShot,
-      ...(baseCtx.terminals ? { terminals: baseCtx.terminals } : {}),
-      ...(baseCtx.cbm ? { cbm: baseCtx.cbm } : {}),
-    };
+    });
 
     const outcome = await gateway.executeTool(call, ctx);
     if (outcome.status === "approval_required") {
@@ -1051,6 +1112,7 @@ export async function resumeAgentTurn(
     emit({ type: "activity", label: "Thinking…", status: "thinking" });
 
     let roundContent = "";
+    let roundReasoning = "";
     const pendingToolCalls = new Map<
       number,
       { id: string; name: string; arguments: string; started: boolean }
@@ -1068,6 +1130,9 @@ export async function resumeAgentTurn(
         toolCalls: allToolCalls,
         toolResults,
       });
+      }
+      if (chunk.type === "reasoning") {
+        roundReasoning += chunk.delta;
       }
       if (chunk.type === "content") {
         if (!streamedThisRound) {
@@ -1148,10 +1213,13 @@ export async function resumeAgentTurn(
     }
 
     if (toolCalls.length === 0) {
-      if (roundContent.trim()) {
+      if (roundContent.trim() || roundReasoning.trim()) {
         messages.push({
           role: "assistant",
-          content: roundContent,
+          content: roundContent || null,
+          ...(roundReasoning
+            ? { reasoning_content: roundReasoning }
+            : {}),
         });
       }
       if (isTankMode(workingState)) {
@@ -1174,6 +1242,7 @@ export async function resumeAgentTurn(
       role: "assistant",
       content: roundContent || null,
       tool_calls: openAiToolCalls,
+      ...(roundReasoning ? { reasoning_content: roundReasoning } : {}),
     });
 
     let batchStop = false;
@@ -1245,19 +1314,7 @@ export async function resumeAgentTurn(
         continue;
       }
 
-      const ctx: ToolExecutionContext = {
-        workspaceRoot: baseCtx.workspaceRoot,
-        mode: workingState.mode,
-        grants: workingState.approvalGrants,
-        fs: baseCtx.fs,
-        git: baseCtx.git,
-        checkpoint: baseCtx.checkpoint,
-        audit: baseCtx.audit ?? (() => undefined),
-        redact: baseCtx.redact ?? defaultRedact,
-        approvedCategories: baseCtx.approvedCategories ?? new Set(),
-        ...(baseCtx.terminals ? { terminals: baseCtx.terminals } : {}),
-        ...(baseCtx.cbm ? { cbm: baseCtx.cbm } : {}),
-      };
+      const ctx = buildToolExecutionContext(baseCtx, workingState);
 
       const outcome = await gateway.executeTool(call, ctx);
       if (outcome.status === "approval_required") {

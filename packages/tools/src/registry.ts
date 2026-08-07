@@ -2,7 +2,7 @@ import type { ZodType } from "zod";
 import type { RiskLevel } from "@ai-ide/shared";
 import type { ToolExecutionContext } from "./gateway.js";
 
-export type ToolPhase = "planning" | "building";
+export type ToolPhase = "planning" | "building" | "testing";
 
 export type ToolDefinition = {
   name: string;
@@ -58,7 +58,7 @@ export class ToolRegistry {
     return this.listForPhase(phase);
   }
 
-  /** Tools for planning vs building product phases. */
+  /** Tools for planning / building / testing product phases. */
   listForPhase(phase: ToolPhase): ToolDefinition[] {
     return this.list().filter((tool) => tool.phases.includes(phase));
   }

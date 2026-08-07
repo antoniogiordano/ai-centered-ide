@@ -14,6 +14,8 @@ import { assertInsideWorkspace } from "./perimeter.js";
 
 export const DEFAULT_MAX_READ_BYTES = 512 * 1024;
 export const DEFAULT_MAX_WRITE_BYTES = 512 * 1024;
+/** Binary attachment imports (images) — aligned with chat attachment cap. */
+export const DEFAULT_MAX_BINARY_WRITE_BYTES = 4 * 1024 * 1024;
 /** Default window size for agent `read_file` (lines). */
 export const DEFAULT_READ_WINDOW_LINES = 250;
 /** Hard cap per `read_file` call — agent pages with startLine. */
@@ -143,16 +145,60 @@ export class FilesystemService {
     writeFileSync(abs, content, "utf8");
   }
 
-  patch(relativePath: string, search: string, replace: string): void {
-    const content = this.read(relativePath);
-    if (!content.includes(search)) {
+  /** Write binary bytes (images, attachments). Cap is {@link DEFAULT_MAX_BINARY_WRITE_BYTES}. */
+  writeBinary(relativePath: string, data: Buffer): void {
+    if (data.byteLength > DEFAULT_MAX_BINARY_WRITE_BYTES) {
       throw new AppError({
-        code: "NOT_FOUND",
-        userMessage: "Could not find the text to replace.",
+        code: "VALIDATION_ERROR",
+        userMessage: "Content is too large to write.",
         technicalDetail: relativePath,
       });
     }
-    this.write(relativePath, content.replace(search, replace));
+    const abs = assertInsideWorkspace(this.workspaceRoot, relativePath);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, data);
+  }
+
+  /**
+   * Exact substring replace. By default `search` must appear exactly once
+   * (avoids ambiguous edits). Pass `replaceAll: true` to replace every match.
+   */
+  patch(
+    relativePath: string,
+    search: string,
+    replace: string,
+    options?: { replaceAll?: boolean },
+  ): { matches: number } {
+    if (search.length === 0) {
+      throw new AppError({
+        code: "VALIDATION_ERROR",
+        userMessage: "search must be a non-empty string.",
+        technicalDetail: relativePath,
+      });
+    }
+    const content = this.read(relativePath);
+    const matches = countNonOverlapping(content, search);
+    if (matches === 0) {
+      throw new AppError({
+        code: "NOT_FOUND",
+        userMessage:
+          "Could not find the text to replace. Expand search with more surrounding context so it matches exactly once.",
+        technicalDetail: relativePath,
+      });
+    }
+    const replaceAll = options?.replaceAll === true;
+    if (!replaceAll && matches > 1) {
+      throw new AppError({
+        code: "VALIDATION_ERROR",
+        userMessage: `search matched ${matches} times — include more context so it is unique, or pass replaceAll=true.`,
+        technicalDetail: relativePath,
+      });
+    }
+    const next = replaceAll
+      ? content.split(search).join(replace)
+      : applyFirstReplace(content, search, replace);
+    this.write(relativePath, next);
+    return { matches: replaceAll ? matches : 1 };
   }
 
   delete(relativePath: string): void {
@@ -356,4 +402,27 @@ async function readWindowStreaming(
     nextStartLine: hasMore ? endLine + 1 : null,
     contentTruncated,
   };
+}
+
+function countNonOverlapping(haystack: string, needle: string): number {
+  let count = 0;
+  let pos = 0;
+  while (pos <= haystack.length - needle.length) {
+    const i = haystack.indexOf(needle, pos);
+    if (i < 0) break;
+    count += 1;
+    pos = i + needle.length;
+  }
+  return count;
+}
+
+/** First-only replace without interpreting `$` patterns in `replace`. */
+function applyFirstReplace(
+  content: string,
+  search: string,
+  replace: string,
+): string {
+  const i = content.indexOf(search);
+  if (i < 0) return content;
+  return content.slice(0, i) + replace + content.slice(i + search.length);
 }
