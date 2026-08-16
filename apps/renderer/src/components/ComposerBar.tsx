@@ -2,11 +2,13 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type DragEvent,
   type FormEvent,
   type ClipboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type RefObject,
 } from "react";
 import type { SessionState } from "@ai-ide/shared";
@@ -27,6 +29,8 @@ const TEXT_PREVIEW_MAX_LINES = 200;
 const MAX_ATTACHMENTS = 10;
 const MAX_IMAGES = 5;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const COMPOSER_MAX_HEIGHT_PX = 220;
+const COMPOSER_MIN_HEIGHT_PX = 24;
 
 type LocalAttachment = {
   id: string;
@@ -181,7 +185,7 @@ function dataUrlToBase64(dataUrl: string): { mime: string; dataBase64: string } 
 
 export function ComposerBar(props: {
   state: SessionState | null;
-  inputRef: RefObject<HTMLInputElement | null>;
+  inputRef: RefObject<HTMLTextAreaElement | null>;
 }) {
   const { state, inputRef } = props;
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -201,6 +205,18 @@ export function ComposerBar(props: {
       : "Continue development — the agent follows the Plan tab…";
 
   const editing = attachments.find((a) => a.id === editingId) ?? null;
+
+  const resizeComposer = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "0px";
+    const next = Math.min(el.scrollHeight, COMPOSER_MAX_HEIGHT_PX);
+    el.style.height = `${Math.max(next, COMPOSER_MIN_HEIGHT_PX)}px`;
+  }, [inputRef]);
+
+  useLayoutEffect(() => {
+    resizeComposer();
+  }, [value, resizeComposer]);
 
   const addFiles = useCallback(async (files: FileList | File[]) => {
     const list = Array.from(files);
@@ -268,21 +284,32 @@ export function ComposerBar(props: {
     await bridge.session.sendMessage(content, {
       ...(payload.length ? { attachments: payload } : {}),
     });
-    inputRef.current?.focus();
+    requestAnimationFrame(() => {
+      resizeComposer();
+      inputRef.current?.focus();
+    });
+  }
+
+  function onComposerKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+    e.preventDefault();
+    if (canSend) void submit();
   }
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "u") return;
       if (editingId) return;
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === "TEXTAREA") return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      // Allow ⌘U while typing in the composer; skip other textareas (Q&A, etc.).
+      if (tag === "TEXTAREA" && target !== inputRef.current) return;
       e.preventDefault();
       fileInputRef.current?.click();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [editingId]);
+  }, [editingId, inputRef]);
 
   function onDragOver(e: DragEvent) {
     e.preventDefault();
@@ -378,12 +405,14 @@ export function ComposerBar(props: {
               </div>
             ) : null}
             <div className="composer-row">
-              <input
+              <textarea
                 ref={inputRef}
                 name="message"
                 className="composer-input"
+                rows={1}
                 value={value}
                 onChange={(e) => setValue(e.target.value)}
+                onKeyDown={onComposerKeyDown}
                 onFocus={() => setFocused(true)}
                 onBlur={() => setFocused(false)}
                 onPaste={(e) => void onPaste(e)}
@@ -461,18 +490,18 @@ export function ComposerBar(props: {
                 previewDataUrl = undefined;
               }
               setAttachments((prev) =>
-                prev.map((a) =>
-                  a.id === editing.id
-                    ? {
-                        ...a,
-                        mime,
-                        dataBase64,
-                        ...(previewDataUrl
-                          ? { previewDataUrl }
-                          : { previewDataUrl: undefined }),
-                      }
-                    : a,
-                ),
+                prev.map((a) => {
+                  if (a.id !== editing.id) return a;
+                  // Drop the stale pre-edit thumbnail if regeneration failed
+                  // (exactOptionalPropertyTypes forbids explicit undefined).
+                  const { previewDataUrl: _stale, ...rest } = a;
+                  return {
+                    ...rest,
+                    mime,
+                    dataBase64,
+                    ...(previewDataUrl ? { previewDataUrl } : {}),
+                  };
+                }),
               );
               setEditingId(null);
             })();

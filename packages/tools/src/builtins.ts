@@ -997,7 +997,8 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
 
   registry.register({
     name: "git_commit",
-    description: "Create a git commit with staged changes.",
+    description:
+      "DISABLED — git commit/push are harness-only. After the test gate passes, the IDE shows a Commit Build banner; do not attempt commits via tools or the terminal.",
     riskLevel: "sensitive",
     phases: BUILDING_AND_TESTING,
     argsSchema: z.object({ message: z.string().min(1) }) as z.ZodType<
@@ -1011,9 +1012,13 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
       required: ["message"],
       additionalProperties: false,
     },
-    execute: async (args, ctx) => {
-      const hash = await ctx.git.commit(String(args.message));
-      return { summary: `Committed ${hash}`, output: { hash } };
+    execute: async () => {
+      return {
+        summary: "Git commit is harness-only.",
+        error:
+          "git_commit is blocked. Use the Commit Build banner after tests pass — agents cannot commit or push.",
+        output: { blocked: true, reason: "harness_only_git" },
+      };
     },
   });
 
@@ -1334,7 +1339,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "terminal_write",
     description:
-      "Send exact text to a terminal. The user gets 3s to confirm/cancel/edit (auto-approve on timeout). Prefer this for interactive commands; use terminal_ask when the user must choose.",
+      "Send exact text to a terminal. The user gets 3s to confirm/cancel/edit (auto-approve on timeout). Prefer this for interactive commands; use terminal_ask when the user must choose. Do NOT send git commit or git push — those are harness-only via the Commit Build / Integrate banners.",
     riskLevel: "reversible",
     phases: BUILDING_AND_TESTING,
     argsSchema: z.object({

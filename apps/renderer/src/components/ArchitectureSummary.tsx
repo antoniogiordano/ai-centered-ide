@@ -115,6 +115,8 @@ export function ArchitectureSummary(props: Props) {
 
   useEffect(() => {
     if (!planning || !needsConfirm) return;
+    // Widget hidden once the file exists — don't keep a silent ⌘S handler.
+    if (exists && fromFile) return;
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "s") return;
       const tag = (e.target as HTMLElement | null)?.tagName;
@@ -124,7 +126,7 @@ export function ArchitectureSummary(props: Props) {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [planning, needsConfirm, confirmSave]);
+  }, [planning, needsConfirm, confirmSave, exists, fromFile]);
 
   if (!workspaceRoot) {
     return (
@@ -133,6 +135,12 @@ export function ArchitectureSummary(props: Props) {
         <span className="muted">Open a workspace to detect the stack.</span>
       </div>
     );
+  }
+
+  // .aifi/ARCHITECTURE.md already saved: stay out of the way (Edit is ⌘⇧A).
+  // Shown only until the first confirm/save creates the file; hides on save.
+  if (exists && fromFile && !error) {
+    return null;
   }
 
   return (

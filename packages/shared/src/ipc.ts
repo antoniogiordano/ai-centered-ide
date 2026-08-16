@@ -11,6 +11,7 @@ import {
   ArchitectureProfilePatchSchema,
   ArchitectureProfileSchema,
 } from "./architecture.js";
+import { ReasoningEffortSchema } from "./providers.js";
 
 export const IPC_CHANNELS = {
   SESSION_GET: "session:get",
@@ -861,7 +862,7 @@ export const ProviderSaveConfigRequestSchema = z.object({
     })
     .optional(),
   thinking: z.boolean().optional(),
-  reasoningEffort: z.enum(["low", "high", "max"]).optional(),
+  reasoningEffort: ReasoningEffortSchema.optional(),
   makeActive: z.boolean().optional(),
 });
 export type ProviderSaveConfigRequest = z.infer<
@@ -896,7 +897,7 @@ export const ProviderGetConfigResponseSchema = z.object({
     .nullable()
     .optional(),
   thinking: z.boolean().optional(),
-  reasoningEffort: z.enum(["low", "high", "max"]).optional(),
+  reasoningEffort: ReasoningEffortSchema.optional(),
 });
 export type ProviderGetConfigResponse = z.infer<
   typeof ProviderGetConfigResponseSchema
@@ -915,7 +916,7 @@ export const ProviderListResponseSchema = z.object({
       defaultModel: z.string(),
       paid: z.boolean(),
       thinking: z.boolean().optional(),
-      reasoningEffort: z.enum(["low", "high", "max"]).optional(),
+      reasoningEffort: ReasoningEffortSchema.optional(),
       pricing: z
         .object({
           inputPer1M: z.number().nonnegative().optional(),

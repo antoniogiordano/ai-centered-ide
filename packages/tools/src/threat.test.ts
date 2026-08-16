@@ -8,6 +8,13 @@ import {
 import { defaultRedact } from "./gateway.js";
 
 describe("threat model: tool gateway", () => {
+  it("blocks git commit / push with flexible whitespace (harness-only)", () => {
+    expect(analyzeCommand("git commit -m 'x'").blocked).toBe(true);
+    expect(analyzeCommand("git  commit -am fix").blocked).toBe(true);
+    expect(analyzeCommand("GIT PUSH origin HEAD").blocked).toBe(true);
+    expect(analyzeCommand("git status").blocked).toBe(false);
+  });
+
   it("denylist is non-empty and blocks force push / rm -rf / sudo", () => {
     expect(COMMAND_DENYLIST.length).toBeGreaterThan(5);
     expect(analyzeCommand("git push --force origin main").blocked).toBe(true);

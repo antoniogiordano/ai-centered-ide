@@ -13,8 +13,22 @@ export const ProviderUsageSchema = z.object({
 });
 export type ProviderUsage = z.infer<typeof ProviderUsageSchema>;
 
-export const ReasoningEffortSchema = z.enum(["low", "high", "max"]);
+/**
+ * Union of effort values across providers. OpenAI-style endpoints accept
+ * none…xhigh; DeepSeek accepts low/high/max. The endpoint rejects
+ * unsupported values with a 400, so the picker exposes them all.
+ */
+export const ReasoningEffortSchema = z.enum([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
+export const REASONING_EFFORT_VALUES = ReasoningEffortSchema.options;
 
 export const SavedProviderSchema = z.object({
   id: z.string().min(1),
@@ -57,6 +71,18 @@ export const ProviderHudSchema = z.object({
   lifetimeCostUsd: z.number().nullable(),
 });
 export type ProviderHud = z.infer<typeof ProviderHudSchema>;
+
+/** Per-model usage within a single chat session (not lifetime). */
+export const SessionModelUsageSchema = z.object({
+  model: z.string().min(1),
+  providerId: z.string().nullable(),
+  providerName: z.string(),
+  paid: z.boolean(),
+  usage: ProviderUsageSchema,
+  /** Estimated USD for this model in the chat; null when unpaid / rates unknown. */
+  costUsd: z.number().nullable(),
+});
+export type SessionModelUsage = z.infer<typeof SessionModelUsageSchema>;
 
 export function emptyProviderUsage(): ProviderUsage {
   return { inputTokens: 0, outputTokens: 0 };
@@ -129,6 +155,45 @@ export function addUsage(
     inputTokens: a.inputTokens + (b.inputTokens ?? 0),
     outputTokens: a.outputTokens + (b.outputTokens ?? 0),
   };
+}
+
+export function accumulateSessionModelUsage(
+  existing: SessionModelUsage[],
+  delta: ProviderUsage,
+  meta: {
+    model: string;
+    providerId: string | null;
+    providerName: string;
+    paid: boolean;
+    pricing?: ProviderPricing | null;
+  },
+): SessionModelUsage[] {
+  const model = meta.model.trim() || "unknown";
+  const key = `${meta.providerId ?? "none"}::${model}`;
+  const next = existing.map((row) => ({ ...row, usage: { ...row.usage } }));
+  const idx = next.findIndex(
+    (row) => `${row.providerId ?? "none"}::${row.model}` === key,
+  );
+  if (idx >= 0) {
+    const row = next[idx]!;
+    const usage = addUsage(row.usage, delta);
+    next[idx] = {
+      ...row,
+      usage,
+      costUsd: meta.paid ? estimateCostUsd(usage, meta.pricing) : null,
+    };
+    return next;
+  }
+  const usage = addUsage(emptyProviderUsage(), delta);
+  next.push({
+    model,
+    providerId: meta.providerId,
+    providerName: meta.providerName,
+    paid: meta.paid,
+    usage,
+    costUsd: meta.paid ? estimateCostUsd(usage, meta.pricing) : null,
+  });
+  return next;
 }
 
 export function buildProviderHud(input: {

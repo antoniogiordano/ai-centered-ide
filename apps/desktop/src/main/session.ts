@@ -9,7 +9,27 @@ import type {
   SessionSummary,
   WorkspaceRef,
 } from "@ai-ide/shared";
-import { createEmptySessionState, deriveProductPhase, planHasOpenWork, planBuildComplete, awaitsTestingConfirm, canStartTestGate, CHECKLIST_CONTINUE_USER_MESSAGE, PLAN_CONTINUE_USER_MESSAGE, TESTING_READY_CONTINUE_USER_MESSAGE, discoverTestRunSpecs, buildTestFailureDigest, decideTestGateAutoContinue, decideTestGateEscalation, fingerprintTestFailure, failedSuiteIds, TEST_FAILURE_CONTINUE_USER_MESSAGE } from "@ai-ide/shared";
+import {
+  accumulateSessionModelUsage,
+  createEmptySessionState,
+  deriveProductPhase,
+  planHasOpenWork,
+  planBuildComplete,
+  awaitsTestingConfirm,
+  canStartTestGate,
+  CHECKLIST_CONTINUE_USER_MESSAGE,
+  PLAN_CONTINUE_USER_MESSAGE,
+  TESTING_READY_CONTINUE_USER_MESSAGE,
+  discoverTestRunSpecs,
+  buildTestFailureDigest,
+  decideTestGateAutoContinue,
+  decideTestGateEscalation,
+  fingerprintTestFailure,
+  failedSuiteIds,
+  TEST_FAILURE_CONTINUE_USER_MESSAGE,
+  type ProviderUsage,
+  type SessionModelUsage,
+} from "@ai-ide/shared";
 import type { ProjectStorage } from "@ai-ide/storage";
 import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
 import {
@@ -647,8 +667,10 @@ export class SessionManager {
     planQuestions: SessionState["planQuestions"];
     planReadyProposal: SessionState["planReadyProposal"];
     buildBaseBranch?: string | null;
+    buildFlowCompletedAt?: string | null;
     sessionKind?: SessionState["sessionKind"];
     approvalGrants: SessionState["approvalGrants"];
+    sessionModelUsage?: SessionModelUsage[];
     createdAt: string;
   }): { state: SessionState; createdAt: string } {
     const turns = this.storage.loadTurns(row.id);
@@ -667,7 +689,9 @@ export class SessionManager {
       planQuestions: normalizePlanQuestions(row.planQuestions),
       planReadyProposal: row.planReadyProposal ?? null,
       buildBaseBranch: row.buildBaseBranch ?? null,
+      buildFlowCompletedAt: row.buildFlowCompletedAt ?? null,
       approvalGrants: row.approvalGrants,
+      sessionModelUsage: row.sessionModelUsage ?? [],
       turns,
       status: "idle",
     };
@@ -709,11 +733,17 @@ export class SessionManager {
       title: c.title,
       updatedAt: c.updatedAt,
       workspaceName: c.workspace?.name ?? null,
-      phase: deriveProductPhase({
-        mode: c.mode,
-        planStatus: c.planStatus,
-        sessionKind: c.sessionKind,
-      }),
+      // Live state for the active chat (offers/test gate are not persisted);
+      // stored plan snapshot for the others so Testing shows as "T" too.
+      phase:
+        c.id === this.state.sessionId
+          ? deriveProductPhase(this.state)
+          : deriveProductPhase({
+              mode: c.mode,
+              planStatus: c.planStatus,
+              sessionKind: c.sessionKind,
+              planPhases: c.planPhases,
+            }),
     }));
   }
 
@@ -770,8 +800,10 @@ export class SessionManager {
       planQuestions: this.state.planQuestions,
       planReadyProposal: this.state.planReadyProposal,
       buildBaseBranch: this.state.buildBaseBranch,
+      buildFlowCompletedAt: this.state.buildFlowCompletedAt,
       sessionKind: this.state.sessionKind,
       approvalGrants: this.state.approvalGrants,
+      sessionModelUsage: this.state.sessionModelUsage,
       createdAt: this.createdAt,
       updatedAt: now,
     });
@@ -786,16 +818,33 @@ export class SessionManager {
     }
   }
 
+  private applyProviderUsage(delta: ProviderUsage): void {
+    if (!this.providerStore) return;
+    if (delta.inputTokens <= 0 && delta.outputTokens <= 0) return;
+    const hud = this.providerStore.recordUsage(delta);
+    const active = this.providerStore.getActiveProvider();
+    const sessionModelUsage = accumulateSessionModelUsage(
+      this.state.sessionModelUsage ?? [],
+      delta,
+      {
+        model: hud.model ?? active?.defaultModel ?? "unknown",
+        providerId: hud.id,
+        providerName: hud.name,
+        paid: hud.paid,
+        pricing: active?.pricing ?? null,
+      },
+    );
+    this.state = { ...this.state, providerHud: hud, sessionModelUsage };
+    this.persist();
+    this.push();
+  }
+
   private handleProgress(event: AgentProgressEvent): void {
     if (event.type === "usage") {
-      if (this.providerStore) {
-        const hud = this.providerStore.recordUsage({
-          inputTokens: event.inputTokens,
-          outputTokens: event.outputTokens,
-        });
-        this.state = { ...this.state, providerHud: hud };
-        this.push();
-      }
+      this.applyProviderUsage({
+        inputTokens: event.inputTokens,
+        outputTokens: event.outputTokens,
+      });
       return;
     }
 
@@ -1271,6 +1320,7 @@ export class SessionManager {
       buildCommitOffer: null,
       buildIntegrateOffer: null,
       buildBaseBranch: rememberedBase,
+      buildFlowCompletedAt: null,
       testRun: null,
       testingConfirmedAt: null,
       testGatePassedAt: null,
@@ -1702,7 +1752,7 @@ export class SessionManager {
     this.testGateInFlight = true;
     try {
       const profile = new ArchitectureStore(root).loadOrDetect().profile;
-      const specs = discoverTestRunSpecs(profile, { includeE2e: false });
+      const specs = discoverTestRunSpecs(profile, { includeE2e: true });
       if (specs.length === 0) {
         const skippedAt = new Date().toISOString();
         this.state = {
@@ -1713,7 +1763,7 @@ export class SessionManager {
             status: "skipped",
             specs: [],
             suites: [],
-            digest: "No lint/typecheck/unit commands in architecture profile.",
+            digest: "No lint/typecheck/unit/e2e commands in architecture profile.",
           },
           testGatePassedAt: skippedAt,
           testGateAutoFixAttempts: 0,
@@ -1974,6 +2024,21 @@ export class SessionManager {
   }
 
   /**
+   * Commit/integrate flow settled with nothing pending: stamp completion so
+   * the renderer can offer Archive chat. No-op while an offer is still open.
+   */
+  private markBuildFlowCompleteIfSettled(): void {
+    if (this.state.buildCommitOffer || this.state.buildIntegrateOffer) return;
+    if (this.state.buildFlowCompletedAt) return;
+    this.state = {
+      ...this.state,
+      buildFlowCompletedAt: new Date().toISOString(),
+    };
+    this.persist();
+    this.push();
+  }
+
+  /**
    * After tests (and after commit/skip when applicable): offer remote PR or
    * local merge into the Start Build base branch.
    */
@@ -2077,12 +2142,9 @@ export class SessionManager {
         if (
           chunk.type === "done" &&
           chunk.usage &&
-          this.providerStore &&
           (chunk.usage.inputTokens > 0 || chunk.usage.outputTokens > 0)
         ) {
-          const hud = this.providerStore.recordUsage(chunk.usage);
-          this.state = { ...this.state, providerHud: hud };
-          this.push();
+          this.applyProviderUsage(chunk.usage);
         }
         if (chunk.type === "error") {
           return {
@@ -2174,6 +2236,8 @@ export class SessionManager {
       if (staged.length === 0) {
         this.state = { ...this.state, buildCommitOffer: null };
         this.push();
+        await this.maybeOfferIntegrate();
+        this.markBuildFlowCompleteIfSettled();
         return {
           ok: false,
           error: {
@@ -2198,6 +2262,7 @@ export class SessionManager {
       this.persist();
       this.push();
       await this.maybeOfferIntegrate();
+      this.markBuildFlowCompleteIfSettled();
       return { ok: true, commit, state: this.state };
     } catch (error) {
       return {
@@ -2212,16 +2277,18 @@ export class SessionManager {
     }
   }
 
-  dismissBuildCommit(): { ok: boolean; state: SessionState } {
+  async dismissBuildCommit(): Promise<{ ok: boolean; state: SessionState }> {
     this.state = { ...this.state, buildCommitOffer: null };
     this.push();
-    void this.maybeOfferIntegrate();
+    await this.maybeOfferIntegrate();
+    this.markBuildFlowCompleteIfSettled();
     return { ok: true, state: this.state };
   }
 
   dismissBuildIntegrate(): { ok: boolean; state: SessionState } {
     this.state = { ...this.state, buildIntegrateOffer: null };
     this.push();
+    this.markBuildFlowCompleteIfSettled();
     return { ok: true, state: this.state };
   }
 
@@ -2275,6 +2342,7 @@ export class SessionManager {
         };
         this.persist();
         this.push();
+        this.markBuildFlowCompleteIfSettled();
         return { ok: true, state: this.state };
       }
 
@@ -2306,6 +2374,7 @@ export class SessionManager {
       };
       this.persist();
       this.push();
+      this.markBuildFlowCompleteIfSettled();
       return { ok: true, url: pr.url, state: this.state };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);

@@ -134,6 +134,14 @@ export const COMMAND_DENYLIST = [
   ":(){ :|:& };:",
 ];
 
+/**
+ * Git write ops that only the harness UI may perform (Commit Build /
+ * Integrate banners). Matched with flexible whitespace so
+ * `git  commit` / multiline terminal paste still block.
+ */
+const HARNESS_ONLY_GIT_RE =
+  /\bgit\s+(commit|push|rebase|am|cherry-pick)(?:\s|$)/i;
+
 export function analyzeCommand(command: string): {
   blocked: boolean;
   needsApproval: boolean;
@@ -141,6 +149,15 @@ export function analyzeCommand(command: string): {
   allowlisted: boolean;
 } {
   const normalized = command.trim().toLowerCase();
+  const harnessGit = HARNESS_ONLY_GIT_RE.exec(command);
+  if (harnessGit) {
+    return {
+      blocked: true,
+      needsApproval: true,
+      matchedDeny: `git ${harnessGit[1]!.toLowerCase()}`,
+      allowlisted: false,
+    };
+  }
   for (const denied of COMMAND_DENYLIST) {
     if (normalized.includes(denied.toLowerCase())) {
       return { blocked: true, needsApproval: true, matchedDeny: denied, allowlisted: false };

@@ -314,15 +314,21 @@ export function detectArchitectureProfile(
         ? {
             e2e: {
               lib: e2eLib,
-              ...(scripts.cypress || scripts["cypress:run"] || scripts.e2e
-                ? {
-                    command: scripts["cypress:run"]
-                      ? run("cypress:run")
-                      : scripts.e2e
-                        ? run("e2e")
-                        : run("cypress"),
-                  }
-                : {}),
+              // Semantic e2e scripts first: they usually wrap
+              // start-server-and-test and are self-contained for the gate.
+              // Bare `cypress` last (often `cypress open`, interactive).
+              ...(() => {
+                const e2eScript = [
+                  "test:e2e",
+                  "e2e",
+                  "e2e:run",
+                  "e2e:headless",
+                  "cypress:run",
+                  "cy:run",
+                  "cypress",
+                ].find((name) => scripts[name]);
+                return e2eScript ? { command: run(e2eScript) } : {};
+              })(),
               ...(fileExists(workspaceRoot, "cypress")
                 ? { roots: ["cypress"] }
                 : fileExists(workspaceRoot, "e2e")

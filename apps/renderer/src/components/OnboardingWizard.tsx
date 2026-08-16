@@ -1,8 +1,22 @@
 import { useEffect, useRef, useState } from "react";
-import { parseUsdRate } from "@ai-ide/shared";
+import {
+  parseUsdRate,
+  REASONING_EFFORT_VALUES,
+  type ReasoningEffort,
+} from "@ai-ide/shared";
 import { getBridge } from "../bridge";
 
-type Step = "list" | "baseUrl" | "apiKey" | "verify" | "model";
+/** Digit shortcut (1-based) and label for each effort button. */
+const EFFORT_OPTIONS = REASONING_EFFORT_VALUES.map((value, i) => ({
+  value,
+  shortcut: String(i + 1),
+  label:
+    value === "xhigh"
+      ? "XHigh"
+      : value.charAt(0).toUpperCase() + value.slice(1),
+}));
+
+type View = "list" | "form";
 
 type ListedProvider = {
   id: string;
@@ -24,6 +38,12 @@ function isTypingTarget(target: EventTarget | null): boolean {
   );
 }
 
+/** e.code "Digit1"…"Digit9" → 1…9 (shift/alt-safe, unlike e.key). */
+function digitFromCode(code: string): number | null {
+  const m = /^Digit([1-9])$/.exec(code);
+  return m ? Number(m[1]) : null;
+}
+
 const DEFAULT_BASE_URL = "http://localhost:11434/v1";
 
 export function OnboardingWizard(props: {
@@ -31,7 +51,7 @@ export function OnboardingWizard(props: {
   onComplete: () => void;
   onCancel: () => void;
 }) {
-  const [step, setStep] = useState<Step>("list");
+  const [view, setView] = useState<View>("list");
   const [providers, setProviders] = useState<ListedProvider[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -44,43 +64,35 @@ export function OnboardingWizard(props: {
   const [inputPer1M, setInputPer1M] = useState("");
   const [outputPer1M, setOutputPer1M] = useState("");
   const [thinking, setThinking] = useState(false);
-  const [reasoningEffort, setReasoningEffort] = useState<"low" | "high" | "max">(
-    "high",
-  );
+  const [reasoningEffort, setReasoningEffort] =
+    useState<ReasoningEffort>("high");
   const [busy, setBusy] = useState(false);
+  const [listing, setListing] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const { open, onCancel, onComplete } = props;
   const stateRef = useRef({
-    step,
+    view,
     busy,
+    listing,
     model,
     baseUrl,
     apiKey,
-    name,
-    paid,
-    inputPer1M,
-    outputPer1M,
     thinking,
-    reasoningEffort,
     editingId,
     providers,
     onCancel,
     onComplete,
   });
   stateRef.current = {
-    step,
+    view,
     busy,
+    listing,
     model,
     baseUrl,
     apiKey,
-    name,
-    paid,
-    inputPer1M,
-    outputPer1M,
     thinking,
-    reasoningEffort,
     editingId,
     providers,
     onCancel,
@@ -96,35 +108,15 @@ export function OnboardingWizard(props: {
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    setStep("list");
+    setView("list");
     setBusy(false);
+    setListing(false);
     setHydrated(false);
     setEditingId(null);
     setError(null);
     void (async () => {
       try {
         await refreshList();
-        const cfg = await getBridge()?.provider.getConfig();
-        if (cancelled) return;
-        setBaseUrl(cfg?.baseUrl?.trim() ? cfg.baseUrl : DEFAULT_BASE_URL);
-        setApiKey(cfg?.apiKey ?? "");
-        setName(cfg?.name ?? "");
-        setPaid(Boolean(cfg?.paid));
-        setInputPer1M(
-          cfg?.pricing?.inputPer1M != null
-            ? String(cfg.pricing.inputPer1M)
-            : "",
-        );
-        setOutputPer1M(
-          cfg?.pricing?.outputPer1M != null
-            ? String(cfg.pricing.outputPer1M)
-            : "",
-        );
-        setThinking(Boolean(cfg?.thinking));
-        setReasoningEffort(cfg?.reasoningEffort ?? "high");
-        setModel(cfg?.defaultModel ?? "");
-        setModels([]);
-        setEditingId(cfg?.id ?? null);
       } catch {
         /* ignore */
       } finally {
@@ -149,7 +141,7 @@ export function OnboardingWizard(props: {
     setThinking(false);
     setReasoningEffort("high");
     setError(null);
-    setStep("baseUrl");
+    setView("form");
   }
 
   async function startEdit(id: string) {
@@ -163,7 +155,7 @@ export function OnboardingWizard(props: {
       setBaseUrl(cfg?.baseUrl ?? DEFAULT_BASE_URL);
       setApiKey(cfg?.apiKey ?? "");
       setModel(cfg?.defaultModel ?? "");
-      // Don't pretend we listed models — force a fresh List models for the select.
+      // Don't pretend we listed models — user can re-list from the form.
       setModels([]);
       setPaid(Boolean(cfg?.paid));
       setInputPer1M(
@@ -176,7 +168,7 @@ export function OnboardingWizard(props: {
       );
       setThinking(Boolean(cfg?.thinking));
       setReasoningEffort(cfg?.reasoningEffort ?? "high");
-      setStep("baseUrl");
+      setView("form");
       await refreshList();
     } finally {
       setBusy(false);
@@ -204,10 +196,10 @@ export function OnboardingWizard(props: {
     }
   }
 
-  async function verify() {
+  async function listModels() {
     const bridge = getBridge();
-    if (!bridge) return;
-    setBusy(true);
+    if (!bridge || stateRef.current.listing) return;
+    setListing(true);
     setError(null);
     try {
       const { baseUrl: url, apiKey: key, model: currentModel } =
@@ -234,28 +226,27 @@ export function OnboardingWizard(props: {
         setError(
           "Provider returned no models. Check the base URL / API key, or type a model id manually.",
         );
-        setStep("model");
         return;
       }
       setModels(listed);
       setModel((prev) => (prev && listed.includes(prev) ? prev : listed[0]!));
       setError(null);
-      setStep("model");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setBusy(false);
+      setListing(false);
     }
   }
 
   async function save() {
     const bridge = getBridge();
     const s = stateRef.current;
-    if (!bridge || !s.model.trim()) return;
+    if (!bridge || s.busy || !s.model.trim()) return;
     setBusy(true);
+    setError(null);
     try {
-      const inRaw = s.inputPer1M.trim();
-      const outRaw = s.outputPer1M.trim();
+      const inRaw = inputPer1M.trim();
+      const outRaw = outputPer1M.trim();
       const inRate = inRaw ? parseUsdRate(inRaw) : undefined;
       const outRate = outRaw ? parseUsdRate(outRaw) : undefined;
       if (inRaw && inRate == null) {
@@ -281,14 +272,14 @@ export function OnboardingWizard(props: {
           : undefined;
       await bridge.provider.saveConfig({
         ...(s.editingId ? { id: s.editingId } : {}),
-        name: s.name.trim() || (s.paid ? "Cloud provider" : "Local provider"),
+        name: name.trim() || (paid ? "Cloud provider" : "Local provider"),
         baseUrl: s.baseUrl,
         apiKey: s.apiKey,
         defaultModel: s.model.trim(),
-        paid: s.paid,
+        paid,
         ...(pricing && Object.keys(pricing).length ? { pricing } : {}),
-        thinking: s.thinking,
-        reasoningEffort: s.reasoningEffort,
+        thinking,
+        reasoningEffort,
         makeActive: true,
       });
       await refreshList();
@@ -300,90 +291,80 @@ export function OnboardingWizard(props: {
     }
   }
 
-  function goBack() {
-    const { step: current } = stateRef.current;
-    if (current === "baseUrl") setStep("list");
-    else if (current === "apiKey") setStep("baseUrl");
-    else if (current === "verify") setStep("apiKey");
-    else if (current === "model") setStep("verify");
+  function saveRef() {
+    // Stable entry point for the keydown handler (save reads via stateRef).
+    void save();
   }
-
-  function submitStep() {
-    const { step: current, busy: isBusy, model: currentModel } =
-      stateRef.current;
-    if (isBusy) return;
-    if (current === "list") return;
-    if (current === "baseUrl") setStep("apiKey");
-    else if (current === "apiKey") setStep("verify");
-    else if (current === "verify") void verify();
-    else if (current === "model" && currentModel.trim()) void save();
-  }
+  const saveRefStable = useRef(saveRef);
+  saveRefStable.current = saveRef;
 
   useEffect(() => {
     if (!open) return;
     function onKey(e: KeyboardEvent) {
+      const s = stateRef.current;
+
       if (e.key === "Escape") {
         e.preventDefault();
-        if (stateRef.current.step === "list") stateRef.current.onCancel();
-        else goBack();
+        e.stopPropagation();
+        if (s.view === "form") {
+          setError(null);
+          setView("list");
+        } else {
+          s.onCancel();
+        }
         return;
       }
 
-      if (stateRef.current.step === "list" && !isTypingTarget(e.target)) {
-        if (e.key.toLowerCase() === "a") {
-          e.preventDefault();
-          startNew();
-          return;
+      if (s.view === "list") {
+        const digit = digitFromCode(e.code);
+        if (!isTypingTarget(e.target)) {
+          if (e.key.toLowerCase() === "a" && !e.metaKey && !e.altKey) {
+            e.preventDefault();
+            startNew();
+            return;
+          }
+          if (digit && s.providers[digit - 1]) {
+            const provider = s.providers[digit - 1]!;
+            e.preventDefault();
+            if (e.metaKey) void startEdit(provider.id);
+            else if (e.altKey) void remove(provider.id);
+            else void activate(provider.id);
+            return;
+          }
         }
-        const digit = Number(e.key);
-        if (
-          digit >= 1 &&
-          digit <= 9 &&
-          stateRef.current.providers[digit - 1]
-        ) {
-          e.preventDefault();
-          void activate(stateRef.current.providers[digit - 1]!.id);
-          return;
-        }
+        return;
       }
 
-      if (
-        stateRef.current.step === "model" &&
-        !isTypingTarget(e.target)
-      ) {
-        if (e.key.toLowerCase() === "t") {
+      // Form view.
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        void listModels();
+        return;
+      }
+      if (!isTypingTarget(e.target)) {
+        if (e.key.toLowerCase() === "t" && !e.metaKey && !e.altKey) {
           e.preventDefault();
           setThinking((v) => !v);
           return;
         }
-        if (stateRef.current.thinking) {
-          if (e.key === "1") {
+        if (e.key === "Backspace") {
+          e.preventDefault();
+          setError(null);
+          setView("list");
+          return;
+        }
+        if (s.thinking) {
+          const opt = EFFORT_OPTIONS.find((o) => o.shortcut === e.key);
+          if (opt) {
             e.preventDefault();
-            setReasoningEffort("low");
-            return;
-          }
-          if (e.key === "2") {
-            e.preventDefault();
-            setReasoningEffort("high");
-            return;
-          }
-          if (e.key === "3") {
-            e.preventDefault();
-            setReasoningEffort("max");
+            setReasoningEffort(opt.value);
             return;
           }
         }
       }
-
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        submitStep();
-        return;
-      }
-
-      if (e.key === "Backspace" && !isTypingTarget(e.target)) {
-        e.preventDefault();
-        goBack();
+        saveRefStable.current();
       }
     }
     window.addEventListener("keydown", onKey, true);
@@ -392,181 +373,122 @@ export function OnboardingWizard(props: {
 
   if (!open) return null;
 
-  const body = !hydrated ? (
-    <p style={{ color: "var(--text-muted)", margin: 0 }}>Loading…</p>
-  ) : (
+  const listView = (
     <>
-      {step === "list" && (
-        <div className="field">
-          <p className="muted" style={{ marginTop: 0 }}>
-            Saved providers. Activate one or add a new OpenAI-compatible
-            endpoint.
-          </p>
-          <ul className="provider-list">
-            {providers.map((p, index) => (
-              <li
-                key={p.id}
-                className={
-                  p.id === activeId
-                    ? "provider-list-item provider-list-item-active"
-                    : "provider-list-item"
-                }
-              >
-                <button
-                  type="button"
-                  className="provider-list-main"
-                  disabled={busy}
-                  onClick={() => void activate(p.id)}
-                >
-                  <span className="provider-list-name">
-                    {p.paid ? <span className="provider-paid-sign">$</span> : null}
-                    {p.name}
-                  </span>
-                  <span className="provider-list-meta">
-                    {p.defaultModel} · {p.baseUrl}
-                  </span>
-                  <span className="provider-list-sc">
-                    {index < 9 ? `· ${index + 1}` : ""}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-sm"
-                  disabled={busy}
-                  onClick={() => void startEdit(p.id)}
-                >
-                  Edit
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-sm"
-                  disabled={busy}
-                  onClick={() => void remove(p.id)}
-                >
-                  Delete
-                </button>
-              </li>
-            ))}
-            {providers.length === 0 ? (
-              <li className="muted">No providers yet.</li>
-            ) : null}
-          </ul>
-          <div className="onboarding-actions">
+      <p className="provider-dialog-lead">
+        Saved providers. Activate one or add a new OpenAI-compatible endpoint.
+      </p>
+      <ul className="provider-list">
+        {providers.map((p, index) => (
+          <li
+            key={p.id}
+            className={
+              p.id === activeId
+                ? "provider-list-item provider-list-item-active"
+                : "provider-list-item"
+            }
+          >
             <button
               type="button"
-              className="btn btn-secondary"
-              onClick={onCancel}
-            >
-              Close · Esc
-            </button>
-            <button type="button" className="btn" onClick={startNew}>
-              Add provider · A
-            </button>
-          </div>
-        </div>
-      )}
-
-      {step === "baseUrl" && (
-        <div className="field">
-          <label htmlFor="providerName">Display name</label>
-          <input
-            id="providerName"
-            className="input"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. OpenAI, Ollama, Together"
-            autoFocus
-          />
-          <label htmlFor="baseUrl">Base URL</label>
-          <input
-            id="baseUrl"
-            className="input"
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
-          />
-          <div className="onboarding-actions">
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={() => setStep("list")}
-            >
-              Back · ⌫
-            </button>
-            <button
-              type="button"
-              className="btn"
-              onClick={() => setStep("apiKey")}
-            >
-              Continue · Enter
-            </button>
-          </div>
-        </div>
-      )}
-
-      {step === "apiKey" && (
-        <div className="field">
-          <label htmlFor="apiKey">API key (optional for local)</label>
-          <input
-            id="apiKey"
-            className="input"
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            autoFocus
-          />
-          <div className="onboarding-actions">
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={() => setStep("baseUrl")}
-            >
-              Back · ⌫
-            </button>
-            <button
-              type="button"
-              className="btn"
-              onClick={() => setStep("verify")}
-            >
-              Continue · Enter
-            </button>
-          </div>
-        </div>
-      )}
-
-      {step === "verify" && (
-        <div className="field">
-          <p>List models from this endpoint to confirm it works.</p>
-          {error ? <p className="start-build-error">{error}</p> : null}
-          <div className="onboarding-actions">
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={() => setStep("apiKey")}
-            >
-              Back · ⌫
-            </button>
-            <button
-              type="button"
-              className="btn"
+              className="provider-list-main"
               disabled={busy}
-              onClick={() => void verify()}
+              onClick={() => void activate(p.id)}
             >
-              {busy ? "Listing…" : "List models · Enter"}
+              <span className="provider-list-name">
+                {p.paid ? <span className="provider-paid-sign">$</span> : null}
+                {p.name}
+              </span>
+              <span className="provider-list-meta">
+                {p.defaultModel} · {p.baseUrl}
+              </span>
+              <span className="provider-list-sc">
+                {index < 9 ? `· ${index + 1}` : ""}
+              </span>
             </button>
-          </div>
-        </div>
-      )}
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={busy}
+              onClick={() => void startEdit(p.id)}
+            >
+              Edit{index < 9 ? ` · ⌘${index + 1}` : ""}
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={busy}
+              onClick={() => void remove(p.id)}
+            >
+              Delete{index < 9 ? ` · ⌥${index + 1}` : ""}
+            </button>
+          </li>
+        ))}
+        {providers.length === 0 ? (
+          <li className="muted">No providers yet.</li>
+        ) : null}
+      </ul>
+      <div className="onboarding-actions">
+        <button type="button" className="btn btn-secondary" onClick={onCancel}>
+          Close · Esc
+        </button>
+        <button type="button" className="btn" onClick={startNew}>
+          Add provider · A
+        </button>
+      </div>
+    </>
+  );
 
-      {step === "model" && (
-        <div className="field">
-          <label htmlFor="model">Default model</label>
+  const formView = (
+    <form
+      className="provider-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void save();
+      }}
+    >
+      <div className="field">
+        <label htmlFor="providerName">Display name</label>
+        <input
+          id="providerName"
+          className="input"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="e.g. OpenAI, Ollama, Together"
+          autoFocus
+        />
+      </div>
+
+      <div className="field">
+        <label htmlFor="baseUrl">Base URL</label>
+        <input
+          id="baseUrl"
+          className="input"
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+          placeholder={DEFAULT_BASE_URL}
+        />
+      </div>
+
+      <div className="field">
+        <label htmlFor="apiKey">API key (optional for local)</label>
+        <input
+          id="apiKey"
+          className="input"
+          type="password"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+        />
+      </div>
+
+      <div className="field">
+        <label htmlFor="model">Default model</label>
+        <div className="provider-model-row">
           {models.length > 0 ? (
             <select
               id="model"
               className="input"
               value={model}
               onChange={(e) => setModel(e.target.value)}
-              autoFocus
             >
               {models.map((m) => (
                 <option key={m} value={m}>
@@ -581,140 +503,164 @@ export function OnboardingWizard(props: {
               value={model}
               placeholder="e.g. gpt-4o-mini"
               onChange={(e) => setModel(e.target.value)}
-              autoFocus
             />
           )}
-          <span className="start-build-hint">
-            {models.length > 0
-              ? `${models.length} model${models.length === 1 ? "" : "s"} from provider`
-              : "No list yet — re-run List models or type an id"}
-          </span>
-          {error ? <p className="start-build-error">{error}</p> : null}
-
-          <label className="start-build-check" style={{ marginTop: 12 }}>
-            <input
-              type="checkbox"
-              checked={paid}
-              onChange={(e) => setPaid(e.target.checked)}
-            />
-            <span>
-              Paid provider <span className="provider-paid-sign">$</span> —
-              show cost estimates in the top bar
-            </span>
-          </label>
-
-          {paid ? (
-            <div className="provider-pricing-grid">
-              <label>
-                Input $/1M tokens
-                <input
-                  className="input"
-                  inputMode="decimal"
-                  placeholder="e.g. 2,5 or 2.5"
-                  value={inputPer1M}
-                  onChange={(e) => setInputPer1M(e.target.value)}
-                />
-              </label>
-              <label>
-                Output $/1M tokens
-                <input
-                  className="input"
-                  inputMode="decimal"
-                  placeholder="e.g. 10 or 10,00"
-                  value={outputPer1M}
-                  onChange={(e) => setOutputPer1M(e.target.value)}
-                />
-              </label>
-            </div>
-          ) : null}
-
-          <label className="start-build-check" style={{ marginTop: 12 }}>
-            <input
-              type="checkbox"
-              checked={thinking}
-              onChange={(e) => setThinking(e.target.checked)}
-            />
-            <span>
-              Thinking mode · T — DeepSeek-style chain-of-thought (
-              <code>thinking</code> + <code>reasoning_effort</code>)
-            </span>
-          </label>
-
-          {thinking ? (
-            <div className="provider-effort-row" role="group" aria-label="Reasoning effort">
-              {(
-                [
-                  ["low", "1"],
-                  ["high", "2"],
-                  ["max", "3"],
-                ] as const
-              ).map(([value, sc]) => (
-                <button
-                  key={value}
-                  type="button"
-                  className={
-                    reasoningEffort === value
-                      ? "btn btn-sm"
-                      : "btn btn-secondary btn-sm"
-                  }
-                  onClick={() => setReasoningEffort(value)}
-                >
-                  {value === "low"
-                    ? "Low"
-                    : value === "high"
-                      ? "High"
-                      : "Max"}{" "}
-                  · {sc}
-                </button>
-              ))}
-            </div>
-          ) : null}
-
-          <div className="onboarding-actions">
-            <button
-              type="button"
-              className="btn btn-secondary"
-              disabled={busy}
-              onClick={() => {
-                setError(null);
-                setStep("verify");
-              }}
-            >
-              Re-list · ⌫
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={busy || !model.trim()}
-              onClick={() => void save()}
-            >
-              Save · Enter
-            </button>
-          </div>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            disabled={listing}
+            onClick={() => void listModels()}
+          >
+            {listing ? "Listing…" : "List models · ⌘L"}
+          </button>
         </div>
-      )}
-    </>
+        <span className="start-build-hint">
+          {models.length > 0
+            ? `${models.length} model${models.length === 1 ? "" : "s"} from provider`
+            : "List models from the endpoint, or type a model id manually"}
+        </span>
+      </div>
+
+      <label className="start-build-check">
+        <input
+          type="checkbox"
+          checked={paid}
+          onChange={(e) => setPaid(e.target.checked)}
+        />
+        <span>
+          Paid provider <span className="provider-paid-sign">$</span> — show
+          cost estimates in the top bar
+        </span>
+      </label>
+
+      {paid ? (
+        <div className="provider-pricing-grid">
+          <label>
+            Input $/1M tokens
+            <input
+              className="input"
+              inputMode="decimal"
+              placeholder="e.g. 2,5 or 2.5"
+              value={inputPer1M}
+              onChange={(e) => setInputPer1M(e.target.value)}
+            />
+          </label>
+          <label>
+            Output $/1M tokens
+            <input
+              className="input"
+              inputMode="decimal"
+              placeholder="e.g. 10 or 10,00"
+              value={outputPer1M}
+              onChange={(e) => setOutputPer1M(e.target.value)}
+            />
+          </label>
+        </div>
+      ) : null}
+
+      <label className="start-build-check">
+        <input
+          type="checkbox"
+          checked={thinking}
+          onChange={(e) => setThinking(e.target.checked)}
+        />
+        <span>
+          Thinking mode · T — DeepSeek-style chain-of-thought (
+          <code>thinking</code> + <code>reasoning_effort</code>)
+        </span>
+      </label>
+
+      {thinking ? (
+        <div
+          className="provider-effort-row"
+          role="group"
+          aria-label="Reasoning effort"
+        >
+          {EFFORT_OPTIONS.map(({ value, shortcut, label }) => (
+            <button
+              key={value}
+              type="button"
+              className={
+                reasoningEffort === value
+                  ? "btn btn-sm"
+                  : "btn btn-secondary btn-sm"
+              }
+              onClick={() => setReasoningEffort(value)}
+            >
+              {label} · {shortcut}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {error ? <p className="start-build-error">{error}</p> : null}
+
+      <div className="onboarding-actions">
+        <button
+          type="button"
+          className="btn btn-secondary"
+          disabled={busy}
+          onClick={() => {
+            setError(null);
+            setView("list");
+          }}
+        >
+          Back · Esc
+        </button>
+        <button
+          type="submit"
+          className="btn"
+          disabled={busy || listing || !model.trim()}
+        >
+          {busy ? "Saving…" : "Save · Enter"}
+        </button>
+      </div>
+    </form>
   );
 
   return (
-    <div className="overlay" role="presentation">
+    <div className="overlay provider-overlay" role="presentation">
       <div
-        className="dialog onboarding-dialog"
+        className="provider-dialog"
         role="dialog"
         aria-modal="true"
         aria-labelledby="provider-dialog-title"
       >
-        <div className="dialog-header">
-          <h2 id="provider-dialog-title">Providers</h2>
+        <div className="provider-dialog-header">
+          <div>
+            <div className="provider-dialog-kicker">Providers</div>
+            <h2 className="provider-dialog-title" id="provider-dialog-title">
+              {view === "list"
+                ? "Model providers"
+                : editingId
+                  ? "Edit provider"
+                  : "New provider"}
+            </h2>
+          </div>
           <button
             type="button"
             className="btn btn-secondary btn-sm"
-            onClick={onCancel}
+            onClick={() => {
+              if (view === "form") {
+                setError(null);
+                setView("list");
+              } else {
+                onCancel();
+              }
+            }}
           >
-            Esc
+            {view === "form" ? "Back · Esc" : "Close · Esc"}
           </button>
         </div>
-        <div className="dialog-body">{body}</div>
+        <div className="provider-dialog-body">
+          {!hydrated ? (
+            <p className="provider-dialog-lead">Loading…</p>
+          ) : view === "list" ? (
+            listView
+          ) : (
+            formView
+          )}
+        </div>
       </div>
     </div>
   );

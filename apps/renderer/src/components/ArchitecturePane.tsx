@@ -61,7 +61,7 @@ export function ArchitecturePane(props: Props) {
   );
   const [intent, setIntent] = useState("");
   const [drift, setDrift] = useState<
-    Array<{ path: string; derived: unknown; override: unknown }>
+    Array<{ path: string; derived?: unknown; override?: unknown }>
   >([]);
   const [fromFile, setFromFile] = useState(false);
   const [busy, setBusy] = useState(false);

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { ProviderHudSchema } from "./providers.js";
+import { ProviderHudSchema, SessionModelUsageSchema } from "./providers.js";
 
 export const AgentModeSchema = z.enum(["ask", "plan", "agent", "autonomous"]);
 export type AgentMode = z.infer<typeof AgentModeSchema>;
@@ -277,6 +277,11 @@ export const SessionStateSchema = z.object({
    * Used as default merge/PR target after the test gate.
    */
   buildBaseBranch: z.string().nullable().default(null),
+  /**
+   * Set when the post-build commit/integrate flow finished (commit + merge/PR,
+   * or skipped). Enables the Archive chat banner. Cleared on Start Build.
+   */
+  buildFlowCompletedAt: z.string().datetime().nullable().default(null),
   /** Last / in-flight post-build test gate (IDE-run). Full logs live in-process. */
   testRun: TestRunReportSchema.nullable().default(null),
   /**
@@ -353,6 +358,8 @@ export const SessionStateSchema = z.object({
   pendingTerminalAsk: PendingTerminalAskSchema.nullable().default(null),
   /** Active provider + token/cost counters for the chrome HUD. */
   providerHud: ProviderHudSchema.nullable().default(null),
+  /** Models used in this chat session with token/cost breakdown. */
+  sessionModelUsage: z.array(SessionModelUsageSchema).default([]),
   error: z.string().nullable(),
 });
 export type SessionState = z.infer<typeof SessionStateSchema>;
@@ -571,6 +578,7 @@ export function createEmptySessionState(sessionId: string): SessionState {
     buildCommitOffer: null,
     buildIntegrateOffer: null,
     buildBaseBranch: null,
+    buildFlowCompletedAt: null,
     testRun: null,
     testingConfirmedAt: null,
     testGatePassedAt: null,
@@ -591,6 +599,7 @@ export function createEmptySessionState(sessionId: string): SessionState {
     pendingTerminalConfirm: null,
     pendingTerminalAsk: null,
     providerHud: null,
+    sessionModelUsage: [],
     error: null,
   };
 }

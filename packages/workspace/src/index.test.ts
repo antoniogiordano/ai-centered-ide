@@ -226,6 +226,29 @@ describe("ArchitectureStore", () => {
     );
     rmSync(dir, { recursive: true });
   });
+
+  it("detects the cypress e2e command from a test:e2e script", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aifi-arch-e2e-"));
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({
+        name: "e2e-app",
+        scripts: {
+          test: "jest",
+          "test:e2e":
+            'start-server-and-test dev http://localhost:3000 "cypress run"',
+        },
+        devDependencies: { cypress: "^15.0.0", jest: "^29.0.0" },
+      }),
+    );
+    mkdirSync(join(dir, "cypress"));
+
+    const detected = detectArchitectureProfile(dir);
+    expect(detected.testing?.e2e?.lib).toBe("cypress");
+    expect(detected.testing?.e2e?.command).toBe("npm run test:e2e");
+    expect(detected.testing?.e2e?.roots).toEqual(["cypress"]);
+    rmSync(dir, { recursive: true });
+  });
 });
 
 describe("createEmptyProject + GitService remotes", () => {

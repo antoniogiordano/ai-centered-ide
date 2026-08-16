@@ -19,6 +19,9 @@ export const TEST_DIGEST_MAX_CHARS = 8_000;
 /** Extra excerpt from full suite logs embedded in the digest. */
 export const TEST_DIGEST_LOG_EXCERPT_CHARS = 3_500;
 
+/** E2E suites (cypress/playwright) boot browsers + dev servers: 10 min. */
+export const TEST_GATE_E2E_TIMEOUT_MS = 600_000;
+
 /** Same failure fingerprint streak before strategy escalation. */
 export const TEST_GATE_ESCALATION_AFTER = 2;
 
@@ -109,6 +112,7 @@ export function discoverTestRunSpecs(
         kind: "e2e",
         command: e2eCmd,
         platform: platformForTestKind("e2e", profile, e2eCmd),
+        timeoutMs: TEST_GATE_E2E_TIMEOUT_MS,
       });
     }
   }
@@ -119,7 +123,7 @@ export function discoverTestRunSpecs(
 export function formatTestGateForBuildPrompt(
   profile: ArchitectureProfile | null | undefined,
 ): string {
-  const specs = discoverTestRunSpecs(profile, { includeE2e: false });
+  const specs = discoverTestRunSpecs(profile, { includeE2e: true });
   const unitLib = profile?.testing?.unit?.lib?.trim();
   const e2eLib = profile?.testing?.e2e?.lib?.trim();
   const lines: string[] = [
@@ -127,7 +131,7 @@ export function formatTestGateForBuildPrompt(
   ];
   if (specs.length === 0) {
     lines.push(
-      "- No lint/typecheck/unit commands detected in the architecture profile yet.",
+      "- No lint/typecheck/unit/e2e commands detected in the architecture profile yet.",
       "- Still write appropriate automated tests for new behavior (match the project stack).",
       "- Do NOT run lint/test/typecheck suites yourself via run_command or terminal_* during Build — after the checklist, call propose_testing_ready so the IDE runs them.",
       "- Install test runners/deps if the plan needs them; create/edit test files with replace_in_file (edits) or write_file (new files); leave execution to the IDE gate.",
@@ -144,6 +148,11 @@ export function formatTestGateForBuildPrompt(
             ? ` · lib=${e2eLib}`
             : "";
       lines.push(`  - [${spec.id}] ${spec.kind}${libHint}: \`${spec.command}\``);
+    }
+    if (specs.some((s) => s.kind === "e2e")) {
+      lines.push(
+        "- The e2e command must be self-contained: the gate runs it headless with no dev server running. If it needs the app up, make the script start (and stop) it, e.g. via start-server-and-test.",
+      );
     }
     lines.push(
       "- Create the test/spec files those suites need as you implement (co-locate or follow project conventions).",

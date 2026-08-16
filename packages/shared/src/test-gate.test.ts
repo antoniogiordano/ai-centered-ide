@@ -49,9 +49,16 @@ describe("discoverTestRunSpecs", () => {
         quality: { ...profile.quality, lint: "pnpm eslint ." },
       }).find((s) => s.id === "lint")?.platform,
     ).toBe("eslint");
-    expect(
-      discoverTestRunSpecs(profile, { includeE2e: true }).map((s) => s.id),
-    ).toEqual(["lint", "typecheck", "unit", "e2e"]);
+    const withE2e = discoverTestRunSpecs(profile, { includeE2e: true });
+    expect(withE2e.map((s) => s.id)).toEqual([
+      "lint",
+      "typecheck",
+      "unit",
+      "e2e",
+    ]);
+    const e2e = withE2e.find((s) => s.id === "e2e");
+    expect(e2e?.platform).toBe("playwright");
+    expect(e2e?.timeoutMs).toBe(600_000);
   });
 });
 
@@ -349,6 +356,19 @@ describe("formatTestGateForBuildPrompt", () => {
     expect(text).toContain("pnpm lint");
     expect(text).toMatch(/data-testid/i);
     expect(text).toMatch(/Do NOT (execute|run)/i);
+  });
+
+  it("lists the e2e suite and its self-contained requirement", () => {
+    const base = createEmptyArchitectureProfile("app");
+    const text = formatTestGateForBuildPrompt({
+      ...base,
+      testing: {
+        unit: { lib: "vitest", command: "pnpm test" },
+        e2e: { lib: "cypress", command: "pnpm cypress:run" },
+      },
+    });
+    expect(text).toContain("[e2e] e2e · lib=cypress: `pnpm cypress:run`");
+    expect(text).toMatch(/self-contained/i);
   });
 
   it("formats escalation system rules", () => {

@@ -4,7 +4,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type MouseEvent,
   type UIEvent,
 } from "react";
 import type {
@@ -26,6 +25,9 @@ import { LiveTerminalPane } from "./LiveTerminalPane";
 import { DiffNavigator } from "./DiffNavigator";
 import { BuildContinueBanner } from "./BuildContinueBanner";
 import { StartBuildBanner } from "./StartBuildBanner";
+import { CommitBuildBanner } from "./CommitBuildBanner";
+import { IntegrateBuildBanner } from "./IntegrateBuildBanner";
+import { ArchiveChatBanner } from "./ArchiveChatBanner";
 import { TestingReportBoard } from "./TestingReportBoard";
 import { playChecklistChime } from "../lib/checklistSound";
 
@@ -258,13 +260,6 @@ function ToolLogCard(props: {
       ) : null}
     </div>
   );
-}
-
-function modShiftHint(key: string): string {
-  const isApple =
-    typeof navigator !== "undefined" &&
-    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
-  return isApple ? `⌘⇧${key}` : `Ctrl+Shift+${key}`;
 }
 
 function roleHeading(role: Turn["role"]): string {
@@ -609,27 +604,15 @@ export function ConversationPane(props: {
   sessions: SessionSummary[];
   activeSessionId: string | null;
   onBuildStarted?: (() => void) | undefined;
+  onBuildCommitted?: (() => void) | undefined;
 }) {
-  const { state, sessions, activeSessionId, onBuildStarted } = props;
+  const { state, sessions, activeSessionId, onBuildStarted, onBuildCommitted } =
+    props;
   const bridge = getBridge();
   const busy = isBusy(state?.status);
   const canCancel = typeof bridge?.session.cancel === "function";
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottomRef = useRef(true);
-
-  async function createSession() {
-    await bridge?.session.create();
-  }
-
-  async function switchSession(sessionId: string) {
-    if (sessionId === activeSessionId) return;
-    await bridge?.session.switch(sessionId);
-  }
-
-  async function closeSession(sessionId: string, e: MouseEvent) {
-    e.stopPropagation();
-    await bridge?.session.close(sessionId);
-  }
 
   const turns = state?.turns ?? [];
   const showThinking =
@@ -647,26 +630,8 @@ export function ConversationPane(props: {
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copyDeepResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const tabSessions =
-    sessions.length > 0
-      ? sessions
-      : activeSessionId
-        ? [
-            {
-              id: activeSessionId,
-              title: "New chat",
-              updatedAt: new Date().toISOString(),
-              workspaceName: state?.workspace?.name ?? null,
-              phase:
-                state?.mode === "plan" || state?.planStatus === "drafting"
-                  ? ("planning" as const)
-                  : ("building" as const),
-            },
-          ]
-        : [];
-
   const activeTabTitle =
-    tabSessions.find((s) => s.id === activeSessionId)?.title ?? "Chat";
+    sessions.find((s) => s.id === activeSessionId)?.title ?? "Chat";
 
   async function copyChat(mode: ChatClipboardMode) {
     if (turns.length === 0) return;
@@ -683,8 +648,18 @@ export function ConversationPane(props: {
     try {
       await navigator.clipboard.writeText(text);
       setState("copied");
+      window.dispatchEvent(
+        new CustomEvent("aifi:copy-open-chat-result", {
+          detail: { mode, ok: true },
+        }),
+      );
     } catch {
       setState("failed");
+      window.dispatchEvent(
+        new CustomEvent("aifi:copy-open-chat-result", {
+          detail: { mode, ok: false },
+        }),
+      );
     }
     if (resetRef.current) clearTimeout(resetRef.current);
     resetRef.current = setTimeout(() => setState("idle"), 1600);
@@ -761,100 +736,12 @@ export function ConversationPane(props: {
     showThinking,
   ]);
 
-  function phaseLetter(phase: string | undefined): string {
-    if (phase === "building") return "B";
-    if (phase === "testing") return "T";
-    return "P";
-  }
-
-  function phaseTitle(phase: string | undefined): string {
-    if (phase === "building") return "Build";
-    if (phase === "testing") return "Test";
-    return "Plan";
-  }
-
-  const copyLabel =
-    copyState === "copied"
-      ? "Copied"
-      : copyState === "failed"
-        ? "Copy failed"
-        : `Copy · ${modShiftHint("C")}`;
-  const copyDeepLabel =
-    copyDeepState === "copied"
-      ? "Copied deep"
-      : copyDeepState === "failed"
-        ? "Deep failed"
-        : `Deep · ${modShiftHint("D")}`;
+  // copyState kept so clipboard feedback still resets after keyboard shortcuts
+  void copyState;
+  void copyDeepState;
 
   return (
     <>
-      <div className="session-tabs" role="tablist" aria-label="Chat sessions">
-        <div className="session-tabs-scroll">
-          {tabSessions.map((session) => {
-            const active = session.id === activeSessionId;
-            return (
-              <div
-                key={session.id}
-                role="tab"
-                aria-selected={active}
-                className={`session-tab ${active ? "session-tab-active" : ""}`}
-              >
-                <button
-                  type="button"
-                  className="session-tab-main"
-                  title={`${session.title} · ${phaseTitle(session.phase)}`}
-                  onClick={() => void switchSession(session.id)}
-                >
-                  <span
-                    className={`session-tab-phase session-tab-phase-${session.phase ?? "planning"}`}
-                    aria-hidden
-                  >
-                    {phaseLetter(session.phase)}
-                  </span>
-                  <span className="session-tab-title">{session.title}</span>
-                </button>
-                <button
-                  type="button"
-                  className="session-tab-close"
-                  aria-label={`Close ${session.title}`}
-                  onClick={(e) => void closeSession(session.id, e)}
-                >
-                  ×
-                </button>
-              </div>
-            );
-          })}
-        </div>
-        <button
-          type="button"
-          className="session-tab-copy"
-          title={`Copy visible chat (${modShiftHint("C")})`}
-          aria-label={`Copy visible chat (${modShiftHint("C")})`}
-          disabled={turns.length === 0}
-          onClick={() => void copyChat("visible")}
-        >
-          {copyLabel}
-        </button>
-        <button
-          type="button"
-          className="session-tab-copy"
-          title={`Copy deep — full tool args and output (${modShiftHint("D")})`}
-          aria-label={`Copy deep chat (${modShiftHint("D")})`}
-          disabled={turns.length === 0}
-          onClick={() => void copyChat("deep")}
-        >
-          {copyDeepLabel}
-        </button>
-        <button
-          type="button"
-          className="session-tab-add"
-          title="New chat (⌘N)"
-          aria-label="New chat"
-          onClick={() => void createSession()}
-        >
-          +
-        </button>
-      </div>
       <div
         ref={scrollRef}
         className="pane-body transcript-body"
@@ -992,6 +879,9 @@ export function ConversationPane(props: {
 
         <StartBuildBanner state={state} onConfirmed={onBuildStarted} />
         <BuildContinueBanner state={state} />
+        <CommitBuildBanner state={state} onCommitted={onBuildCommitted} />
+        <IntegrateBuildBanner state={state} onDone={onBuildCommitted} />
+        <ArchiveChatBanner state={state} />
 
         {(state?.pendingApprovals ?? []).map((approval) => (
           <ApprovalCard key={approval.id} approval={approval} />

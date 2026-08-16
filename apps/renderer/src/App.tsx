@@ -5,14 +5,13 @@ import { useBridgeReady, useSessionState } from "./hooks/useSessionState";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { ConversationPane, VerifyPane } from "./components/Cockpit";
 import { ComposerBar } from "./components/ComposerBar";
+import { SessionBar } from "./components/SessionBar";
 import { CommandPalette } from "./components/CommandPalette";
 import {
   formatPlanAnswersMessage,
   PlanQaDialog,
   type PlanQaAnswer,
 } from "./components/PlanQaDialog";
-import { CommitBuildDialog } from "./components/CommitBuildDialog";
-import { IntegrateBuildDialog } from "./components/IntegrateBuildDialog";
 import { NewProjectDialog } from "./components/NewProjectDialog";
 import {
   ArchitecturePane,
@@ -57,14 +56,6 @@ export function App() {
   const [qaOpen, setQaOpen] = useState(false);
   const [qaFocusRequestId, setQaFocusRequestId] = useState(0);
   const [qaDismissedKey, setQaDismissedKey] = useState<string | null>(null);
-  const [commitBuildOpen, setCommitBuildOpen] = useState(false);
-  const [commitBuildDismissedKey, setCommitBuildDismissedKey] = useState<
-    string | null
-  >(null);
-  const [integrateBuildOpen, setIntegrateBuildOpen] = useState(false);
-  const [integrateBuildDismissedKey, setIntegrateBuildDismissedKey] = useState<
-    string | null
-  >(null);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [architecturePaneOpen, setArchitecturePaneOpen] = useState(false);
   const [gitStatus, setGitStatus] = useState<{
@@ -73,7 +64,7 @@ export function App() {
     remoteBranch: string | null;
     hasRemote: boolean;
   } | null>(null);
-  const composerRef = useRef<HTMLInputElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const openPlanQuestions = useMemo(
     () => (state?.planQuestions ?? []).filter((q) => q.status === "open"),
@@ -115,64 +106,13 @@ export function App() {
   useEffect(() => {
     setQaDismissedKey(null);
     setQaOpen(false);
-    setCommitBuildOpen(false);
-    setCommitBuildDismissedKey(null);
-    setIntegrateBuildOpen(false);
-    setIntegrateBuildDismissedKey(null);
   }, [activeSessionId]);
-
-  const buildCommitOffer = state?.buildCommitOffer ?? null;
-  const buildCommitKey = buildCommitOffer
-    ? `${state?.sessionId}:${buildCommitOffer.offeredAt}`
-    : null;
-  const buildIntegrateOffer = state?.buildIntegrateOffer ?? null;
-  const buildIntegrateKey = buildIntegrateOffer
-    ? `${state?.sessionId}:${buildIntegrateOffer.offeredAt}`
-    : null;
 
   const refreshGitStatus = useCallback(() => {
     void getBridge()?.workspace.gitStatus().then((info) => {
       if (info) setGitStatus(info);
     });
   }, []);
-
-  // Auto-open local commit dialog when build checklist is complete.
-  useEffect(() => {
-    if (!buildCommitOffer || !buildCommitKey) {
-      setCommitBuildOpen(false);
-      return;
-    }
-    if (commitBuildDismissedKey === buildCommitKey) return;
-    if (providerOpen || newProjectOpen || qaOpen || integrateBuildOpen) return;
-    setCommitBuildOpen(true);
-  }, [
-    buildCommitOffer,
-    buildCommitKey,
-    commitBuildDismissedKey,
-    providerOpen,
-    newProjectOpen,
-    qaOpen,
-    integrateBuildOpen,
-  ]);
-
-  // Auto-open integrate (PR / local merge) after tests (+ commit/skip).
-  useEffect(() => {
-    if (!buildIntegrateOffer || !buildIntegrateKey) {
-      setIntegrateBuildOpen(false);
-      return;
-    }
-    if (integrateBuildDismissedKey === buildIntegrateKey) return;
-    if (providerOpen || newProjectOpen || qaOpen || commitBuildOpen) return;
-    setIntegrateBuildOpen(true);
-  }, [
-    buildIntegrateOffer,
-    buildIntegrateKey,
-    integrateBuildDismissedKey,
-    providerOpen,
-    newProjectOpen,
-    qaOpen,
-    commitBuildOpen,
-  ]);
 
   useEffect(() => {
     if (!qaEligible) {
@@ -333,7 +273,10 @@ export function App() {
       <header className="chrome">
         <div className="topbar">
           <div className="topbar-left">
-            <strong className="brand">AI-First IDE</strong>
+            <strong className="brand">
+              AICI
+              <span className="brand-sub">AI Centered IDE</span>
+            </strong>
             <span className="status-pill">{state?.status ?? "idle"}</span>
           </div>
           <div className="topbar-right">
@@ -415,7 +358,7 @@ export function App() {
           <div className="workspace-bar-actions">
             <button
               type="button"
-              className={`btn workspace-bar-action ${showArchitecturePane ? "workspace-bar-action-active" : ""}`}
+              className={`btn btn-secondary btn-sm workspace-bar-action ${showArchitecturePane ? "workspace-bar-action-active" : ""}`}
               title={`Architecture settings (${modShiftHint("A")})`}
               aria-pressed={showArchitecturePane}
               onClick={toggleArchitecturePane}
@@ -424,7 +367,7 @@ export function App() {
             </button>
             <button
               type="button"
-              className="btn workspace-bar-action"
+              className="btn btn-secondary btn-sm workspace-bar-action"
               title={`New project (${modShiftHint("N")})`}
               onClick={() => setNewProjectOpen(true)}
             >
@@ -432,7 +375,7 @@ export function App() {
             </button>
             <button
               type="button"
-              className="btn workspace-bar-action"
+              className="btn btn-sm workspace-bar-action"
               title={`Open or change workspace (${modShortcutHint("O")})`}
               onClick={() => void openWorkspace()}
             >
@@ -440,6 +383,12 @@ export function App() {
             </button>
           </div>
         </div>
+
+        <SessionBar
+          state={state}
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+        />
 
         <div
           className="git-bar"
@@ -498,6 +447,7 @@ export function App() {
             sessions={sessions}
             activeSessionId={activeSessionId}
             onBuildStarted={refreshGitStatus}
+            onBuildCommitted={refreshGitStatus}
           />
         </section>
         <section className="pane">
@@ -542,50 +492,6 @@ export function App() {
           setQaDismissedKey(openQuestionKey);
         }}
         onSubmit={submitPlanAnswers}
-      />
-
-      <CommitBuildDialog
-        open={
-          commitBuildOpen &&
-          Boolean(buildCommitOffer) &&
-          !providerOpen &&
-          !newProjectOpen &&
-          !integrateBuildOpen
-        }
-        offer={buildCommitOffer}
-        onClose={() => {
-          setCommitBuildOpen(false);
-          if (buildCommitKey) setCommitBuildDismissedKey(buildCommitKey);
-        }}
-        onCommitted={() => {
-          setCommitBuildOpen(false);
-          if (buildCommitKey) setCommitBuildDismissedKey(buildCommitKey);
-          void getBridge()?.workspace.gitStatus().then((info) => {
-            if (info) setGitStatus(info);
-          });
-        }}
-      />
-
-      <IntegrateBuildDialog
-        open={
-          integrateBuildOpen &&
-          Boolean(buildIntegrateOffer) &&
-          !providerOpen &&
-          !newProjectOpen &&
-          !commitBuildOpen
-        }
-        offer={buildIntegrateOffer}
-        onClose={() => {
-          setIntegrateBuildOpen(false);
-          if (buildIntegrateKey) setIntegrateBuildDismissedKey(buildIntegrateKey);
-        }}
-        onDone={() => {
-          setIntegrateBuildOpen(false);
-          if (buildIntegrateKey) setIntegrateBuildDismissedKey(buildIntegrateKey);
-          void getBridge()?.workspace.gitStatus().then((info) => {
-            if (info) setGitStatus(info);
-          });
-        }}
       />
 
       <NewProjectDialog

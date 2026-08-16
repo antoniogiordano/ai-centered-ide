@@ -13,7 +13,14 @@ import {
   type ModelInfo,
 } from "./types.js";
 
-export type ReasoningEffort = "low" | "high" | "max";
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
 
 export type OpenAiProviderConfig = {
   baseUrl: string;

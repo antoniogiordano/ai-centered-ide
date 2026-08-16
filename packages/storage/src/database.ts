@@ -11,6 +11,7 @@ import type {
   PlanStatus,
   PlanStep,
   SessionKind,
+  SessionModelUsage,
   Turn,
   WorkspaceRef,
 } from "@ai-ide/shared";
@@ -220,11 +221,13 @@ export class ProjectStorage {
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
     buildBaseBranch?: string | null;
-    sessionKind: SessionKind;
-    approvalGrants: ApprovalGrant[];
-    createdAt: string;
-    updatedAt: string;
-  }): void {
+  buildFlowCompletedAt?: string | null;
+  sessionKind: SessionKind;
+  approvalGrants: ApprovalGrant[];
+  sessionModelUsage?: SessionModelUsage[];
+  createdAt: string;
+  updatedAt: string;
+}): void {
     this.db
       .prepare(
         `INSERT INTO conversations (
@@ -253,8 +256,10 @@ export class ProjectStorage {
           planQuestions: row.planQuestions,
           planReadyProposal: row.planReadyProposal,
           buildBaseBranch: row.buildBaseBranch ?? null,
+          buildFlowCompletedAt: row.buildFlowCompletedAt ?? null,
           sessionKind: row.sessionKind,
           approvalGrants: row.approvalGrants,
+          sessionModelUsage: row.sessionModelUsage ?? [],
         }),
       );
   }
@@ -271,8 +276,10 @@ export class ProjectStorage {
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
     buildBaseBranch: string | null;
+    buildFlowCompletedAt: string | null;
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
+    sessionModelUsage: SessionModelUsage[];
     createdAt: string;
     updatedAt: string;
   }> {
@@ -306,8 +313,10 @@ export class ProjectStorage {
             planQuestions?: PlanQuestion[];
             planReadyProposal?: PlanReadyProposal | null;
             buildBaseBranch?: string | null;
+            buildFlowCompletedAt?: string | null;
             sessionKind?: SessionKind;
             approvalGrants?: ApprovalGrant[];
+            sessionModelUsage?: SessionModelUsage[];
           })
         : {};
       return {
@@ -324,8 +333,10 @@ export class ProjectStorage {
         planQuestions: meta.planQuestions ?? [],
         planReadyProposal: meta.planReadyProposal ?? null,
         buildBaseBranch: meta.buildBaseBranch ?? null,
+        buildFlowCompletedAt: meta.buildFlowCompletedAt ?? null,
         sessionKind: meta.sessionKind ?? "delivery",
         approvalGrants: meta.approvalGrants ?? [],
+        sessionModelUsage: meta.sessionModelUsage ?? [],
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
       };
@@ -344,8 +355,10 @@ export class ProjectStorage {
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
     buildBaseBranch: string | null;
+    buildFlowCompletedAt: string | null;
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
+    sessionModelUsage: SessionModelUsage[];
     createdAt: string;
     updatedAt: string;
   } | null {

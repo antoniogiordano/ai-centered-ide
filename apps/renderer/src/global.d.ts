@@ -145,6 +145,7 @@ export type DesktopBridge = {
     architectureSave: (input: {
       profile?: WorkspaceArchitectureGetResponse["profile"];
       patch?: Record<string, unknown>;
+      intent?: string;
       confirm?: boolean;
     }) => Promise<WorkspaceArchitectureSaveResponse>;
   };
@@ -184,7 +185,14 @@ export type DesktopBridge = {
       paid?: boolean;
       pricing?: { inputPer1M?: number; outputPer1M?: number };
       thinking?: boolean;
-      reasoningEffort?: "low" | "high" | "max";
+      reasoningEffort?:
+        | "none"
+        | "minimal"
+        | "low"
+        | "medium"
+        | "high"
+        | "xhigh"
+        | "max";
       makeActive?: boolean;
     }) => Promise<ProviderSaveConfigResponse>;
   };

@@ -179,7 +179,7 @@ export class ToolGateway {
             callId: call.id,
             success: false,
             summary: "Command blocked by policy.",
-            error: `Blocked by policy: ${analysis.matchedDeny ?? cmd}`,
+            error: `Blocked by policy: ${analysis.matchedDeny ?? cmd}. Git commit and push are harness-only — use the Commit Build / Integrate banners.`,
             output: { command: cmd, blocked: true, reason: "denylist" },
           },
         };
@@ -198,6 +198,50 @@ export class ToolGateway {
             approvalId: randomUUID(),
             description: describeApproval(decision.description),
             call: { ...call, riskLevel },
+          };
+        }
+      }
+    }
+
+    if (call.name === "git_commit") {
+      return {
+        status: "ok",
+        result: {
+          callId: call.id,
+          success: false,
+          summary: "Git commit is harness-only.",
+          error:
+            "git_commit is blocked. After tests pass, use the Commit Build banner in the IDE — agents cannot commit or push.",
+          output: { blocked: true, reason: "harness_only_git" },
+        },
+      };
+    }
+
+    if (call.name === "terminal_write" || call.name === "terminal_ask") {
+      const text =
+        call.name === "terminal_write"
+          ? String(parsed.data.text ?? "")
+          : String(
+              (parsed.data as { suggestedText?: string }).suggestedText ??
+                (parsed.data as { prompt?: string }).prompt ??
+                "",
+            );
+      if (text.trim()) {
+        const analysis = analyzeCommand(text);
+        if (analysis.blocked) {
+          return {
+            status: "ok",
+            result: {
+              callId: call.id,
+              success: false,
+              summary: "Terminal input blocked by policy.",
+              error: `Blocked by policy: ${analysis.matchedDeny ?? "denied"}. Git commit and push are harness-only — use the Commit Build / Integrate banners.`,
+              output: {
+                text,
+                blocked: true,
+                reason: "denylist",
+              },
+            },
           };
         }
       }

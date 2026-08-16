@@ -6,9 +6,54 @@ import {
   formatTokenCount,
   parseUsdRate,
   SavedProviderSchema,
+  accumulateSessionModelUsage,
 } from "./providers.js";
 
 describe("provider cost helpers", () => {
+  it("accumulates per-model usage for a chat session", () => {
+    const first = accumulateSessionModelUsage(
+      [],
+      { inputTokens: 100, outputTokens: 20 },
+      {
+        model: "gpt-5.2",
+        providerId: "p1",
+        providerName: "OpenAI",
+        paid: true,
+        pricing: { inputPer1M: 2, outputPer1M: 8 },
+      },
+    );
+    expect(first).toHaveLength(1);
+    expect(first[0]?.usage.inputTokens).toBe(100);
+    expect(first[0]?.costUsd).toBeCloseTo(0.00036, 6);
+
+    const second = accumulateSessionModelUsage(
+      first,
+      { inputTokens: 50, outputTokens: 0 },
+      {
+        model: "gpt-5.2",
+        providerId: "p1",
+        providerName: "OpenAI",
+        paid: true,
+        pricing: { inputPer1M: 2, outputPer1M: 8 },
+      },
+    );
+    expect(second).toHaveLength(1);
+    expect(second[0]?.usage.inputTokens).toBe(150);
+
+    const third = accumulateSessionModelUsage(
+      second,
+      { inputTokens: 10, outputTokens: 10 },
+      {
+        model: "local-model",
+        providerId: "p2",
+        providerName: "Ollama",
+        paid: false,
+      },
+    );
+    expect(third).toHaveLength(2);
+    expect(third[1]?.costUsd).toBeNull();
+  });
+
   it("estimates cost from per-1M rates", () => {
     const cost = estimateCostUsd(
       { inputTokens: 1_000_000, outputTokens: 500_000 },

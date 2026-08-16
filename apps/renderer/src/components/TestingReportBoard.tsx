@@ -168,7 +168,7 @@ export function TestingReportBoard(props: { state: SessionState | null }) {
             <strong>Testing report</strong>
             <p className="verify-hint">
               Waiting for the agent to call propose_testing_ready, then the IDE
-              Test gate will run lint / typecheck / unit here.
+              Test gate will run lint / typecheck / unit / e2e here.
             </p>
           </div>
         </div>

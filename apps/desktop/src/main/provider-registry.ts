@@ -36,6 +36,12 @@ export class ProviderRegistryStore {
     return this.sessionUsage;
   }
 
+  getActiveProvider(): SavedProvider | null {
+    const registry = this.loadRegistry();
+    if (!registry.activeId) return null;
+    return registry.providers.find((p) => p.id === registry.activeId) ?? null;
+  }
+
   loadRegistry(): ProviderRegistry {
     const existing = this.storage.getPreference<ProviderRegistry>(REGISTRY_KEY);
     const legacy = this.storage.getPreference<{
