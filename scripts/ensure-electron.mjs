@@ -1,43 +1,16 @@
 #!/usr/bin/env node
-import { existsSync, readdirSync } from "node:fs";
-import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { resolveElectronPackageDir } from "./electron-path.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-
-function resolveElectronPkg() {
-  const candidates = [
-    join(root, "apps/desktop"),
-    root,
-  ];
-  for (const base of candidates) {
-    try {
-      const require = createRequire(join(base, "package.json"));
-      return dirname(require.resolve("electron/package.json"));
-    } catch {
-      /* try next */
-    }
-  }
-  const pnpm = join(root, "node_modules/.pnpm");
-  if (existsSync(pnpm)) {
-    const hit = readdirSync(pnpm).find((n) => n.startsWith("electron@"));
-    if (hit) {
-      return join(pnpm, hit, "node_modules/electron");
-    }
-  }
-  return null;
-}
-
-const pkg = resolveElectronPkg();
+const pkg = resolveElectronPackageDir();
 if (!pkg) {
   console.warn("Electron package not found — skip ensure");
   process.exit(0);
 }
 
-const pathTxt = join(pkg, "path.txt");
-if (existsSync(pathTxt)) {
+if (existsSync(join(pkg, "path.txt"))) {
   console.log("Electron binary OK");
   process.exit(0);
 }

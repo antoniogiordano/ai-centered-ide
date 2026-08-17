@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle-preload.mjs",
     "dev": "node scripts/dev.mjs",
-    "test": "vitest run",
+    "test": "node ../../scripts/vitest-electron.mjs run",
     "lint": "eslint src",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.preload.json --noEmit"
   },

@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "pnpm -r build",
-    "test": "pnpm rebuild better-sqlite3 || true; pnpm -r test",
+    "test": "node scripts/ensure-electron.mjs || true; node scripts/rebuild-native-for-electron.mjs || true; pnpm -r test",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
     "dev": "pnpm --filter @ai-ide/desktop dev",

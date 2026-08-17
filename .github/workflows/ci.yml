@@ -23,8 +23,18 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The Electron binary runs the storage/desktop tests (ELECTRON_RUN_AS_NODE),
+      # and it stays dynamically linked to the desktop libraries even in that mode.
+      # libasound was renamed in Ubuntu 24.04, hence the fallback.
+      - name: Electron runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-0 libnss3 libgbm1
+          sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
+
+      # Against the Electron ABI, never the Node one — see docs/notes/versions.md.
       - name: Build native modules
-        run: pnpm rebuild better-sqlite3 keytar
+        run: pnpm rebuild:electron
 
       - name: Lint
         run: pnpm lint

@@ -3,22 +3,13 @@
  * Rebuild native modules against the Electron ABI (not system Node).
  * System Node 22 ≈ MODULE 127; Electron 36 ≈ MODULE 135 — they are not interchangeable.
  */
-import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { readElectronVersion, repoRoot as root } from "./electron-path.mjs";
 
-const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const stampPath = join(root, "node_modules/.cache/electron-native-abi");
-const require = createRequire(join(root, "apps/desktop/package.json"));
-
-let electronVersion = "36.9.5";
-try {
-  electronVersion = require("electron/package.json").version;
-} catch {
-  /* use default */
-}
+const electronVersion = readElectronVersion();
 
 const force = process.argv.includes("--force");
 const stamp = `electron@${electronVersion}:better-sqlite3,keytar,node-pty`;

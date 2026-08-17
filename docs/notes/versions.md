@@ -23,3 +23,10 @@ Date: 2026-07-31
 - Node tooling: stay on active LTS.
 - React/Vite/TS: minor/patch freely; major only with a dedicated upgrade note.
 - Native modules (node-pty, keytar, better-sqlite3): pin exact versions per Electron ABI; rebuild on Electron bump.
+
+## One ABI: Electron
+
+Native addons are built **only** against the Electron ABI (Electron 36 → `NODE_MODULE_VERSION` 135), never against system Node (22 → 127); `scripts/rebuild-native-for-electron.mjs` runs on postinstall and stamps the result. The two ABIs are not interchangeable, so the tests that load an addon run inside Electron's own Node instead of asking for a rebuild:
+
+- `packages/storage` and `apps/desktop` use `scripts/vitest-electron.mjs`, which spawns the Electron binary with `ELECTRON_RUN_AS_NODE=1`. It works regardless of the Node version on the developer's `PATH`.
+- Never run `pnpm rebuild better-sqlite3`: it switches the addon to the Node ABI and the desktop app stops starting until the next `pnpm rebuild:electron`.
