@@ -1,5 +1,5 @@
 import type { ZodType } from "zod";
-import type { RiskLevel } from "@ai-ide/shared";
+import type { RiskLevel, ToolResultImage } from "@ai-ide/shared";
 import type { ToolExecutionContext } from "./gateway.js";
 
 export type ToolPhase = "planning" | "checking" | "building" | "testing";
@@ -16,7 +16,13 @@ export type ToolDefinition = {
   execute: (
     args: Record<string, unknown>,
     ctx: ToolExecutionContext,
-  ) => Promise<{ summary: string; output?: unknown; artifactRef?: string }>;
+  ) => Promise<{
+    summary: string;
+    output?: unknown;
+    artifactRef?: string;
+    /** Pixels for the model to look at. Never persisted — see ToolResultImage. */
+    images?: ToolResultImage[];
+  }>;
 };
 
 export type ToolFunctionDef = {

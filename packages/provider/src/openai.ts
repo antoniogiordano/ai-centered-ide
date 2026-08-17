@@ -10,6 +10,7 @@ import {
   type ChatChunk,
   type ChatMessage,
   type ChatOptions,
+  type ContentPart,
   type ModelInfo,
 } from "./types.js";
 
@@ -58,25 +59,28 @@ export class OpenAiCompatibleProvider implements AiProvider {
       throw await this.httpError(response);
     }
     const body = (await response.json()) as {
-      data?: Array<{ id?: string; name?: string }>;
-      models?: Array<{ id?: string; name?: string } | string>;
+      data?: unknown[];
+      models?: unknown[];
     };
     const raw = body.data ?? body.models ?? [];
-    const ids: string[] = [];
+    const byId = new Map<string, ModelInfo>();
     for (const entry of raw) {
-      if (typeof entry === "string" && entry.trim()) {
-        ids.push(entry.trim());
+      const parsed = parseModelListEntry(entry);
+      if (!parsed) continue;
+      const prior = byId.get(parsed.id);
+      if (!prior) {
+        byId.set(parsed.id, parsed);
         continue;
       }
-      if (entry && typeof entry === "object") {
-        const id =
-          (typeof entry.id === "string" && entry.id.trim()) ||
-          (typeof entry.name === "string" && entry.name.trim()) ||
-          "";
-        if (id) ids.push(id);
+      // Prefer the entry that includes a context window.
+      if (
+        parsed.contextWindowTokens != null &&
+        prior.contextWindowTokens == null
+      ) {
+        byId.set(parsed.id, parsed);
       }
     }
-    return [...new Set(ids)].map((id) => ({ id }));
+    return [...byId.values()];
   }
 
   async *chat(
@@ -289,7 +293,7 @@ export class OpenAiCompatibleProvider implements AiProvider {
   ): Record<string, unknown> {
     const body: Record<string, unknown> = {
       model,
-      messages: messages.map(toOpenAiMessage),
+      messages: expandMessagesForOpenAi(messages),
       stream: true,
     };
     // Many local servers reject unknown fields; cloud OpenAI-compatible APIs
@@ -392,9 +396,13 @@ function formatHttpUserMessage(status: number, body: string): string {
     : `Provider error (HTTP ${status})${statusHint ? `: ${statusHint}` : "."}`;
 }
 
-/** True when any user/system message includes image_url parts. */
+/** True when any message carries image pixels (user/system parts or tool images). */
 export function messagesHaveVision(messages: ChatMessage[]): boolean {
   for (const m of messages) {
+    if (m.role === "tool") {
+      if (m.images?.length) return true;
+      continue;
+    }
     if (m.role !== "user" && m.role !== "system") continue;
     if (typeof m.content === "string") continue;
     if (m.content.some((p) => p.type === "image_url")) return true;
@@ -405,6 +413,15 @@ export function messagesHaveVision(messages: ChatMessage[]): boolean {
 /** Drop image parts; keep text + a note so the agent can import_attachment. */
 export function flattenVisionToText(messages: ChatMessage[]): ChatMessage[] {
   return messages.map((m) => {
+    if (m.role === "tool") {
+      if (!m.images?.length) return m;
+      const note = `\n\n[IDE] This tool returned ${m.images.length} image(s), but this model/endpoint cannot view images (no vision). The pixels were NOT sent to you. Rely on the text output, or ask the user to describe the image.`;
+      return {
+        role: "tool",
+        tool_call_id: m.tool_call_id,
+        content: `${m.content}${note}`,
+      };
+    }
     if (m.role !== "user" && m.role !== "system") return m;
     if (typeof m.content === "string") return m;
     const imageCount = m.content.filter((p) => p.type === "image_url").length;
@@ -413,6 +430,44 @@ export function flattenVisionToText(messages: ChatMessage[]): ChatMessage[] {
     const note = `\n\n[IDE] ${imageCount} image(s) were attached but this model/endpoint cannot view images (no vision). The pixels were NOT sent to you — only this text. Ask the user to describe the screenshot, or use import_attachment if you need the file bytes in the workspace.`;
     return { role: m.role, content: `${text}${note}` };
   });
+}
+
+/**
+ * Expand internal messages into wire messages.
+ *
+ * OpenAI-compatible endpoints reject images on non-user roles ("Image URLs are
+ * only allowed for messages with role 'user'"), so a tool message carrying
+ * images becomes two wire messages: the text-only tool result, then a synthetic
+ * user message holding the pixels. Order matters — the images must follow the
+ * tool result they belong to.
+ */
+export function expandMessagesForOpenAi(
+  messages: ChatMessage[],
+): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    out.push(toOpenAiMessage(message));
+    if (message.role !== "tool" || !message.images?.length) continue;
+    const labels = message.images
+      .map((img, index) => img.label ?? `image ${index + 1}`)
+      .join(", ");
+    const parts: ContentPart[] = [
+      {
+        type: "text",
+        text: `[IDE] Images returned by the previous tool call (${labels}). Look at them and continue — the user did not send these, the tool did.`,
+      },
+    ];
+    for (const img of message.images) {
+      parts.push({
+        type: "image_url",
+        image_url: {
+          url: `data:${img.mime || "image/png"};base64,${img.dataBase64}`,
+        },
+      });
+    }
+    out.push({ role: "user", content: parts });
+  }
+  return out;
 }
 
 export function isVisionUnsupportedError(
@@ -551,6 +606,72 @@ function toOpenAiMessage(message: ChatMessage): Record<string, unknown> {
 
 /** @internal exported for tests */
 export { toOpenAiMessage };
+
+function coerceContextTokens(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const n = Math.floor(value);
+    // Ignore tiny values — those are usually completion caps, not windows.
+    if (n >= 4_000 && n <= 10_000_000) return n;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    return coerceContextTokens(Number(value.trim()));
+  }
+  return undefined;
+}
+
+/**
+ * Pull a context-window hint from heterogeneous OpenAI-compatible /models
+ * payloads (OpenRouter, Groq, vLLM, LM Studio, Together, …).
+ */
+export function extractContextWindowTokens(
+  entry: Record<string, unknown>,
+): number | undefined {
+  const directKeys = [
+    "context_length",
+    "context_window",
+    "contextWindow",
+    "context_window_tokens",
+    "max_model_len",
+    "max_input_tokens",
+    "max_seq_len",
+    "n_ctx",
+    "n_ctx_train",
+  ] as const;
+  for (const key of directKeys) {
+    const n = coerceContextTokens(entry[key]);
+    if (n != null) return n;
+  }
+
+  // max_tokens is ambiguous (often completion-only). Accept only large values.
+  const maxTokens = coerceContextTokens(entry.max_tokens);
+  if (maxTokens != null && maxTokens >= 16_000) return maxTokens;
+
+  for (const nestKey of ["meta", "architecture", "top_provider", "limits", "parameters"] as const) {
+    const nest = entry[nestKey];
+    if (nest && typeof nest === "object" && !Array.isArray(nest)) {
+      const nested = extractContextWindowTokens(nest as Record<string, unknown>);
+      if (nested != null) return nested;
+    }
+  }
+  return undefined;
+}
+
+export function parseModelListEntry(entry: unknown): ModelInfo | null {
+  if (typeof entry === "string" && entry.trim()) {
+    return { id: entry.trim() };
+  }
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const obj = entry as Record<string, unknown>;
+  const id =
+    (typeof obj.id === "string" && obj.id.trim()) ||
+    (typeof obj.name === "string" && obj.name.trim()) ||
+    "";
+  if (!id) return null;
+  const contextWindowTokens = extractContextWindowTokens(obj);
+  return contextWindowTokens != null
+    ? { id, contextWindowTokens }
+    : { id };
+}
 
 export function parseSseDataLines(raw: string): string[] {
   return raw

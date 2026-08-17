@@ -11,7 +11,10 @@ import {
   ArchitectureProfilePatchSchema,
   ArchitectureProfileSchema,
 } from "./architecture.js";
-import { ReasoningEffortSchema } from "./providers.js";
+import {
+  ProviderPricingSchema,
+  ReasoningEffortSchema,
+} from "./providers.js";
 
 export const IPC_CHANNELS = {
   SESSION_GET: "session:get",
@@ -29,6 +32,7 @@ export const IPC_CHANNELS = {
   SESSION_TERMINAL_CONFIRM: "session:terminal-confirm",
   SESSION_TERMINAL_CONFIRM_EDIT: "session:terminal-confirm-edit",
   SESSION_TERMINAL_ASK: "session:terminal-ask",
+  SESSION_AGENT_ASK: "session:agent-ask",
   TERMINAL_SUBSCRIBE: "terminal:subscribe",
   TERMINAL_LIST: "terminal:list",
   TERMINAL_WRITE_USER: "terminal:write-user",
@@ -67,6 +71,10 @@ export const IPC_CHANNELS = {
   PROVIDER_LIST: "provider:list",
   PROVIDER_SET_ACTIVE: "provider:set-active",
   PROVIDER_DELETE: "provider:delete",
+  PROVIDER_FETCH_PRICING: "provider:fetch-pricing",
+  PROVIDER_CANCEL_FETCH_PRICING: "provider:cancel-fetch-pricing",
+  /** Push channel: main → renderer progress lines while fetch pricing runs. */
+  PROVIDER_FETCH_PRICING_PROGRESS: "provider:fetch-pricing-progress",
   GITHUB_STATUS: "github:status",
   GITHUB_LOGOUT: "github:logout",
   GITHUB_LOGIN_WEB: "github:login-web",
@@ -215,6 +223,17 @@ export const SessionTerminalAskRequestSchema = z.object({
 });
 export type SessionTerminalAskRequest = z.infer<
   typeof SessionTerminalAskRequestSchema
+>;
+
+/** Answer to the blocking ask_user question (see PendingAgentAskSchema). */
+export const SessionAgentAskRequestSchema = z.object({
+  askId: z.string().min(1),
+  selectedOptionIds: z.array(z.string()).default([]),
+  text: z.string().max(20_000).default(""),
+  cancelled: z.boolean().default(false),
+});
+export type SessionAgentAskRequest = z.infer<
+  typeof SessionAgentAskRequestSchema
 >;
 
 export const TerminalDataEventSchema = z.object({
@@ -826,7 +845,17 @@ export type ProviderVerifyRequest = z.infer<typeof ProviderVerifyRequestSchema>;
 
 export const ProviderVerifyResponseSchema = z.object({
   ok: z.boolean(),
+  /** Model ids (backward compatible). */
   models: z.array(z.string()).optional(),
+  /** Richer model metadata from GET /v1/models when available. */
+  modelDetails: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        contextWindowTokens: z.number().int().positive().optional(),
+      }),
+    )
+    .optional(),
   error: AppErrorPayloadSchema.optional(),
 });
 export type ProviderVerifyResponse = z.infer<
@@ -843,6 +872,14 @@ export type ProviderListModelsRequest = z.infer<
 
 export const ProviderListModelsResponseSchema = z.object({
   models: z.array(z.string()),
+  modelDetails: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        contextWindowTokens: z.number().int().positive().optional(),
+      }),
+    )
+    .optional(),
 });
 export type ProviderListModelsResponse = z.infer<
   typeof ProviderListModelsResponseSchema
@@ -855,14 +892,17 @@ export const ProviderSaveConfigRequestSchema = z.object({
   apiKey: z.string().default(""),
   defaultModel: z.string().min(1),
   paid: z.boolean().optional(),
-  pricing: z
-    .object({
-      inputPer1M: z.number().nonnegative().optional(),
-      outputPer1M: z.number().nonnegative().optional(),
-    })
-    .optional(),
+  pricing: ProviderPricingSchema.optional(),
   thinking: z.boolean().optional(),
   reasoningEffort: ReasoningEffortSchema.optional(),
+  /** Model context window in tokens (for compaction). null clears. */
+  contextWindowTokens: z
+    .number()
+    .int()
+    .positive()
+    .max(10_000_000)
+    .nullable()
+    .optional(),
   makeActive: z.boolean().optional(),
 });
 export type ProviderSaveConfigRequest = z.infer<
@@ -889,15 +929,10 @@ export const ProviderGetConfigResponseSchema = z.object({
   defaultModel: z.string().nullable(),
   apiKey: z.string().nullable(),
   paid: z.boolean().optional(),
-  pricing: z
-    .object({
-      inputPer1M: z.number().nonnegative().optional(),
-      outputPer1M: z.number().nonnegative().optional(),
-    })
-    .nullable()
-    .optional(),
+  pricing: ProviderPricingSchema.nullable().optional(),
   thinking: z.boolean().optional(),
   reasoningEffort: ReasoningEffortSchema.optional(),
+  contextWindowTokens: z.number().int().positive().nullable().optional(),
 });
 export type ProviderGetConfigResponse = z.infer<
   typeof ProviderGetConfigResponseSchema
@@ -917,12 +952,8 @@ export const ProviderListResponseSchema = z.object({
       paid: z.boolean(),
       thinking: z.boolean().optional(),
       reasoningEffort: ReasoningEffortSchema.optional(),
-      pricing: z
-        .object({
-          inputPer1M: z.number().nonnegative().optional(),
-          outputPer1M: z.number().nonnegative().optional(),
-        })
-        .optional(),
+      contextWindowTokens: z.number().int().positive().optional(),
+      pricing: ProviderPricingSchema.optional(),
     }),
   ),
 });
@@ -956,6 +987,71 @@ export type ProviderDeleteResponse = z.infer<
   typeof ProviderDeleteResponseSchema
 >;
 
+const ProviderLookupDraftSchema = z.object({
+  baseUrl: z.string().url(),
+  apiKey: z.string().default(""),
+  model: z.string().min(1),
+});
+
+/**
+ * Fetch published API pricing via a saved (or draft) provider LLM + optional
+ * docs page fetch. Result is a draft for the user to confirm before save.
+ */
+export const ProviderFetchPricingRequestSchema = z
+  .object({
+    /** Saved provider used to run extraction (tool-calling chat). */
+    lookupProviderId: z.string().min(1).optional(),
+    /** Unsaved / in-form credentials (e.g. the provider being edited). */
+    lookupDraft: ProviderLookupDraftSchema.optional(),
+    target: z.object({
+      name: z.string().max(80).optional(),
+      baseUrl: z.string().url(),
+      defaultModel: z.string().optional(),
+    }),
+    /** Official pricing docs URL; guessed from host when omitted. */
+    docsUrl: z.string().url().optional(),
+  })
+  .refine((v) => Boolean(v.lookupProviderId || v.lookupDraft), {
+    message: "Provide lookupProviderId or lookupDraft",
+  });
+export type ProviderFetchPricingRequest = z.infer<
+  typeof ProviderFetchPricingRequestSchema
+>;
+
+export const ProviderFetchPricingResponseSchema = z.object({
+  ok: z.boolean(),
+  pricing: ProviderPricingSchema.optional(),
+  /** Context window for the target default model, when extracted from docs. */
+  contextWindowTokens: z.number().int().positive().max(10_000_000).optional(),
+  docsUrl: z.string().url().nullable().optional(),
+  pageFetched: z.boolean().optional(),
+  cancelled: z.boolean().optional(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type ProviderFetchPricingResponse = z.infer<
+  typeof ProviderFetchPricingResponseSchema
+>;
+
+export const ProviderFetchPricingProgressSchema = z.object({
+  message: z.string().min(1).max(2000),
+  at: z.string().datetime(),
+});
+export type ProviderFetchPricingProgress = z.infer<
+  typeof ProviderFetchPricingProgressSchema
+>;
+
+export const ProviderCancelFetchPricingRequestSchema = z.object({});
+export type ProviderCancelFetchPricingRequest = z.infer<
+  typeof ProviderCancelFetchPricingRequestSchema
+>;
+
+export const ProviderCancelFetchPricingResponseSchema = z.object({
+  ok: z.boolean(),
+});
+export type ProviderCancelFetchPricingResponse = z.infer<
+  typeof ProviderCancelFetchPricingResponseSchema
+>;
+
 export const IpcRequestSchemas = {
   [IPC_CHANNELS.SESSION_GET]: SessionGetRequestSchema,
   [IPC_CHANNELS.SESSION_SUBSCRIBE]: SessionSubscribeRequestSchema,
@@ -967,6 +1063,7 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.SESSION_TERMINAL_CONFIRM_EDIT]:
     SessionTerminalConfirmEditRequestSchema,
   [IPC_CHANNELS.SESSION_TERMINAL_ASK]: SessionTerminalAskRequestSchema,
+  [IPC_CHANNELS.SESSION_AGENT_ASK]: SessionAgentAskRequestSchema,
   [IPC_CHANNELS.TERMINAL_SUBSCRIBE]: TerminalSubscribeRequestSchema,
   [IPC_CHANNELS.TERMINAL_LIST]: TerminalListRequestSchema,
   [IPC_CHANNELS.TERMINAL_WRITE_USER]: TerminalWriteUserRequestSchema,
@@ -1014,6 +1111,9 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.PROVIDER_LIST]: ProviderListRequestSchema,
   [IPC_CHANNELS.PROVIDER_SET_ACTIVE]: ProviderSetActiveRequestSchema,
   [IPC_CHANNELS.PROVIDER_DELETE]: ProviderDeleteRequestSchema,
+  [IPC_CHANNELS.PROVIDER_FETCH_PRICING]: ProviderFetchPricingRequestSchema,
+  [IPC_CHANNELS.PROVIDER_CANCEL_FETCH_PRICING]:
+    ProviderCancelFetchPricingRequestSchema,
   [IPC_CHANNELS.GITHUB_STATUS]: GithubStatusRequestSchema,
   [IPC_CHANNELS.GITHUB_LOGOUT]: GithubLogoutRequestSchema,
   [IPC_CHANNELS.GITHUB_LOGIN_WEB]: GithubLoginWebRequestSchema,

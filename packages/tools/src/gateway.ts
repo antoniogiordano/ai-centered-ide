@@ -4,6 +4,7 @@ import type {
   ApprovalGrant,
   ToolCall,
   ToolResult,
+  ToolResultImage,
 } from "@ai-ide/shared";
 import type {
   CheckpointService,
@@ -18,6 +19,7 @@ import {
   type ApprovalCategory,
 } from "./policy.js";
 import type { ToolRegistry } from "./registry.js";
+import type { AskHost } from "./ask-host.js";
 import type { TerminalHost } from "./terminal-host.js";
 import type { CbmHost } from "./cbm-host.js";
 
@@ -39,6 +41,8 @@ export type ToolExecutionContext = {
   oneShotApprovedIds?: Set<string>;
   /** Interactive multi-PTY host (desktop). Optional in tests. */
   terminals?: TerminalHost;
+  /** Blocking user-question host for ask_user (desktop). Optional in tests. */
+  ask?: AskHost;
   /** Codebase-memory-mcp host (desktop). Optional until indexed. */
   cbm?: CbmHost;
   /** Full suite logs from the last IDE test gate (for read_test_log). */
@@ -77,7 +81,16 @@ export type ToolExecutionContext = {
 };
 
 export type GatewayResult =
-  | { status: "ok"; result: ToolResult }
+  | {
+      status: "ok";
+      result: ToolResult;
+      /**
+       * Out-of-band image payloads. Kept off {@link ToolResult} so base64 never
+       * lands in SessionState, SQLite or the IPC transcript — the agent loop
+       * forwards them straight to the provider message list.
+       */
+      images?: ToolResultImage[];
+    }
   | {
       status: "approval_required";
       approvalId: string;
@@ -295,6 +308,7 @@ export class ToolGateway {
           output,
           artifactRef: raw.artifactRef,
         },
+        ...(raw.images?.length ? { images: raw.images } : {}),
       };
     } catch (error) {
       ctx.audit({

@@ -112,6 +112,7 @@ export class ProviderRegistryStore {
     pricing?: SavedProvider["pricing"];
     thinking?: boolean;
     reasoningEffort?: SavedProvider["reasoningEffort"];
+    contextWindowTokens?: number | null;
     apiKey?: string;
     makeActive?: boolean;
   }): SavedProvider {
@@ -121,12 +122,13 @@ export class ProviderRegistryStore {
     const existingIdx = registry.providers.findIndex((p) => p.id === id);
     const prior =
       existingIdx >= 0 ? registry.providers[existingIdx] : undefined;
-    const mergedPricing = input.pricing
-      ? {
-          ...(prior?.pricing ?? {}),
-          ...input.pricing,
-        }
-      : prior?.pricing;
+    // Replace pricing wholesale when provided (nested schedule/byModel).
+    const nextPricing =
+      input.pricing !== undefined ? input.pricing : prior?.pricing;
+    const nextWindow =
+      input.contextWindowTokens !== undefined
+        ? input.contextWindowTokens
+        : prior?.contextWindowTokens;
     const next: SavedProvider = {
       id,
       name: input.name.trim() || "Provider",
@@ -136,8 +138,11 @@ export class ProviderRegistryStore {
       thinking: input.thinking ?? prior?.thinking ?? false,
       reasoningEffort:
         input.reasoningEffort ?? prior?.reasoningEffort ?? "high",
-      ...(mergedPricing && Object.keys(mergedPricing).length
-        ? { pricing: mergedPricing }
+      ...(typeof nextWindow === "number" && nextWindow > 0
+        ? { contextWindowTokens: nextWindow }
+        : {}),
+      ...(nextPricing && Object.keys(nextPricing).length
+        ? { pricing: nextPricing }
         : {}),
       createdAt: prior?.createdAt ?? now,
       updatedAt: now,

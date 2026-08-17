@@ -12,6 +12,8 @@ import {
   type ProviderSetActiveResponse,
   type ProviderDeleteResponse,
   type ProviderSaveConfigResponse,
+  type ProviderFetchPricingRequest,
+  type ProviderFetchPricingResponse,
   type ProviderVerifyResponse,
   type SessionCloseResponse,
   type SessionCreateResponse,
@@ -102,6 +104,12 @@ export type DesktopBridge = {
       text: string;
       cancelled?: boolean;
     }) => Promise<void>;
+    agentAsk: (input: {
+      askId: string;
+      selectedOptionIds?: string[];
+      text: string;
+      cancelled?: boolean;
+    }) => Promise<void>;
     cancel: () => Promise<void>;
     exportDiagnostics: () => Promise<unknown>;
   };
@@ -170,7 +178,7 @@ export type DesktopBridge = {
       apiKey: string;
       defaultModel: string;
       paid?: boolean;
-      pricing?: { inputPer1M?: number; outputPer1M?: number };
+      pricing?: import("@ai-ide/shared").ProviderPricing;
       thinking?: boolean;
       reasoningEffort?:
         | "none"
@@ -180,8 +188,19 @@ export type DesktopBridge = {
         | "high"
         | "xhigh"
         | "max";
+      contextWindowTokens?: number | null;
       makeActive?: boolean;
     }) => Promise<ProviderSaveConfigResponse>;
+    fetchPricing: (
+      input: ProviderFetchPricingRequest,
+    ) => Promise<ProviderFetchPricingResponse>;
+    cancelFetchPricing: () => Promise<{ ok: boolean }>;
+    onFetchPricingProgress: (
+      cb: (event: {
+        message: string;
+        at: string;
+      }) => void,
+    ) => () => void;
   };
   ui: {
     onFocusComposer: (cb: () => void) => () => void;
@@ -270,6 +289,13 @@ const bridge: DesktopBridge = {
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_TERMINAL_ASK, {
         askId: input.askId,
         selectedOptionId: input.selectedOptionId ?? null,
+        text: input.text,
+        cancelled: Boolean(input.cancelled),
+      }),
+    agentAsk: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_AGENT_ASK, {
+        askId: input.askId,
+        selectedOptionIds: input.selectedOptionIds ?? [],
         text: input.text,
         cancelled: Boolean(input.cancelled),
       }),
@@ -368,6 +394,19 @@ const bridge: DesktopBridge = {
       ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_LIST_MODELS, input),
     saveConfig: (input) =>
       ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_SAVE_CONFIG, input),
+    fetchPricing: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_FETCH_PRICING, input),
+    cancelFetchPricing: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_CANCEL_FETCH_PRICING, {}),
+    onFetchPricingProgress: (cb) => {
+      const channel = IPC_CHANNELS.PROVIDER_FETCH_PRICING_PROGRESS;
+      const handler = (
+        _: unknown,
+        event: { message: string; at: string },
+      ) => cb(event);
+      ipcRenderer.on(channel, handler);
+      return () => ipcRenderer.removeListener(channel, handler);
+    },
   },
   ui: {
     onFocusComposer: (cb) => onUiEvent(UI_FOCUS_COMPOSER, cb),

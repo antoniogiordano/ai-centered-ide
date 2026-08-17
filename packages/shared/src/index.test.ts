@@ -27,6 +27,9 @@ describe("shared schemas", () => {
     expect(state.planPhases).toEqual([]);
     expect(state.planStatus).toBe("drafting");
     expect(state.testingConfirmedAt).toBeNull();
+    expect(state.contextSummary).toBeNull();
+    expect(state.contextCompactionCount).toBe(0);
+    expect(state.agentHistoryPath).toBeNull();
   });
 
   it("rejects invalid IPC payloads", () => {

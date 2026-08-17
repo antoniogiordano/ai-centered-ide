@@ -16,6 +16,12 @@ export const DEFAULT_MAX_READ_BYTES = 512 * 1024;
 export const DEFAULT_MAX_WRITE_BYTES = 512 * 1024;
 /** Binary attachment imports (images) — aligned with chat attachment cap. */
 export const DEFAULT_MAX_BINARY_WRITE_BYTES = 4 * 1024 * 1024;
+/**
+ * Cap for binary reads that end up as base64 in a model prompt (read_image).
+ * Lower than the write cap: base64 inflates by ~4/3 and images are billed as
+ * tokens, so a 4 MB screenshot would dominate the context window.
+ */
+export const DEFAULT_MAX_BINARY_READ_BYTES = 2 * 1024 * 1024;
 /** Default window size for agent `read_file` (lines). */
 export const DEFAULT_READ_WINDOW_LINES = 250;
 /** Hard cap per `read_file` call — agent pages with startLine. */
@@ -111,6 +117,41 @@ export class FilesystemService {
       maxLines,
       maxChars,
     );
+  }
+
+  /**
+   * Read raw bytes (images for vision). Unlike {@link readWindow} this never
+   * decodes as UTF-8, so callers get the real bytes instead of mojibake.
+   */
+  readBinary(
+    relativePath: string,
+    options?: { maxBytes?: number },
+  ): { bytes: Buffer; path: string; totalBytes: number } {
+    const abs = assertInsideWorkspace(this.workspaceRoot, relativePath);
+    const stat = statSync(abs);
+    if (stat.isDirectory()) {
+      throw new AppError({
+        code: "VALIDATION_ERROR",
+        userMessage: "Path is a directory, not a file.",
+        technicalDetail: relativePath,
+      });
+    }
+    const maxBytes = Math.max(
+      1,
+      Math.floor(options?.maxBytes ?? DEFAULT_MAX_BINARY_READ_BYTES),
+    );
+    if (stat.size > maxBytes) {
+      throw new AppError({
+        code: "VALIDATION_ERROR",
+        userMessage: `File is too large to read as binary (${stat.size} bytes, cap ${maxBytes}).`,
+        technicalDetail: `${relativePath} size ${stat.size}`,
+      });
+    }
+    return {
+      bytes: readFileSync(abs),
+      path: relative(this.workspaceRoot, abs),
+      totalBytes: stat.size,
+    };
   }
 
   list(relativePath = "."): string[] {

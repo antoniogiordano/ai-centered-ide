@@ -12,7 +12,7 @@ import {
   type ProjectStorage,
 } from "@ai-ide/storage";
 import type { CredentialStore } from "@ai-ide/storage";
-import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
+import { OpenAiCompatibleProvider } from "@ai-ide/provider";
 import { assertHttpsForRemote } from "@ai-ide/provider";
 import {
   GitService,
@@ -24,6 +24,7 @@ import {
 } from "@ai-ide/workspace";
 import { ARCHITECTURE_FILE_PATH } from "@ai-ide/shared";
 import type { SessionManager } from "./session.js";
+import { fetchProviderPricingOnline } from "./fetch-provider-pricing.js";
 
 let invalidMessageCount = 0;
 
@@ -224,6 +225,17 @@ export function registerIpcHandlers(
     session.resolveTerminalAsk({
       askId: req.askId,
       selectedOptionId: req.selectedOptionId ?? null,
+      text: req.text,
+      cancelled: req.cancelled,
+    });
+    return { state: session.getState() };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SESSION_AGENT_ASK, (_event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.SESSION_AGENT_ASK, payload);
+    session.resolveAgentAsk({
+      askId: req.askId,
+      selectedOptionIds: req.selectedOptionIds,
       text: req.text,
       cancelled: req.cancelled,
     });
@@ -649,12 +661,21 @@ export function registerIpcHandlers(
         apiKey: req.apiKey,
         ...(req.model ? { defaultModel: req.model } : {}),
       });
-      const models = (await provider.listModels()).map((m) => m.id);
+      const models = await provider.listModels();
       // Persist key only when present; empty is fine for local providers.
       if (req.apiKey.trim()) {
         await credentials.set(CREDENTIAL_SERVICE, "default", req.apiKey);
       }
-      return { ok: true, models };
+      return {
+        ok: true,
+        models: models.map((m) => m.id),
+        modelDetails: models.map((m) => ({
+          id: m.id,
+          ...(typeof m.contextWindowTokens === "number"
+            ? { contextWindowTokens: m.contextWindowTokens }
+            : {}),
+        })),
+      };
     } catch (error) {
       const detail =
         error instanceof AppError
@@ -678,10 +699,22 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle(IPC_CHANNELS.PROVIDER_LIST_MODELS, async (_event, payload) => {
-    safeValidate(IPC_CHANNELS.PROVIDER_LIST_MODELS, payload);
-    const provider = new MockProvider({ name: "list", steps: [] });
+    const req = safeValidate(IPC_CHANNELS.PROVIDER_LIST_MODELS, payload);
+    assertHttpsForRemote(req.baseUrl);
+    const provider = new OpenAiCompatibleProvider({
+      baseUrl: req.baseUrl,
+      apiKey: req.apiKey,
+    });
     const models = await provider.listModels();
-    return { models: models.map((m) => m.id) };
+    return {
+      models: models.map((m) => m.id),
+      modelDetails: models.map((m) => ({
+        id: m.id,
+        ...(typeof m.contextWindowTokens === "number"
+          ? { contextWindowTokens: m.contextWindowTokens }
+          : {}),
+      })),
+    };
   });
 
   ipcMain.handle(IPC_CHANNELS.PROVIDER_SAVE_CONFIG, async (_event, payload) => {
@@ -714,6 +747,9 @@ export function registerIpcHandlers(
       ...(req.reasoningEffort
         ? { reasoningEffort: req.reasoningEffort }
         : {}),
+      ...(req.contextWindowTokens !== undefined
+        ? { contextWindowTokens: req.contextWindowTokens }
+        : {}),
       ...(req.apiKey.trim() ? { apiKey: req.apiKey } : {}),
       makeActive: req.makeActive !== false,
     });
@@ -743,6 +779,7 @@ export function registerIpcHandlers(
           pricing: active.pricing ?? null,
           thinking: active.thinking,
           reasoningEffort: active.reasoningEffort,
+          contextWindowTokens: active.contextWindowTokens ?? null,
         };
       }
     }
@@ -761,6 +798,7 @@ export function registerIpcHandlers(
       pricing: null,
       thinking: false,
       reasoningEffort: "high" as const,
+      contextWindowTokens: null,
     };
   });
 
@@ -782,6 +820,9 @@ export function registerIpcHandlers(
         paid: p.paid,
         thinking: p.thinking,
         reasoningEffort: p.reasoningEffort,
+        ...(typeof p.contextWindowTokens === "number"
+          ? { contextWindowTokens: p.contextWindowTokens }
+          : {}),
         ...(p.pricing ? { pricing: p.pricing } : {}),
       })),
     };
@@ -827,6 +868,71 @@ export function registerIpcHandlers(
     session.syncProviderHud();
     return { ok: true };
   });
+
+  let pricingFetchAbort: AbortController | null = null;
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDER_FETCH_PRICING, async (event, payload) => {
+    const req = safeValidate(IPC_CHANNELS.PROVIDER_FETCH_PRICING, payload);
+    const store = session.getProviderStore();
+    if (!store) {
+      return {
+        ok: false,
+        error: {
+          code: "INTERNAL_ERROR" as const,
+          userMessage: "Provider store is not ready.",
+          technicalDetail: "getProviderStore() returned null",
+        },
+      };
+    }
+    pricingFetchAbort?.abort();
+    pricingFetchAbort = new AbortController();
+    const signal = pricingFetchAbort.signal;
+    const onProgress = (message: string) => {
+      if (event.sender.isDestroyed()) return;
+      event.sender.send(IPC_CHANNELS.PROVIDER_FETCH_PRICING_PROGRESS, {
+        message,
+        at: new Date().toISOString(),
+      });
+    };
+    try {
+      return await fetchProviderPricingOnline({
+        store,
+        request: req,
+        signal,
+        onProgress,
+      });
+    } catch (error) {
+      if (signal.aborted) {
+        return {
+          ok: false,
+          cancelled: true,
+          error: {
+            code: "PROVIDER_ERROR" as const,
+            userMessage: "Fetch cancelled.",
+            technicalDetail: "AbortSignal aborted",
+          },
+        };
+      }
+      return {
+        ok: false,
+        error: errorPayload(error),
+      };
+    } finally {
+      if (pricingFetchAbort?.signal === signal) {
+        pricingFetchAbort = null;
+      }
+    }
+  });
+
+  ipcMain.handle(
+    IPC_CHANNELS.PROVIDER_CANCEL_FETCH_PRICING,
+    (_event, payload) => {
+      safeValidate(IPC_CHANNELS.PROVIDER_CANCEL_FETCH_PRICING, payload ?? {});
+      pricingFetchAbort?.abort();
+      pricingFetchAbort = null;
+      return { ok: true };
+    },
+  );
 
   ipcMain.handle(IPC_CHANNELS.GITHUB_STATUS, async (_event, payload) => {
     safeValidate(IPC_CHANNELS.GITHUB_STATUS, payload ?? {});

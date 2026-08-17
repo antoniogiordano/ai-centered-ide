@@ -918,6 +918,49 @@ describe("agent runtime", () => {
     expect(ctx.length).toBeLessThanOrEqual(1 + 1 + BUILD_CONTEXT_TAIL_TURNS + 1);
   });
 
+  it("buildContext pins compaction summary when present", () => {
+    const session = {
+      ...newSession("s-ctx-sum", "agent"),
+      mode: "agent" as const,
+      planStatus: "executing" as const,
+      contextSummary: "- Read AppHeader\n- Next: ProductTour wrapper",
+      contextCompactionCount: 2,
+      agentHistoryPath: ".aici/agent-history/s-ctx-sum.md",
+      planPhases: [
+        {
+          id: "p1",
+          title: "Tour",
+          status: "in_progress" as const,
+          checklist: [{ id: "c1", text: "Wire joyride", done: false }],
+        },
+      ],
+      turns: [
+        {
+          id: "u0",
+          role: "user" as const,
+          content: "Add a product tour",
+          createdAt: new Date().toISOString(),
+        },
+      ],
+    };
+    const ctx = buildContext(session, "continue");
+    expect(
+      ctx.some(
+        (t) =>
+          t.role === "user" &&
+          t.content.includes("Context summary #2") &&
+          t.content.includes("AppHeader"),
+      ),
+    ).toBe(true);
+    expect(
+      ctx.some(
+        (t) =>
+          t.role === "user" &&
+          t.content.includes(".aici/agent-history/s-ctx-sum.md"),
+      ),
+    ).toBe(true);
+  });
+
   it("compactProviderMessages refreshes system and bounds the live tail", () => {
     const state = {
       ...newSession("s-compact", "agent"),

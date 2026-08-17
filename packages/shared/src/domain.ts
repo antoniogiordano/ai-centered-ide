@@ -185,6 +185,20 @@ export const ToolResultSchema = z.object({
 });
 export type ToolResult = z.infer<typeof ToolResultSchema>;
 
+/**
+ * Image bytes a tool wants the model to actually look at (e2e screenshots,
+ * rendered diagrams). Deliberately **not** a field of {@link ToolResultSchema}:
+ * base64 payloads must never reach SessionState, persistence or the IPC
+ * transcript. They travel gateway → agent loop → provider only.
+ */
+export const ToolResultImageSchema = z.object({
+  mime: z.string().min(1),
+  dataBase64: z.string().min(1),
+  /** Short provenance shown to the model, e.g. the source file name. */
+  label: z.string().optional(),
+});
+export type ToolResultImage = z.infer<typeof ToolResultImageSchema>;
+
 export const ApprovalGrantSchema = z.object({
   id: z.string().min(1),
   category: z.string().min(1),
@@ -257,6 +271,29 @@ export const PendingTerminalAskSchema = z.object({
   appendNewline: z.boolean().default(true),
 });
 export type PendingTerminalAsk = z.infer<typeof PendingTerminalAskSchema>;
+
+export const AgentAskOptionSchema = z.object({
+  id: z.string().min(1),
+  label: z.string().min(1),
+});
+export type AgentAskOption = z.infer<typeof AgentAskOptionSchema>;
+
+/**
+ * Structural decision the agent cannot resolve on its own (ask_user tool).
+ * Blocks the running turn until the user answers — unlike planQuestions, the
+ * answer returns inside the tool result instead of a new user message.
+ */
+export const PendingAgentAskSchema = z.object({
+  id: z.string().min(1),
+  /** What the agent found that forced the question (dialog lead). */
+  context: z.string().default(""),
+  prompt: z.string().min(1),
+  /** single = A–Z keys; multiple = 1–9 keys + Enter. */
+  selection: z.enum(["single", "multiple"]).default("single"),
+  options: z.array(AgentAskOptionSchema).min(2).max(8),
+  allowFreeText: z.boolean().default(true),
+});
+export type PendingAgentAsk = z.infer<typeof PendingAgentAskSchema>;
 
 export const SessionStateSchema = z.object({
   sessionId: z.string().min(1),
@@ -361,10 +398,24 @@ export const SessionStateSchema = z.object({
   pendingTerminalConfirm: PendingTerminalConfirmSchema.nullable().default(null),
   /** Exclusive Q&A when the agent needs a human decision for the terminal. */
   pendingTerminalAsk: PendingTerminalAskSchema.nullable().default(null),
+  /** Set while ask_user blocks the turn on a structural decision. */
+  pendingAgentAsk: PendingAgentAskSchema.nullable().default(null),
   /** Active provider + token/cost counters for the chrome HUD. */
   providerHud: ProviderHudSchema.nullable().default(null),
   /** Models used in this chat session with token/cost breakdown. */
   sessionModelUsage: z.array(SessionModelUsageSchema).default([]),
+  /**
+   * Lossy summary of prior agent trajectory after context compaction
+   * (Cursor-style). Replaces dropped tool/chat history in the live window.
+   */
+  contextSummary: z.string().nullable().default(null),
+  /** How many times this session has been compacted. */
+  contextCompactionCount: z.number().int().nonnegative().default(0),
+  /**
+   * Workspace-relative path to the full compacted transcript
+   * (e.g. `.aici/agent-history/<sessionId>.md`) for recovery via read_file.
+   */
+  agentHistoryPath: z.string().nullable().default(null),
   error: z.string().nullable(),
 });
 export type SessionState = z.infer<typeof SessionStateSchema>;
@@ -644,8 +695,12 @@ export function createEmptySessionState(sessionId: string): SessionState {
     liveTerminals: [],
     pendingTerminalConfirm: null,
     pendingTerminalAsk: null,
+    pendingAgentAsk: null,
     providerHud: null,
     sessionModelUsage: [],
+    contextSummary: null,
+    contextCompactionCount: 0,
+    agentHistoryPath: null,
     error: null,
   };
 }

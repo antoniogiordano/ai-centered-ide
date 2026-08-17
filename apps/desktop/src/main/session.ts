@@ -7,6 +7,7 @@ import type {
   AttachmentPayload,
   SessionState,
   SessionSummary,
+  TestSuiteResult,
   WorkspaceRef,
 } from "@ai-ide/shared";
 import {
@@ -54,8 +55,8 @@ import {
   GitService,
   GhCli,
 } from "@ai-ide/workspace";
-import type { TerminalHost } from "@ai-ide/tools";
-import { runTestSuites } from "@ai-ide/tools";
+import type { AgentAskAnswer, AskHost, TerminalHost } from "@ai-ide/tools";
+import { discoverE2eScreenshots, runTestSuites } from "@ai-ide/tools";
 import { app, shell } from "electron";
 import type { CredentialStore } from "@ai-ide/storage";
 import { getAppCredential } from "@ai-ide/storage";
@@ -237,6 +238,7 @@ export class SessionManager {
   private tokenFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly terminals = new TerminalManager();
   private terminalHost: TerminalHost;
+  private askHost: AskHost;
   private readonly engine = new CbmEngine();
   private cbmHost: CbmHost;
   private confirmWaiters = new Map<
@@ -256,6 +258,10 @@ export class SessionManager {
         cancelled: boolean;
       }) => void;
     }
+  >();
+  private agentAskWaiters = new Map<
+    string,
+    { resolve: (value: AgentAskAnswer) => void }
   >();
   private terminalChunkListeners = new Set<
     (event: { terminalId: string; data: string; sequence: number }) => void
@@ -291,6 +297,7 @@ export class SessionManager {
     this.state = boot.state;
     this.createdAt = boot.createdAt;
     this.terminalHost = this.createTerminalHost();
+    this.askHost = this.createAskHost();
     this.cbmHost = this.createCbmHost();
     this.terminals.onChange(() => this.scheduleLiveTerminalSync());
     this.terminals.onChunk((event) => {
@@ -365,15 +372,26 @@ export class SessionManager {
       waiter.resolve({ selectedOptionId: null, text: "", cancelled: true });
       this.askWaiters.delete(id);
     }
+    for (const [id, waiter] of this.agentAskWaiters) {
+      waiter.resolve({
+        selectedOptionIds: [],
+        selectedLabels: [],
+        text: "",
+        cancelled: true,
+      });
+      this.agentAskWaiters.delete(id);
+    }
     if (
       this.state.pendingTerminalConfirm ||
       this.state.pendingTerminalAsk ||
+      this.state.pendingAgentAsk ||
       reason === "dispose"
     ) {
       this.state = {
         ...this.state,
         pendingTerminalConfirm: null,
         pendingTerminalAsk: null,
+        pendingAgentAsk: null,
       };
     }
   }
@@ -515,6 +533,74 @@ export class SessionManager {
       text: input.text,
       cancelled: Boolean(input.cancelled),
     });
+  }
+
+  private waitAgentAsk(params: {
+    context: string;
+    prompt: string;
+    selection: "single" | "multiple";
+    options: Array<{ id: string; label: string }>;
+    allowFreeText: boolean;
+  }): Promise<AgentAskAnswer> {
+    const id = randomUUID();
+    this.state = {
+      ...this.state,
+      pendingAgentAsk: {
+        id,
+        context: params.context,
+        prompt: params.prompt,
+        selection: params.selection,
+        options: params.options,
+        allowFreeText: params.allowFreeText,
+      },
+      activityLabel: "Waiting for your decision…",
+    };
+    this.push();
+    return new Promise((resolve) => {
+      this.agentAskWaiters.set(id, { resolve });
+    });
+  }
+
+  resolveAgentAsk(input: {
+    askId: string;
+    selectedOptionIds?: string[];
+    text: string;
+    cancelled?: boolean;
+  }): void {
+    const pending = this.state.pendingAgentAsk;
+    if (!pending || pending.id !== input.askId) return;
+    const waiter = this.agentAskWaiters.get(input.askId);
+    if (!waiter) return;
+    this.agentAskWaiters.delete(input.askId);
+    const ids = input.selectedOptionIds ?? [];
+    const labels = ids
+      .map((id) => pending.options.find((o) => o.id === id)?.label)
+      .filter((label): label is string => Boolean(label));
+    this.state = {
+      ...this.state,
+      pendingAgentAsk: null,
+      activityLabel: null,
+    };
+    this.push();
+    waiter.resolve({
+      selectedOptionIds: ids,
+      selectedLabels: labels,
+      text: input.text,
+      cancelled: Boolean(input.cancelled),
+    });
+  }
+
+  private createAskHost(): AskHost {
+    return {
+      ask: (params) =>
+        this.waitAgentAsk({
+          context: params.context ?? "",
+          prompt: params.prompt,
+          selection: params.selection === "multiple" ? "multiple" : "single",
+          options: params.options,
+          allowFreeText: params.allowFreeText !== false,
+        }),
+    };
   }
 
   private createTerminalHost(): TerminalHost {
@@ -672,6 +758,9 @@ export class SessionManager {
     sessionKind?: SessionState["sessionKind"];
     approvalGrants: SessionState["approvalGrants"];
     sessionModelUsage?: SessionModelUsage[];
+    contextSummary?: string | null;
+    contextCompactionCount?: number;
+    agentHistoryPath?: string | null;
     createdAt: string;
   }): { state: SessionState; createdAt: string } {
     const turns = this.storage.loadTurns(row.id);
@@ -693,6 +782,9 @@ export class SessionManager {
       buildFlowCompletedAt: row.buildFlowCompletedAt ?? null,
       approvalGrants: row.approvalGrants,
       sessionModelUsage: row.sessionModelUsage ?? [],
+      contextSummary: row.contextSummary ?? null,
+      contextCompactionCount: row.contextCompactionCount ?? 0,
+      agentHistoryPath: row.agentHistoryPath ?? null,
       turns,
       status: "idle",
     };
@@ -805,6 +897,9 @@ export class SessionManager {
       sessionKind: this.state.sessionKind,
       approvalGrants: this.state.approvalGrants,
       sessionModelUsage: this.state.sessionModelUsage,
+      contextSummary: this.state.contextSummary,
+      contextCompactionCount: this.state.contextCompactionCount,
+      agentHistoryPath: this.state.agentHistoryPath,
       createdAt: this.createdAt,
       updatedAt: now,
     });
@@ -1408,6 +1503,7 @@ export class SessionManager {
         liveTerminals: [],
         pendingTerminalConfirm: null,
         pendingTerminalAsk: null,
+        pendingAgentAsk: null,
       };
       this.createdAt = hydrated.createdAt;
     } else {
@@ -1428,6 +1524,7 @@ export class SessionManager {
         liveTerminals: [],
         pendingTerminalConfirm: null,
         pendingTerminalAsk: null,
+        pendingAgentAsk: null,
       };
       this.createdAt = now;
     }
@@ -1476,6 +1573,7 @@ export class SessionManager {
       liveTools: [],
       pendingTerminalConfirm: null,
       pendingTerminalAsk: null,
+      pendingAgentAsk: null,
     };
     this.persist();
     this.push();
@@ -1586,6 +1684,10 @@ export class SessionManager {
         provider,
         signal: this.abort.signal,
         onProgress: (event) => this.handleProgress(event),
+        contextWindowTokens:
+          this.providerStore?.getActive()?.contextWindowTokens ??
+          this.state.providerHud?.contextWindowTokens ??
+          null,
         ...(visionImages.length ? { visionImages } : {}),
         ...(root
           ? {
@@ -1595,6 +1697,7 @@ export class SessionManager {
                 git: new GitService(root),
                 checkpoint: new CheckpointService(root, checkpointRoot),
                 terminals: this.terminalHost,
+                ask: this.askHost,
                 cbm: this.cbmHost,
                 testLogs: {
                   get: (suiteId: string) => this.testLogs.get(suiteId),
@@ -1923,7 +2026,14 @@ export class SessionManager {
       };
       this.push();
       if (decision.autoContinue) {
-        void this.sendMessage(checkDigest);
+        const shots = this.collectE2eFailureScreenshots(
+          outcome.suites,
+          startedAt,
+        );
+        void this.sendMessage(
+          this.digestWithScreenshots(checkDigest, shots),
+          shots.length ? { attachments: shots } : undefined,
+        );
       }
     } catch (error) {
       const decision = decideTestGateAutoContinue({
@@ -2225,7 +2335,14 @@ export class SessionManager {
       };
       this.push();
       if (decision.autoContinue) {
-        void this.sendMessage(digest);
+        const shots = this.collectE2eFailureScreenshots(
+          outcome.suites,
+          startedAt,
+        );
+        void this.sendMessage(
+          this.digestWithScreenshots(digest, shots),
+          shots.length ? { attachments: shots } : undefined,
+        );
       }
     } catch (error) {
       const decision = decideTestGateAutoContinue({
@@ -2291,6 +2408,56 @@ export class SessionManager {
     } finally {
       this.testGateInFlight = false;
     }
+  }
+
+  /**
+   * Turn e2e failure screenshots into chat attachments so the agent actually
+   * sees them. Cypress/Playwright never print the picture, and it is usually
+   * the fastest route to the cause (a modal overlay, a missing element).
+   */
+  private collectE2eFailureScreenshots(
+    suites: TestSuiteResult[],
+    startedAtIso: string,
+  ): AttachmentPayload[] {
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) return [];
+    const e2eFailed = suites.some(
+      (s) => s.kind === "e2e" && s.status !== "passed" && s.status !== "skipped",
+    );
+    if (!e2eFailed) return [];
+    const startedMs = Date.parse(startedAtIso);
+    const sinceMs = Number.isFinite(startedMs)
+      ? startedMs - 2_000
+      : Date.now() - 600_000;
+    try {
+      return discoverE2eScreenshots({ workspaceRoot: root, sinceMs }).map(
+        (shot) => ({
+          id: randomUUID(),
+          kind: "image" as const,
+          name: shot.path,
+          path: shot.path,
+          mime: shot.mime,
+          dataBase64: shot.dataBase64,
+        }),
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  /** Digest + a pointer to the attached screenshots, when there are any. */
+  private digestWithScreenshots(
+    digest: string,
+    shots: AttachmentPayload[],
+  ): string {
+    if (!shots.length) return digest;
+    const names = shots.map((s) => s.name).join(", ");
+    return [
+      digest,
+      "",
+      `[IDE] Attached ${shots.length} screenshot(s) captured by the failed e2e run: ${names}.`,
+      "Look at them before changing code — they usually show the real cause (an overlay covering the element, a missing selector, a wrong route). Re-open any of them later with read_image.",
+    ].join("\n");
   }
 
   private isPaidActiveProvider(): boolean {
@@ -2809,6 +2976,10 @@ export class SessionManager {
         signal: this.abort.signal,
         onProgress: (event) => this.handleProgress(event),
         approvedCallId: pending.toolCall.id,
+        contextWindowTokens:
+          this.providerStore?.getActive()?.contextWindowTokens ??
+          this.state.providerHud?.contextWindowTokens ??
+          null,
         ...(root
           ? {
               toolCtx: {
@@ -2817,6 +2988,7 @@ export class SessionManager {
                 git: new GitService(root),
                 checkpoint: new CheckpointService(root, checkpointRoot),
                 terminals: this.terminalHost,
+                ask: this.askHost,
                 cbm: this.cbmHost,
                 testLogs: {
                   get: (suiteId: string) => this.testLogs.get(suiteId),

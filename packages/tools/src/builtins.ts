@@ -1,6 +1,9 @@
 import { z } from "zod";
 import { ToolRegistry, type ToolPhase } from "./registry.js";
+import { registerAskTools } from "./ask.js";
 import { registerCbmTools } from "./cbm-builtins.js";
+import { registerVisionTools } from "./vision.js";
+import { registerWebTools } from "./web.js";
 
 const emptyObjectSchema = {
   type: "object",
@@ -1573,5 +1576,8 @@ export function createDefaultRegistry(): ToolRegistry {
   const registry = new ToolRegistry();
   registerBuiltinTools(registry);
   registerCbmTools(registry);
+  registerWebTools(registry);
+  registerVisionTools(registry);
+  registerAskTools(registry);
   return registry;
 }

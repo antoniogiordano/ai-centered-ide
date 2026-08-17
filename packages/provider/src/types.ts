@@ -1,4 +1,6 @@
-import { AppError } from "@ai-ide/shared";
+import { AppError, type ToolResultImage } from "@ai-ide/shared";
+
+export type { ToolResultImage };
 
 export type ToolFunctionDef = {
   name: string;
@@ -38,7 +40,19 @@ export type ChatMessage =
        */
       reasoning_content?: string;
     }
-  | { role: "tool"; tool_call_id: string; content: string };
+  | {
+      role: "tool";
+      tool_call_id: string;
+      content: string;
+      /**
+       * Images the tool wants the model to look at. Wire encoding is
+       * provider-specific: OpenAI-compatible endpoints reject `image_url` on
+       * tool messages, so the adapter hoists these into a synthetic user
+       * message. Providers with native support (Anthropic `tool_result`
+       * content blocks) can send them inline.
+       */
+      images?: ToolResultImage[];
+    };
 
 /** Flatten text from multimodal content for compaction / goal heuristics. */
 export function chatContentText(content: UserOrSystemContent): string {
@@ -74,6 +88,8 @@ export type ChatOptions = {
 
 export type ModelInfo = {
   id: string;
+  /** Best-effort context window from /v1/models metadata when the endpoint provides it. */
+  contextWindowTokens?: number;
 };
 
 export interface AiProvider {

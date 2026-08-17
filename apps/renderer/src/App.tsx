@@ -19,6 +19,7 @@ import {
 } from "./components/ArchitecturePane";
 import { TerminalConfirmBar } from "./components/TerminalConfirmBar";
 import { TerminalAskDialog } from "./components/TerminalAskDialog";
+import { AgentAskDialog } from "./components/AgentAskDialog";
 import { EngineBanner } from "./components/EngineBanner";
 
 const ONBOARDING_KEY = "ai-ide-onboarding-complete";
@@ -514,6 +515,14 @@ export function App() {
       !providerOpen &&
       !newProjectOpen ? (
         <TerminalAskDialog pending={state.pendingTerminalAsk} />
+      ) : null}
+
+      {state?.pendingAgentAsk &&
+      !state.pendingTerminalAsk &&
+      !state.pendingTerminalConfirm &&
+      !providerOpen &&
+      !newProjectOpen ? (
+        <AgentAskDialog pending={state.pendingAgentAsk} />
       ) : null}
 
       <OnboardingWizard

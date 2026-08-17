@@ -4,6 +4,8 @@ import {
   MockProvider,
   parseSseDataLines,
   requiresReasoningEffortNoneWithTools,
+  extractContextWindowTokens,
+  parseModelListEntry,
 } from "./index.js";
 import {
   assertHttpsForRemote,
@@ -126,5 +128,36 @@ describe("vision fallback helpers", () => {
         'unknown variant `image_url`, expected `text`',
       ),
     ).toBe(true);
+  });
+
+  it("extracts context_length from heterogeneous /models entries", () => {
+    expect(
+      extractContextWindowTokens({ context_length: 128_000 }),
+    ).toBe(128_000);
+    expect(
+      extractContextWindowTokens({
+        meta: { context_length: 65_536 },
+      }),
+    ).toBe(65_536);
+    expect(
+      extractContextWindowTokens({ max_model_len: 32_768 }),
+    ).toBe(32_768);
+    expect(
+      extractContextWindowTokens({
+        architecture: { context_length: 200_000 },
+      }),
+    ).toBe(200_000);
+    // Small max_tokens is treated as completion cap, not window.
+    expect(extractContextWindowTokens({ max_tokens: 4096 })).toBeUndefined();
+    expect(extractContextWindowTokens({ max_tokens: 32_768 })).toBe(32_768);
+
+    const parsed = parseModelListEntry({
+      id: "deepseek-chat",
+      context_length: 128000,
+    });
+    expect(parsed).toEqual({
+      id: "deepseek-chat",
+      contextWindowTokens: 128000,
+    });
   });
 });

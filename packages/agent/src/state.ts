@@ -186,6 +186,19 @@ export function buildSystemPrompt(state: SessionState): string {
     "Keep replies concise. Prefer short turns over long monologues.",
   ];
 
+  const compactionLine =
+    state.contextSummary || state.agentHistoryPath
+      ? [
+          "Context compaction:",
+          state.contextSummary
+            ? `- A prior trajectory summary is pinned in the chat (compaction #${state.contextCompactionCount}). Prefer it over guessing.`
+            : null,
+          state.agentHistoryPath
+            ? `- Full compacted transcript: \`${state.agentHistoryPath}\` — use read_file / search_text there if the summary omitted a detail (do not re-walk the whole repo for facts you already discovered).`
+            : null,
+        ].filter(Boolean)
+      : [];
+
   const workspaceLine = root
     ? [
         `Active workspace root: ${root}`,
@@ -193,9 +206,12 @@ export function buildSystemPrompt(state: SessionState): string {
         "When the codebase index is ready (see CODEBASE INDEX in the system prompt): MUST use search_graph / search_code / get_architecture / get_code_snippet / trace_path for discovery — not repeated list_dir.",
         "When the index is not ready, use list_dir / read_file / search_text. Never use shell cat/ls/find to browse the repo.",
         "read_file is windowed (startLine/maxLines). If truncated, continue with nextStartLine — do not expect whole large files in one call.",
+        "Third-party libraries: use web_search / web_fetch to read the official README or docs (GitHub raw README, npm page) before reverse-engineering APIs from node_modules or guessing from types.",
+        ...compactionLine,
       ]
     : [
         "No workspace is open yet. Ask the user to open a project folder before reading files.",
+        ...compactionLine,
       ];
 
   const architectureProfile = (() => {
@@ -224,7 +240,7 @@ export function buildSystemPrompt(state: SessionState): string {
 
   const planningRules = [
     "PHASE: PLANNING — the plan is being created (not executed).",
-    "Available tools: when indexed — search_graph / search_code / get_architecture / get_code_snippet / trace_path (primary), plus list_dir/read_file/search_text (fallback), plus read_architecture, upsert_architecture, import_attachment (copy chat attachments into the workspace), read_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, upsert_plan (full rewrite), propose_plan_ready.",
+    "Available tools: when indexed — search_graph / search_code / get_architecture / get_code_snippet / trace_path (primary), plus list_dir/read_file/search_text (fallback), web_search / web_fetch (library docs), plus read_architecture, upsert_architecture, import_attachment (copy chat attachments into the workspace), read_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, upsert_plan (full rewrite), propose_plan_ready.",
     "Unavailable: write_file, replace_in_file, git_*, run_command, terminal_*, checkpoint_restore, get_test_report, list_failed_tests, read_test_log.",
     "IMPORTANT: Never tell the user you cannot run shell commands. Commands run only after Start Build (Check gate, then Build). When the user asks to run npm/git/shell now, call propose_plan_ready so the IDE can switch — then you will get run_command / terminal_*.",
     "",
@@ -297,6 +313,7 @@ export function buildSystemPrompt(state: SessionState): string {
     "Code reading (critical — do not use the shell as a file browser):",
     "- When indexed: search_graph → get_code_snippet / trace_path / search_code first. Do not discover files via repeated list_dir.",
     "- For a known path (from graph or user): use read_file / list_dir / search_text. NEVER run cat/ls/head/find via run_command to inspect source — those commands are blocked.",
+    "- For third-party packages (react-joyride, etc.): web_search for the official docs/README, then web_fetch that URL (or raw.githubusercontent.com README). Do NOT thrash-read node_modules to learn the API.",
     "- Large files: read_file returns a line window (default ~250 lines). If truncated=true, call again with startLine=nextStartLine. Do not try to load the whole file in one call.",
     "- Do not invent qualified_name values — take them from search_graph / search_code results.",
     "When the user asks to run a command: DO IT with tools — prefer a persistent terminal for Node/npm/pnpm workflows.",
@@ -397,7 +414,7 @@ export function buildContext(state: SessionState, userMessage: string): Turn[] {
     ];
   }
 
-  // Building: goal + plan (in system) + short fresh tail — not the full chat.
+  // Building: goal + optional compaction summary + short fresh tail — not the full chat.
   // Escalated test-fix: keep a longer tail so prior digests survive compaction.
   const goal = sessionGoal(state);
   const history = state.turns.filter(
@@ -427,6 +444,17 @@ export function buildContext(state: SessionState, userMessage: string): Turn[] {
         createdAt: new Date().toISOString(),
       });
     }
+  }
+  if (state.contextSummary?.trim()) {
+    const historyNote = state.agentHistoryPath
+      ? `\n\nFull prior transcript: ${state.agentHistoryPath}`
+      : "";
+    turns.push({
+      id: randomUUID(),
+      role: "user",
+      content: `[Context summary #${state.contextCompactionCount} — prior trajectory compacted]\n${state.contextSummary.trim()}${historyNote}`,
+      createdAt: new Date().toISOString(),
+    });
   }
   for (const dig of recentDigests) {
     if (!tail.some((t) => t.id === dig.id)) {
@@ -489,8 +517,8 @@ function isNoiseTranscriptTurn(turn: Turn): boolean {
 }
 
 /**
- * Rebuild provider messages for a long build: fresh system/plan + original goal
- * + a bounded live tail (tool chains kept intact).
+ * Sliding-window fallback (legacy). Prefer maybeCompactProviderMessages in the
+ * agent loop — Cursor-style summarization when near the token trigger.
  */
 export function compactProviderMessages(
   messages: ChatMessage[],
@@ -517,7 +545,17 @@ export function compactProviderMessages(
     return true;
   });
   const tail = takeSafeMessageTail(body, tailMax);
-  return [system, ...(goalMsg ? [goalMsg] : []), ...tail];
+  const pinned: ChatMessage[] = [];
+  if (state.contextSummary?.trim()) {
+    const historyNote = state.agentHistoryPath
+      ? `\n\nFull prior transcript: ${state.agentHistoryPath}`
+      : "";
+    pinned.push({
+      role: "user",
+      content: `[Context summary #${state.contextCompactionCount} — prior trajectory compacted]\n${state.contextSummary.trim()}${historyNote}`,
+    });
+  }
+  return [system, ...(goalMsg ? [goalMsg] : []), ...pinned, ...tail];
 }
 
 /** Keep assistant→tool groups intact when slicing a live message list. */

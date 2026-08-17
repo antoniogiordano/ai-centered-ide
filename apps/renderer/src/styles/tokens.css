@@ -489,6 +489,77 @@ textarea {
   font-size: 12px;
 }
 
+.provider-pricing-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.provider-pricing-fetch-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.provider-pricing-log {
+  margin: 0.5rem 0 0;
+  max-height: 10rem;
+  overflow: auto;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border, #333);
+  background: color-mix(in srgb, var(--bg, #111) 88%, #000);
+  color: var(--muted, #9aa);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.provider-pricing-lookup {
+  flex: 1;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.provider-pricing-confirm {
+  border: 1px solid var(--border-strong, rgba(255, 255, 255, 0.16));
+  background: var(--bg-elevated, rgba(0, 0, 0, 0.2));
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.provider-pricing-confirm-lead {
+  margin: 0;
+  font-size: 13px;
+}
+
+.provider-pricing-confirm-json {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.provider-pricing-confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 .provider-effort-row {
   display: flex;
   flex-wrap: wrap;

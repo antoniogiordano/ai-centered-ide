@@ -23,7 +23,6 @@ import {
   bumpSessionSequence,
   CHECK_CONTINUE_NUDGE,
   CHECKLIST_CONTINUE_NUDGE,
-  compactProviderMessages,
   isAgentTankMode,
   isPlanMutationTool,
   parseToolCallsFromText,
@@ -35,6 +34,11 @@ import {
   tryParsePartialJson,
   TurnStateMachine,
 } from "./state.js";
+import {
+  maybeCompactProviderMessages,
+  refreshSystemMessage,
+  triggerTokensForContextWindow,
+} from "./compaction.js";
 
 function isTankMode(state: SessionState): boolean {
   return isAgentTankMode(state);
@@ -122,6 +126,7 @@ function buildToolExecutionContext(
       ? { oneShotApprovedIds: extras.oneShotApprovedIds }
       : {}),
     ...(baseCtx.terminals ? { terminals: baseCtx.terminals } : {}),
+    ...(baseCtx.ask ? { ask: baseCtx.ask } : {}),
     ...(baseCtx.cbm ? { cbm: baseCtx.cbm } : {}),
     ...(baseCtx.testLogs ? { testLogs: baseCtx.testLogs } : {}),
     ...(baseCtx.testGate ? { testGate: baseCtx.testGate } : {}),
@@ -306,10 +311,10 @@ function pushTankContinue(
     },
   });
   emit({ type: "activity", label, status: "thinking" });
-  // Drop bloated history before the nudge — plan + goal + fresh tail only.
-  const compacted = compactProviderMessages(messages, state);
-  messages.length = 0;
-  messages.push(...compacted, {
+  // Drop bloated history only via token-triggered summarization (prepareMessagesForProvider).
+  // Here: refresh plan/system and append the continue nudge.
+  refreshSystemMessage(messages, state);
+  messages.push({
     role: "user",
     content: planning
       ? PLAN_CONTINUE_NUDGE
@@ -322,17 +327,71 @@ function pushTankContinue(
   return { state, tankRounds: nextRound };
 }
 
-function refreshBuildMessages(
+/**
+ * Refresh system prompt every round; summarize+compact only near the token trigger
+ * (Cursor-style), instead of sliding-window truncating every tank iteration.
+ */
+async function prepareMessagesForProvider(
   messages: ChatMessage[],
   state: SessionState,
-): void {
-  // Bound context during long tank runs (planning or building).
-  if (!isTankMode(state) && productPhaseForState(state) !== "building") {
-    return;
+  deps: {
+    provider: AiProvider;
+    signal?: AbortSignal;
+    workspaceRoot?: string | null;
+    lastInputTokens?: number;
+    contextWindowTokens?: number | null;
+    emit: (event: AgentProgressEvent) => void;
+  },
+): Promise<SessionState> {
+  const phase = productPhaseForState(state);
+  const shouldConsider =
+    isTankMode(state) ||
+    phase === "building" ||
+    phase === "checking" ||
+    phase === "testing" ||
+    phase === "planning";
+  if (!shouldConsider) {
+    refreshSystemMessage(messages, state);
+    return state;
   }
-  const compacted = compactProviderMessages(messages, state);
-  messages.length = 0;
-  messages.push(...compacted);
+
+  const result = await maybeCompactProviderMessages({
+    messages,
+    state,
+    provider: deps.provider,
+    ...(deps.workspaceRoot !== undefined
+      ? { workspaceRoot: deps.workspaceRoot }
+      : {}),
+    ...(typeof deps.lastInputTokens === "number"
+      ? { lastInputTokens: deps.lastInputTokens }
+      : {}),
+    ...(typeof deps.contextWindowTokens === "number"
+      ? { contextWindowTokens: deps.contextWindowTokens }
+      : {}),
+    ...(deps.signal ? { signal: deps.signal } : {}),
+  });
+  if (result.compacted) {
+    messages.length = 0;
+    messages.push(...result.messages);
+    const trigger = triggerTokensForContextWindow(deps.contextWindowTokens);
+    deps.emit({
+      type: "activity",
+      label:
+        result.method === "summary"
+          ? `Context compacted (summary · trigger ~${trigger.toLocaleString()})…`
+          : "Context compacted (tail)…",
+      status: "thinking",
+    });
+    deps.emit({
+      type: "session_patch",
+      patch: {
+        contextSummary: result.state.contextSummary,
+        contextCompactionCount: result.state.contextCompactionCount,
+        agentHistoryPath: result.state.agentHistoryPath,
+      },
+    });
+  }
+  return result.state;
 }
 
 export type AgentProgressEvent =
@@ -374,6 +433,10 @@ export type AgentProgressEvent =
           | "turns"
           | "activityLabel"
           | "status"
+          | "contextSummary"
+          | "contextCompactionCount"
+          | "agentHistoryPath"
+          | "testGateCircuitOpen"
         >
       >;
       /** Live draft while tool args stream — do not persist. */
@@ -388,6 +451,8 @@ export type AgentLoopDeps = {
   onProgress?: (event: AgentProgressEvent) => void;
   /** Vision for the current user message only (not re-sent on later turns). */
   visionImages?: Array<{ mime: string; dataBase64: string }>;
+  /** Active provider context window (tokens) for compaction trigger. */
+  contextWindowTokens?: number | null;
 };
 
 /** In-memory snapshot so Approve can resume the tool loop. */
@@ -423,6 +488,7 @@ export async function runAgentTurn(
   let workingState: SessionState = { ...state };
   const registry = createDefaultRegistry();
   const gateway = deps.gateway ?? new ToolGateway(registry);
+  let lastInputTokens = 0;
 
   const toolDefsFor = (stateLike: SessionState) =>
     buildModelToolDefs(
@@ -444,6 +510,11 @@ export async function runAgentTurn(
   let assistantContent = "";
   const toolResults: ToolResult[] = [];
   const allToolCalls: ToolCall[] = [];
+  const workspaceRoot =
+    workingState.workspace?.resolvedRootPath ??
+    workingState.workspace?.rootPath ??
+    deps.toolCtx?.workspaceRoot ??
+    null;
 
   while (machine.nextIteration(isTankMode(workingState))) {
     if (deps.signal?.aborted) {
@@ -466,7 +537,16 @@ export async function runAgentTurn(
     let streamedThisRound = false;
     let lastProvisionalEmit = 0;
 
-    refreshBuildMessages(messages, workingState);
+    workingState = await prepareMessagesForProvider(messages, workingState, {
+      provider: deps.provider,
+      workspaceRoot,
+      lastInputTokens,
+      emit,
+      ...(typeof deps.contextWindowTokens === "number"
+        ? { contextWindowTokens: deps.contextWindowTokens }
+        : {}),
+      ...(deps.signal ? { signal: deps.signal } : {}),
+    });
     for await (const chunk of deps.provider.chat(messages, {
       ...(toolDefs.length ? { tools: toolDefs } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
@@ -577,6 +657,9 @@ export async function runAgentTurn(
         chunk.usage &&
         (chunk.usage.inputTokens > 0 || chunk.usage.outputTokens > 0)
       ) {
+        if (chunk.usage.inputTokens > 0) {
+          lastInputTokens = chunk.usage.inputTokens;
+        }
         emit({
           type: "usage",
           inputTokens: chunk.usage.inputTokens,
@@ -783,6 +866,8 @@ export async function runAgentTurn(
         role: "tool",
         tool_call_id: call.id,
         content: toolContent,
+        // Pixels stay out of SessionState; the provider decides the wire shape.
+        ...(outcome.images?.length ? { images: outcome.images } : {}),
       });
 
       if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
@@ -892,6 +977,17 @@ function toolActivityLabel(call: ToolCall): string {
       return query
         ? `Code search “${query.length > 48 ? `${query.slice(0, 45)}…` : query}”…`
         : "Searching indexed code…";
+    case "web_fetch": {
+      const url =
+        typeof call.arguments.url === "string" ? call.arguments.url : null;
+      return url
+        ? `Fetching ${url.length > 48 ? `${url.slice(0, 45)}…` : url}…`
+        : "Fetching URL…";
+    }
+    case "web_search":
+      return query
+        ? `Web search “${query.length > 48 ? `${query.slice(0, 45)}…` : query}”…`
+        : "Searching the web…";
     case "get_graph_schema":
       return "Reading graph schema…";
     case "detect_changes":
@@ -1052,6 +1148,12 @@ export async function resumeAgentTurn(
   const userMessage = pause.userMessage;
   const baseCtx = deps.toolCtx;
   const oneShot = new Set<string>([deps.approvedCallId]);
+  let lastInputTokens = 0;
+  const workspaceRoot =
+    workingState.workspace?.resolvedRootPath ??
+    workingState.workspace?.rootPath ??
+    deps.toolCtx?.workspaceRoot ??
+    null;
 
   let stop = false;
   for (const call of pause.remainingCalls) {
@@ -1222,7 +1324,16 @@ export async function resumeAgentTurn(
     >();
     let streamedThisRound = false;
 
-    refreshBuildMessages(messages, workingState);
+    workingState = await prepareMessagesForProvider(messages, workingState, {
+      provider: deps.provider,
+      workspaceRoot,
+      lastInputTokens,
+      emit,
+      ...(typeof deps.contextWindowTokens === "number"
+        ? { contextWindowTokens: deps.contextWindowTokens }
+        : {}),
+      ...(deps.signal ? { signal: deps.signal } : {}),
+    });
     for await (const chunk of deps.provider.chat(messages, {
       ...(toolDefs.length ? { tools: toolDefs } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
@@ -1284,6 +1395,9 @@ export async function resumeAgentTurn(
         chunk.usage &&
         (chunk.usage.inputTokens > 0 || chunk.usage.outputTokens > 0)
       ) {
+        if (chunk.usage.inputTokens > 0) {
+          lastInputTokens = chunk.usage.inputTokens;
+        }
         emit({
           type: "usage",
           inputTokens: chunk.usage.inputTokens,
@@ -1358,6 +1472,7 @@ export async function resumeAgentTurn(
       name: c.name,
       arguments: JSON.stringify(c.arguments ?? {}),
     }));
+
     messages.push({
       role: "assistant",
       content: roundContent || null,
@@ -1365,10 +1480,12 @@ export async function resumeAgentTurn(
       ...(roundReasoning ? { reasoning_content: roundReasoning } : {}),
     });
 
-    let batchStop = false;
+    stop = false;
     const batchStart = toolResults.length;
     for (const call of toolCalls) {
-      allToolCalls.push(call);
+      if (!allToolCalls.some((c) => c.id === call.id)) {
+        allToolCalls.push(call);
+      }
       const label = toolActivityLabel(call);
       emit({ type: "tool_start", call, label });
       emit({ type: "activity", label, status: "tool" });
@@ -1403,7 +1520,7 @@ export async function resumeAgentTurn(
         });
         toolDefs = toolDefsFor(workingState);
         if (!machine.recordToolResult(call.name, result.success, isTankMode(workingState))) {
-          batchStop = true;
+          stop = true;
           break;
         }
         continue;
@@ -1429,18 +1546,17 @@ export async function resumeAgentTurn(
           content: failed.summary,
         });
         if (!machine.recordToolResult(call.name, false, isTankMode(workingState))) {
-          batchStop = true;
+          stop = true;
           break;
         }
         continue;
       }
 
-      const ctx = buildToolExecutionContext(baseCtx, workingState);
-
+      const ctx = buildToolExecutionContext(baseCtx, workingState, {
+        oneShotApprovedIds: oneShot,
+      });
       const outcome = await gateway.executeTool(call, ctx);
       if (outcome.status === "approval_required") {
-        const idx = toolCalls.findIndex((c) => c.id === call.id);
-        const remainingCalls = toolCalls.slice(idx >= 0 ? idx : toolCalls.length - 1);
         return {
           state: bumpSessionSequence({
             ...workingState,
@@ -1466,7 +1582,7 @@ export async function resumeAgentTurn(
             assistantContent,
             toolResults: [...toolResults],
             allToolCalls: [...allToolCalls],
-            remainingCalls,
+            remainingCalls: [call],
             userMessage,
           },
         };
@@ -1484,24 +1600,12 @@ export async function resumeAgentTurn(
         content: toolMessageContent(call.name, outcome.result),
       });
       if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
-        batchStop = true;
+        stop = true;
         break;
       }
     }
 
-    if (batchStop) {
-      return fail(
-        workingState,
-        "Agent stopped: repeated tool failures or loop detected.",
-        {
-          assistantContent,
-          toolCalls: allToolCalls,
-          toolResults,
-        },
-      );
-    }
-
-    {
+    if (isTankMode(workingState)) {
       const thrash = noteGateFixRound(
         workingState,
         batchHadSuccessfulEdit(toolCalls, toolResults.slice(batchStart)),
@@ -1520,6 +1624,19 @@ export async function resumeAgentTurn(
         break;
       }
     }
+
+    if (stop) {
+      return fail(
+        workingState,
+        "Agent stopped: repeated tool failures or loop detected.",
+        {
+          assistantContent,
+          toolCalls: allToolCalls,
+          toolResults,
+        },
+      );
+    }
+
     emit({ type: "activity", label: "Thinking…", status: "thinking" });
   }
 

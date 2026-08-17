@@ -225,6 +225,9 @@ export class ProjectStorage {
   sessionKind: SessionKind;
   approvalGrants: ApprovalGrant[];
   sessionModelUsage?: SessionModelUsage[];
+  contextSummary?: string | null;
+  contextCompactionCount?: number;
+  agentHistoryPath?: string | null;
   createdAt: string;
   updatedAt: string;
 }): void {
@@ -260,6 +263,9 @@ export class ProjectStorage {
           sessionKind: row.sessionKind,
           approvalGrants: row.approvalGrants,
           sessionModelUsage: row.sessionModelUsage ?? [],
+          contextSummary: row.contextSummary ?? null,
+          contextCompactionCount: row.contextCompactionCount ?? 0,
+          agentHistoryPath: row.agentHistoryPath ?? null,
         }),
       );
   }
@@ -280,6 +286,9 @@ export class ProjectStorage {
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     sessionModelUsage: SessionModelUsage[];
+    contextSummary: string | null;
+    contextCompactionCount: number;
+    agentHistoryPath: string | null;
     createdAt: string;
     updatedAt: string;
   }> {
@@ -317,6 +326,9 @@ export class ProjectStorage {
             sessionKind?: SessionKind;
             approvalGrants?: ApprovalGrant[];
             sessionModelUsage?: SessionModelUsage[];
+            contextSummary?: string | null;
+            contextCompactionCount?: number;
+            agentHistoryPath?: string | null;
           })
         : {};
       return {
@@ -337,6 +349,9 @@ export class ProjectStorage {
         sessionKind: meta.sessionKind ?? "delivery",
         approvalGrants: meta.approvalGrants ?? [],
         sessionModelUsage: meta.sessionModelUsage ?? [],
+        contextSummary: meta.contextSummary ?? null,
+        contextCompactionCount: meta.contextCompactionCount ?? 0,
+        agentHistoryPath: meta.agentHistoryPath ?? null,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
       };
@@ -359,6 +374,9 @@ export class ProjectStorage {
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     sessionModelUsage: SessionModelUsage[];
+    contextSummary: string | null;
+    contextCompactionCount: number;
+    agentHistoryPath: string | null;
     createdAt: string;
     updatedAt: string;
   } | null {

@@ -86,6 +86,8 @@ describe("phase tool gating", () => {
         "read_architecture",
         "upsert_architecture",
         "import_attachment",
+        "web_fetch",
+        "web_search",
       ]),
     );
     expect(names).not.toContain("write_file");
@@ -105,6 +107,8 @@ describe("phase tool gating", () => {
         "write_file",
         "replace_in_file",
         "import_attachment",
+        "web_fetch",
+        "web_search",
         "git_status",
         "run_command",
         "terminal_open",

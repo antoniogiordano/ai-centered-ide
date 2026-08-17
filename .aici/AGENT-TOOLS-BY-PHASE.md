@@ -31,6 +31,9 @@ Explore + draft the delivery plan. No file writes, git, shell, terminals, or tes
 | `list_dir` | safe | List a workspace directory |
 | `read_file` | safe | Read a line window of a text file |
 | `search_text` | safe | Grep-like text search (prefer CBM when indexed) |
+| `web_fetch` | safe | Fetch a public HTTPS URL (README / docs) as plain text |
+| `web_search` | safe | DuckDuckGo HTML search → titles/URLs, then `web_fetch` |
+| `read_image` | safe | **Look at** a PNG/JPEG/GIF/WebP (use instead of `read_file`, which returns binary garbage) |
 
 ### Architecture
 
@@ -72,7 +75,7 @@ Explore + draft the delivery plan. No file writes, git, shell, terminals, or tes
 | `get_graph_schema` | safe | Labels / relationship schema |
 | `detect_changes` | safe | Git diff → impacted symbols |
 
-**Not exposed in Plan:** `write_file`, `replace_in_file`, git_*, `run_command`, `terminal_*`, `checkpoint_restore`, `propose_testing_ready`, `get_test_report`, `list_failed_tests`, `read_test_log`.
+**Not exposed in Plan:** `write_file`, `replace_in_file`, git_*, `run_command`, `terminal_*`, `checkpoint_restore`, `propose_testing_ready`, `get_test_report`, `list_failed_tests`, `read_test_log`, `ask_user` (Plan asks via `set_questions` + the Plan Q&A dialog instead).
 
 ---
 
@@ -87,6 +90,16 @@ Pre-build baseline. Entered after the user confirms Start Build (optional `feat/
 | `get_test_report` | safe | Suite status, platform, pass/fail counts |
 | `list_failed_tests` | safe | Failed test titles (optional `suiteId`) |
 | `read_test_log` | safe | Raw log chunk for a suite |
+
+When an **e2e** suite fails, the IDE also attaches the screenshots that run just produced (`cypress/screenshots`, `test-results`, …) to the failure digest, so the agent sees the page instead of guessing from stdout. Re-open any of them later with `read_image`.
+
+### Asking the user (Check + Build + Test)
+
+| Tool | Risk | Role |
+| --- | --- | --- |
+| `ask_user` | safe | **Blocking** A/B/C… question for a structural decision; the answer returns in the same tool result |
+
+Use it only after investigating — when the diagnosis is settled but several fixes are legitimate and the choice belongs to the user. `terminal_ask` remains the variant bound to a PTY.
 
 ### Bug-fix still available
 
@@ -168,6 +181,9 @@ Do **not** re-launch full lint/test suites via `run_command` / `terminal_*` — 
 | Tool | Plan | Check | Build | Test |
 | --- | --- | --- | --- | --- |
 | `list_dir` / `read_file` / `search_text` | ✓ | ✓ | ✓ | ✓ |
+| `web_fetch` / `web_search` | ✓ | ✓ | ✓ | ✓ |
+| `read_image` | ✓ | ✓ | ✓ | ✓ |
+| `ask_user` | — | ✓ | ✓ | ✓ |
 | CBM graph tools (if indexed) | ✓ | ✓ | ✓ | ✓ |
 | `read_architecture` / `upsert_architecture` | ✓ | ✓ | ✓ | ✓ |
 | `read_plan` | ✓ | ✓ (read-only) | ✓ | ✓ (read-only) |
@@ -188,6 +204,10 @@ Do **not** re-launch full lint/test suites via `run_command` / `terminal_*` — 
 - Registry + phase filter: `packages/tools/src/registry.ts`
 - Builtins: `packages/tools/src/builtins.ts`
 - CBM tools: `packages/tools/src/cbm-builtins.ts`
+- Vision tool: `packages/tools/src/vision.ts`; e2e screenshot pickup: `packages/tools/src/test-artifacts.ts`
+- Ask tool: `packages/tools/src/ask.ts` (+ `ask-host.ts`, `apps/renderer/src/components/AgentAskDialog.tsx`)
+- Image transport: `ToolResultImage` (`packages/shared/src/domain.ts`) → `GatewayResult.images` → tool message `images` → `expandMessagesForOpenAi` (`packages/provider/src/openai.ts`)
+- End-to-end scenario: `packages/agent/src/harness.test.ts`
 - Model exposure: `packages/agent/src/loop.ts` (`buildModelToolDefs`)
 - Product phase: `packages/shared/src/domain.ts` (`deriveProductPhase`), `packages/agent/src/state.ts` (`productPhaseForState`)
 - Phase gating tests: `packages/tools/src/index.test.ts` (`phase tool gating`)
