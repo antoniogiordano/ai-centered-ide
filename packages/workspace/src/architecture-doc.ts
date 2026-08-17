@@ -25,7 +25,7 @@ const EMPTY_DOC: ArchitectureDoc = {
 };
 
 /**
- * Parse `.aifi/ARCHITECTURE.md` with optional YAML frontmatter.
+ * Parse `.aici/ARCHITECTURE.md` with optional YAML frontmatter.
  * Body (after frontmatter) is product intent markdown.
  */
 export function parseArchitectureMarkdown(raw: string): ArchitectureDoc {

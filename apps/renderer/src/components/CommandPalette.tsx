@@ -95,7 +95,7 @@ export function CommandPalette(props: {
       label: "Copy open chat (visible)",
       hint: modShiftHint("C"),
       run: () => {
-        window.dispatchEvent(new CustomEvent("aifi:copy-open-chat"));
+        window.dispatchEvent(new CustomEvent("aici:copy-open-chat"));
         onClose();
       },
     },
@@ -104,7 +104,7 @@ export function CommandPalette(props: {
       label: "Copy open chat (deep)",
       hint: modShiftHint("D"),
       run: () => {
-        window.dispatchEvent(new CustomEvent("aifi:copy-open-chat-deep"));
+        window.dispatchEvent(new CustomEvent("aici:copy-open-chat-deep"));
         onClose();
       },
     },

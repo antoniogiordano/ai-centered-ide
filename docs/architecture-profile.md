@@ -1,4 +1,4 @@
-# AIFI Architecture Profile
+# AICI Architecture Profile
 
 Contract for workspace tech-stack metadata + product intent.
 
@@ -6,7 +6,7 @@ Contract for workspace tech-stack metadata + product intent.
 
 | Artifact | Answers | Path / home |
 |---|---|---|
-| **Architecture doc** | Product intent + sparse overrides | `.aifi/ARCHITECTURE.md` |
+| **Architecture doc** | Product intent + sparse overrides | `.aici/ARCHITECTURE.md` |
 | **Detected stack** | What the repo actually uses | Derived at runtime from files |
 | **Environment manifest** (Fase 8) | How we run and test it | TBD |
 
@@ -14,9 +14,9 @@ Do not treat `ARCHITECTURE.md` as a second `package.json`. Stack facts come from
 
 ## File
 
-- Path: `.aifi/ARCHITECTURE.md`
+- Path: `.aici/ARCHITECTURE.md`
 - Format: YAML frontmatter (sparse `ArchitectureProfile` patch) + markdown body (intent)
-- Legacy: `.aifi/architecture.json` is still read once for migration
+- Legacy: `.aifi/ARCHITECTURE.md` and `.aifi/architecture.json` are still read once for migration
 - Validated with Zod (`ArchitectureProfilePatchSchema` in `@ai-ide/shared`)
 
 ## Effective profile

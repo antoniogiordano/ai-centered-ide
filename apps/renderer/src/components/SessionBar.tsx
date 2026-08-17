@@ -69,7 +69,7 @@ export function SessionBar(props: {
   function dispatchCopy(mode: "visible" | "deep") {
     window.dispatchEvent(
       new CustomEvent(
-        mode === "deep" ? "aifi:copy-open-chat-deep" : "aifi:copy-open-chat",
+        mode === "deep" ? "aici:copy-open-chat-deep" : "aici:copy-open-chat",
       ),
     );
   }
@@ -89,9 +89,9 @@ export function SessionBar(props: {
       if (!detail) return;
       markCopyFeedback(detail.mode, detail.ok);
     }
-    window.addEventListener("aifi:copy-open-chat-result", onCopied);
+    window.addEventListener("aici:copy-open-chat-result", onCopied);
     return () =>
-      window.removeEventListener("aifi:copy-open-chat-result", onCopied);
+      window.removeEventListener("aici:copy-open-chat-result", onCopied);
   }, []);
 
   useEffect(() => {

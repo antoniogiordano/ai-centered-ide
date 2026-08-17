@@ -82,7 +82,7 @@ export class McpStdioClient {
     const init = (await this.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "ai-first-ide", version: "0.1.0" },
+      clientInfo: { name: "ai-centered-ide", version: "0.1.0" },
     })) as { serverInfo?: { name?: string; version?: string } };
 
     this.notify("notifications/initialized", {});

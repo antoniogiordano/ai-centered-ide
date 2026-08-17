@@ -29,4 +29,16 @@ export class MemoryCredentialStore implements CredentialStore {
   }
 }
 
-export const CREDENTIAL_SERVICE = "ai-first-ide";
+export const CREDENTIAL_SERVICE = "ai-centered-ide";
+/** Pre-rename keychain service — read fallback only. */
+export const CREDENTIAL_SERVICE_LEGACY = "ai-first-ide";
+
+/** Read credential under the new service name, falling back to the pre-rename service. */
+export async function getAppCredential(
+  store: CredentialStore,
+  account: string,
+): Promise<string | null> {
+  const modern = await store.get(CREDENTIAL_SERVICE, account);
+  if (modern) return modern;
+  return store.get(CREDENTIAL_SERVICE_LEGACY, account);
+}

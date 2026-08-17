@@ -8,6 +8,7 @@ import {
 } from "@ai-ide/shared";
 import {
   CREDENTIAL_SERVICE,
+  getAppCredential,
   type ProjectStorage,
 } from "@ai-ide/storage";
 import type { CredentialStore } from "@ai-ide/storage";
@@ -749,7 +750,7 @@ export function registerIpcHandlers(
       baseUrl?: string;
       defaultModel?: string;
     }>("providerConfig");
-    const apiKey = await credentials.get(CREDENTIAL_SERVICE, "default");
+    const apiKey = await getAppCredential(credentials, "default");
     return {
       id: null,
       name: null,

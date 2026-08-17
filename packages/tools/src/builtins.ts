@@ -516,7 +516,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "read_architecture",
     description:
-      "Read effective architecture: detected stack from the repo ⊕ sparse overrides/intent in .aifi/ARCHITECTURE.md.",
+      "Read effective architecture: detected stack from the repo ⊕ sparse overrides/intent in .aici/ARCHITECTURE.md.",
     riskLevel: "safe",
     phases: ALL_PHASES,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
@@ -550,7 +550,7 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "upsert_architecture",
     description:
-      "Merge sparse overrides into .aifi/ARCHITECTURE.md frontmatter (optional intent markdown body). Does not replace repo detection. Canonical keys only; wrong keys fail with a field guide.",
+      "Merge sparse overrides into .aici/ARCHITECTURE.md frontmatter (optional intent markdown body). Does not replace repo detection. Canonical keys only; wrong keys fail with a field guide.",
     riskLevel: "safe",
     phases: ALL_PHASES,
     argsSchema: z.object({

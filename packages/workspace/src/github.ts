@@ -176,7 +176,7 @@ export class GithubClient {
         Accept: "application/vnd.github+json",
         Authorization: `Bearer ${token}`,
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "ai-first-ide",
+        "User-Agent": "ai-centered-ide",
       },
     });
     const data = await parseJson(res);
@@ -201,7 +201,7 @@ export class GithubClient {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "ai-first-ide",
+        "User-Agent": "ai-centered-ide",
       },
       body: JSON.stringify({
         name: input.name,

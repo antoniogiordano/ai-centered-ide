@@ -1,4 +1,4 @@
-# AI-First IDE — Piano di sviluppo
+# AI-Centered IDE — Piano di sviluppo
 
 Documento master: visione, decisioni, indice. Le specifiche step by step stanno nei dieci file in `docs/phases`.
 
@@ -27,7 +27,7 @@ Fuori perimetro: fork di Code - OSS ed estensioni VS Code, debugger con breakpoi
 - **Sicurezza**: il workspace è l'unico perimetro di scrittura; diff live e checkpoint locali; **nessun commit automatico**; push non disponibile all'agent.
 - **Segreti**: valori in `.env.*` gitignorati; l'agent li scrive ma **non ne legge mai i valori**; redazione dei log non disattivabile.
 - **Ambienti**: un manifest versionato descrive servizi, comandi, porte, scope env, healthcheck, seed e cleanup.
-- **Architecture profile**: `.aifi/ARCHITECTURE.md` (intent + sparse overrides); stack is detected from the repo — vedi [architecture-profile.md](architecture-profile.md).
+- **Architecture profile**: `.aici/ARCHITECTURE.md` (intent + sparse overrides); stack is detected from the repo — vedi [architecture-profile.md](architecture-profile.md).
 - **QA**: recorder umano che genera test Cypress leggibili e versionati, rifiniti dall'agent.
 - **Dati**: tutto locale, credenziali solo nel keychain di sistema.
 - **Distribuzione**: solo build interne, nessuna firma né auto-update.

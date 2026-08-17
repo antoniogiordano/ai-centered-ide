@@ -13,7 +13,7 @@ import {
   type SavedProvider,
 } from "@ai-ide/shared";
 import type { CredentialStore } from "@ai-ide/storage";
-import { CREDENTIAL_SERVICE } from "@ai-ide/storage";
+import { CREDENTIAL_SERVICE, getAppCredential } from "@ai-ide/storage";
 import type { ProjectStorage } from "@ai-ide/storage";
 
 const REGISTRY_KEY = "providerRegistry";
@@ -82,14 +82,14 @@ export class ProviderRegistryStore {
 
   async getApiKey(providerId: string): Promise<string> {
     if (!this.credentials) return "";
-    const modern = await this.credentials.get(
-      CREDENTIAL_SERVICE,
+    const modern = await getAppCredential(
+      this.credentials,
       providerKeychainAccount(providerId),
     );
     if (modern) return modern;
     // Fallback for migrated legacy-default.
     if (providerId === "legacy-default") {
-      return (await this.credentials.get(CREDENTIAL_SERVICE, LEGACY_KEY_ACCOUNT)) ?? "";
+      return (await getAppCredential(this.credentials, LEGACY_KEY_ACCOUNT)) ?? "";
     }
     return "";
   }
@@ -195,13 +195,10 @@ export class ProviderRegistryStore {
 
   private async migrateLegacyKey(providerId: string): Promise<void> {
     if (!this.credentials) return;
-    const legacy = await this.credentials.get(
-      CREDENTIAL_SERVICE,
-      LEGACY_KEY_ACCOUNT,
-    );
+    const legacy = await getAppCredential(this.credentials, LEGACY_KEY_ACCOUNT);
     if (!legacy) return;
-    const existing = await this.credentials.get(
-      CREDENTIAL_SERVICE,
+    const existing = await getAppCredential(
+      this.credentials,
       providerKeychainAccount(providerId),
     );
     if (existing) return;

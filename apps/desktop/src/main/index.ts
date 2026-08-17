@@ -1,5 +1,5 @@
 import { app, BrowserWindow, Menu, screen, shell } from "electron";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -414,7 +414,12 @@ function ensureGitOnPath(): void {
 app.whenReady().then(async () => {
   ensureGitOnPath();
   installAppMenu();
-  const dbPath = join(app.getPath("userData"), "ai-first-ide.sqlite");
+  const userData = app.getPath("userData");
+  const dbPath = join(userData, "ai-centered-ide.sqlite");
+  const legacyDbPath = join(userData, "ai-first-ide.sqlite");
+  if (!existsSync(dbPath) && existsSync(legacyDbPath)) {
+    renameSync(legacyDbPath, dbPath);
+  }
   const storage = new ProjectStorage(openDatabase(dbPath));
   appStorage = storage;
   const session = new SessionManager(storage);

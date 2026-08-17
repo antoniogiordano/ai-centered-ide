@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import {
   ARCHITECTURE_FILE_PATH,
+  ARCHITECTURE_LEGACY_MD_PATH,
   ARCHITECTURE_LEGACY_JSON_PATH,
   AppError,
   buildEffectiveArchitecture,
@@ -385,6 +386,25 @@ export class ArchitectureStore {
     if (existsSync(mdAbs)) {
       try {
         const raw = this.fs.read(ARCHITECTURE_FILE_PATH);
+        return { doc: parseArchitectureMarkdown(raw), exists: true };
+      } catch (error) {
+        return {
+          doc: {
+            overrides: {},
+            intent: "",
+            metaSources: {},
+            updatedAt: null,
+          },
+          exists: true,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+
+    const legacyMdAbs = join(this.workspaceRoot, ARCHITECTURE_LEGACY_MD_PATH);
+    if (existsSync(legacyMdAbs)) {
+      try {
+        const raw = readFileSync(legacyMdAbs, "utf8");
         return { doc: parseArchitectureMarkdown(raw), exists: true };
       } catch (error) {
         return {

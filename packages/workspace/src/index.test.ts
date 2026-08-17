@@ -14,7 +14,7 @@ import {
 
 describe("assertInsideWorkspace", () => {
   it("allows paths inside workspace", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     writeFileSync(join(dir, "a.txt"), "hi");
     const resolved = assertInsideWorkspace(dir, join(dir, "a.txt"));
     expect(resolved).toContain("a.txt");
@@ -22,16 +22,16 @@ describe("assertInsideWorkspace", () => {
   });
 
   it("rejects paths outside workspace", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
-    const outside = mkdtempSync(join(tmpdir(), "aifi-out-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
+    const outside = mkdtempSync(join(tmpdir(), "aici-out-"));
     expect(() => assertInsideWorkspace(dir, outside)).toThrow(AppError);
     rmSync(dir, { recursive: true });
     rmSync(outside, { recursive: true });
   });
 
   it("rejects symlink escape", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
-    const outside = mkdtempSync(join(tmpdir(), "aifi-out-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
+    const outside = mkdtempSync(join(tmpdir(), "aici-out-"));
     writeFileSync(join(outside, "secret.txt"), "secret");
     const link = join(dir, "escape");
     try {
@@ -47,7 +47,7 @@ describe("assertInsideWorkspace", () => {
   });
 
   it("rejects .. traversal", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     mkdirSync(join(dir, "sub"));
     expect(() =>
       assertInsideWorkspace(dir, join("sub", "..", "..", "etc", "passwd")),
@@ -58,7 +58,7 @@ describe("assertInsideWorkspace", () => {
 
 describe("FilesystemService", () => {
   it("reads and writes within workspace", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     const fs = new FilesystemService(dir);
     fs.write("hello.txt", "world");
     expect(fs.read("hello.txt")).toBe("world");
@@ -66,7 +66,7 @@ describe("FilesystemService", () => {
   });
 
   it("patch replaces a unique substring", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     const fs = new FilesystemService(dir);
     fs.write("a.ts", "const x = 1;\nconst y = 2;\n");
     expect(fs.patch("a.ts", "const y = 2;", "const y = 3;")).toEqual({
@@ -77,7 +77,7 @@ describe("FilesystemService", () => {
   });
 
   it("patch rejects ambiguous search unless replaceAll", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     const fs = new FilesystemService(dir);
     fs.write("a.ts", "foo\nfoo\n");
     expect(() => fs.patch("a.ts", "foo", "bar")).toThrow(/matched 2 times/);
@@ -89,7 +89,7 @@ describe("FilesystemService", () => {
   });
 
   it("patch does not interpret $ in replace", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     const fs = new FilesystemService(dir);
     fs.write("a.ts", "price");
     fs.patch("a.ts", "price", "$1.00");
@@ -98,7 +98,7 @@ describe("FilesystemService", () => {
   });
 
   it("writeBinary writes attachment bytes", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     const fs = new FilesystemService(dir);
     const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
     fs.writeBinary("shot.png", bytes);
@@ -107,7 +107,7 @@ describe("FilesystemService", () => {
   });
 
   it("readWindow pages lines and reports nextStartLine", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     const fs = new FilesystemService(dir);
     const body = Array.from({ length: 40 }, (_, i) => `line-${i + 1}`).join(
       "\n",
@@ -144,7 +144,7 @@ describe("FilesystemService", () => {
   });
 
   it("readWindow streams files larger than maxReadBytes", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     const fs = new FilesystemService(dir, 2_000);
     // ~4KB of lines → above 2KB cap for full read(), but windowed stream works.
     const lines = Array.from({ length: 200 }, (_, i) => `row-${i + 1}-${"x".repeat(16)}`);
@@ -170,7 +170,7 @@ describe("FilesystemService", () => {
 
 describe("searchText", () => {
   it("finds matches", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-ws-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
     writeFileSync(join(dir, "findme.txt"), "needle here");
     const hits = searchText(dir, "needle");
     expect(hits).toHaveLength(1);
@@ -180,7 +180,7 @@ describe("searchText", () => {
 
 describe("ArchitectureStore", () => {
   it("detects a Node/React/Vitest workspace", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-arch-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-arch-"));
     writeFileSync(
       join(dir, "package.json"),
       JSON.stringify({
@@ -228,7 +228,7 @@ describe("ArchitectureStore", () => {
   });
 
   it("detects the cypress e2e command from a test:e2e script", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-arch-e2e-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-arch-e2e-"));
     writeFileSync(
       join(dir, "package.json"),
       JSON.stringify({
@@ -260,7 +260,7 @@ describe("createEmptyProject + GitService remotes", () => {
   });
 
   it("inits git and can add a remote", async () => {
-    const parent = mkdtempSync(join(tmpdir(), "aifi-parent-"));
+    const parent = mkdtempSync(join(tmpdir(), "aici-parent-"));
     const { createEmptyProject } = await import("./project.js");
     const { GitService } = await import("./git.js");
     const projectPath = await createEmptyProject(parent, "demo-app");

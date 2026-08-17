@@ -7,7 +7,7 @@ import { getSchemaVersion, openDatabase, ProjectStorage } from "./database.js";
 
 describe("ConfigStore precedence", () => {
   it("merges global < workspace < project", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-config-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-config-"));
     const globalPath = join(dir, "global.json");
     const workspacePath = join(dir, "workspace.json");
     const projectPath = join(dir, "project.json");
@@ -29,7 +29,7 @@ describe("ConfigStore precedence", () => {
 
 describe("database migrations", () => {
   it("creates schema at version 2", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-db-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-db-"));
     const dbPath = join(dir, "test.sqlite");
     const db = openDatabase(dbPath);
     expect(getSchemaVersion(db)).toBe(2);
@@ -38,7 +38,7 @@ describe("database migrations", () => {
   });
 
   it("purges project data", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-db-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-db-"));
     const dbPath = join(dir, "test.sqlite");
     const db = openDatabase(dbPath);
     const storage = new ProjectStorage(db);
@@ -58,7 +58,7 @@ describe("database migrations", () => {
   });
 
   it("opens existing database without corruption", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-db-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-db-"));
     const dbPath = join(dir, "test.sqlite");
     const first = openDatabase(dbPath);
     first.close();
@@ -69,7 +69,7 @@ describe("database migrations", () => {
   });
 
   it("persists conversations and turns", () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-db-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-db-"));
     const dbPath = join(dir, "test.sqlite");
     const db = openDatabase(dbPath);
     const storage = new ProjectStorage(db);

@@ -137,7 +137,7 @@ export function ArchitectureSummary(props: Props) {
     );
   }
 
-  // .aifi/ARCHITECTURE.md already saved: stay out of the way (Edit is ⌘⇧A).
+  // .aici/ARCHITECTURE.md already saved: stay out of the way (Edit is ⌘⇧A).
   // Shown only until the first confirm/save creates the file; hides on save.
   if (exists && fromFile && !error) {
     return null;
@@ -150,7 +150,7 @@ export function ArchitectureSummary(props: Props) {
           <strong>Architecture</strong>
           <span className="arch-summary-status muted">
             {fromFile
-              ? ".aifi/ARCHITECTURE.md"
+              ? ".aici/ARCHITECTURE.md"
               : profile
                 ? "Detected draft — not saved"
                 : "No profile yet"}

@@ -1,6 +1,6 @@
 # Demo Project
 
-Minimal full-stack app for AI-First IDE Phase 9–10 acceptance.
+Minimal full-stack app for AI-Centered IDE Phase 9–10 acceptance.
 
 ## Stack
 

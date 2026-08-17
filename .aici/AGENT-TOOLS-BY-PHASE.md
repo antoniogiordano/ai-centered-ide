@@ -34,8 +34,8 @@ Explore + draft the delivery plan. No file writes, git, shell, terminals, or tes
 
 | Tool | Risk | Role |
 | --- | --- | --- |
-| `read_architecture` | safe | Effective stack: detection ⊕ `.aifi/ARCHITECTURE.md` |
-| `upsert_architecture` | safe | Sparse overrides into `.aifi/ARCHITECTURE.md` |
+| `read_architecture` | safe | Effective stack: detection ⊕ `.aici/ARCHITECTURE.md` |
+| `upsert_architecture` | safe | Sparse overrides into `.aici/ARCHITECTURE.md` |
 
 ### Plan CRUD
 

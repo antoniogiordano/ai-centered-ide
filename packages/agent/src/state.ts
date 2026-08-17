@@ -181,7 +181,7 @@ export function buildSystemPrompt(state: SessionState): string {
   const planning = phase === "planning";
 
   const identity = [
-    "You are the product manager of this AI-First IDE.",
+    "You are the product manager of this AI-Centered IDE.",
     "You collaborate with the user through a planning Q&A, then drive development against an agreed plan.",
     "Keep replies concise. Prefer short turns over long monologues.",
   ];

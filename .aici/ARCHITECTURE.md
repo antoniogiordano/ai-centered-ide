@@ -1,5 +1,5 @@
 ---
-name: ai-first-ide
+name: ai-centered-ide
 repo:
   shape: monorepo
   packageManager: pnpm
@@ -38,9 +38,9 @@ meta:
     quality: user_confirmed
 ---
 
-# AI-First IDE
+# AI-Centered IDE
 
-Desktop IDE that puts the agent loop first: planning, architecture, tools, and git inside a trusted workspace perimeter.
+Desktop IDE that puts the agent loop at the center: planning, architecture, tools, and git inside a trusted workspace perimeter.
 
 ## Notes
 

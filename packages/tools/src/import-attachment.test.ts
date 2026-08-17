@@ -12,7 +12,7 @@ import type { ToolExecutionContext } from "./gateway.js";
 
 describe("import_attachment", () => {
   it("copies attachment bytes into the workspace", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "aifi-att-"));
+    const dir = mkdtempSync(join(tmpdir(), "aici-att-"));
     const registry = createDefaultRegistry();
     const tool = registry.get("import_attachment");
     expect(tool).toBeDefined();

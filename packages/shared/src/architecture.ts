@@ -1,7 +1,10 @@
 import { z } from "zod";
 
 /** Canonical architecture doc (intent markdown + YAML override frontmatter). */
-export const ARCHITECTURE_FILE_PATH = ".aifi/ARCHITECTURE.md";
+export const ARCHITECTURE_FILE_PATH = ".aici/ARCHITECTURE.md";
+
+/** Pre-rename markdown path — read for migration only. */
+export const ARCHITECTURE_LEGACY_MD_PATH = ".aifi/ARCHITECTURE.md";
 
 /** Legacy full-profile JSON — read for migration only. */
 export const ARCHITECTURE_LEGACY_JSON_PATH = ".aifi/architecture.json";

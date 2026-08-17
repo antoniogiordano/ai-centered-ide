@@ -1,4 +1,4 @@
-# AI-First IDE
+# AI-Centered IDE
 
 Local-first desktop IDE where the AI is the primary operator of code. Humans direct goals, approve diffs, verify in the browser, and record Cypress tests.
 

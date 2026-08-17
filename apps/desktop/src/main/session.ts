@@ -57,7 +57,7 @@ import type { TerminalHost } from "@ai-ide/tools";
 import { runTestSuites } from "@ai-ide/tools";
 import { app, shell } from "electron";
 import type { CredentialStore } from "@ai-ide/storage";
-import { CREDENTIAL_SERVICE } from "@ai-ide/storage";
+import { getAppCredential } from "@ai-ide/storage";
 import { TerminalManager } from "./terminals.js";
 import { CbmEngine } from "./engine/cbm-engine.js";
 import type { CbmHost } from "@ai-ide/tools";
@@ -2415,7 +2415,7 @@ export class SessionManager {
       defaultModel?: string;
     }>("providerConfig");
     const apiKey = this.credentials
-      ? await this.credentials.get(CREDENTIAL_SERVICE, "default")
+      ? await getAppCredential(this.credentials, "default")
       : null;
     if (cfg?.baseUrl) {
       return new OpenAiCompatibleProvider({

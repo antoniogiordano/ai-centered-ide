@@ -5,7 +5,7 @@
 import { platform } from "node:os";
 import keytar from "keytar";
 
-const SERVICE = "ai-first-ide-spike";
+const SERVICE = "ai-centered-ide-spike";
 const ACCOUNT = "spike-test-account";
 const VALUE = `spike-secret-${Date.now()}`;
 const VALUE2 = `spike-secret-updated-${Date.now()}`;

@@ -649,14 +649,14 @@ export function ConversationPane(props: {
       await navigator.clipboard.writeText(text);
       setState("copied");
       window.dispatchEvent(
-        new CustomEvent("aifi:copy-open-chat-result", {
+        new CustomEvent("aici:copy-open-chat-result", {
           detail: { mode, ok: true },
         }),
       );
     } catch {
       setState("failed");
       window.dispatchEvent(
-        new CustomEvent("aifi:copy-open-chat-result", {
+        new CustomEvent("aici:copy-open-chat-result", {
           detail: { mode, ok: false },
         }),
       );
@@ -681,12 +681,12 @@ export function ConversationPane(props: {
       void copyChat("deep");
     }
     window.addEventListener("keydown", onKey, true);
-    window.addEventListener("aifi:copy-open-chat", onCopyEvent);
-    window.addEventListener("aifi:copy-open-chat-deep", onCopyDeepEvent);
+    window.addEventListener("aici:copy-open-chat", onCopyEvent);
+    window.addEventListener("aici:copy-open-chat-deep", onCopyDeepEvent);
     return () => {
       window.removeEventListener("keydown", onKey, true);
-      window.removeEventListener("aifi:copy-open-chat", onCopyEvent);
-      window.removeEventListener("aifi:copy-open-chat-deep", onCopyDeepEvent);
+      window.removeEventListener("aici:copy-open-chat", onCopyEvent);
+      window.removeEventListener("aici:copy-open-chat-deep", onCopyDeepEvent);
     };
   }, [turns, activeTabTitle, state?.workspace?.name]);
 

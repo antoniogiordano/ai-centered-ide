@@ -1,6 +1,6 @@
 # GitHub via CLI (`gh`)
 
-New Project → **Create on GitHub** uses the [GitHub CLI](https://cli.github.com) already installed on your machine. No OAuth App registration inside AIFI.
+New Project → **Create on GitHub** uses the [GitHub CLI](https://cli.github.com) already installed on your machine. No OAuth App registration inside AICI.
 
 ## Prerequisites
 

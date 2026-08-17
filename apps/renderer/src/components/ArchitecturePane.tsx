@@ -179,7 +179,7 @@ export function ArchitecturePane(props: Props) {
         </div>
         <div className="empty-state verify-empty">
           <strong>No workspace</strong>
-          <p>Open a project folder to edit `.aifi/ARCHITECTURE.md`.</p>
+          <p>Open a project folder to edit `.aici/ARCHITECTURE.md`.</p>
         </div>
       </div>
     );

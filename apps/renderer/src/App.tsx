@@ -275,7 +275,7 @@ export function App() {
           <div className="topbar-left">
             <strong className="brand">
               AICI
-              <span className="brand-sub">AI Centered IDE</span>
+              <span className="brand-sub">AI-Centered IDE</span>
             </strong>
             <span className="status-pill">{state?.status ?? "idle"}</span>
           </div>
