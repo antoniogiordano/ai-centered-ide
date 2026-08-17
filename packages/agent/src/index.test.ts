@@ -579,6 +579,137 @@ describe("agent runtime", () => {
     expect(started.state.testingConfirmedAt).toBeNull();
   });
 
+  it("applyStartBuilding works after Check (planStatus checking)", () => {
+    const session = {
+      ...newSession("s-check", "plan"),
+      mode: "agent" as const,
+      planStatus: "checking" as const,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Phase 1",
+          status: "pending" as const,
+          checklist: [{ id: "c1", text: "Do thing", done: false }],
+        },
+      ],
+      planQuestions: [],
+      planReadyProposal: {
+        suggestedBranch: "feat/demo",
+        proposedAt: new Date().toISOString(),
+      },
+      testGatePassedAt: new Date().toISOString(),
+    };
+    expect(isAgentTankMode(session)).toBe(false);
+    const started = applyStartBuilding(session);
+    expect(started.error).toBeUndefined();
+    expect(started.state.planStatus).toBe("executing");
+    expect(started.state.testGatePassedAt).toBeNull();
+  });
+
+  it("isAgentTankMode is false while Check awaits the IDE gate", () => {
+    const awaiting = {
+      ...newSession("s-check-tank", "agent"),
+      mode: "agent" as const,
+      planStatus: "checking" as const,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Phase 1",
+          status: "pending" as const,
+          checklist: [{ id: "c1", text: "Do thing", done: false }],
+        },
+      ],
+      planReadyProposal: {
+        suggestedBranch: "feat/demo",
+        proposedAt: new Date().toISOString(),
+      },
+      testRun: null,
+      testGatePassedAt: null,
+    };
+    expect(isAgentTankMode(awaiting)).toBe(false);
+    expect(
+      isAgentTankMode({
+        ...awaiting,
+        testRun: {
+          startedAt: new Date().toISOString(),
+          status: "running",
+          specs: [],
+          suites: [],
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("isAgentTankMode is true during Check only after a failed report", () => {
+    const failed = {
+      ...newSession("s-check-fail", "agent"),
+      mode: "agent" as const,
+      planStatus: "checking" as const,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Phase 1",
+          status: "pending" as const,
+          checklist: [{ id: "c1", text: "Do thing", done: false }],
+        },
+      ],
+      testGatePassedAt: null,
+      testRun: {
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: "failed" as const,
+        specs: [],
+        suites: [],
+        digest: "fail",
+      },
+    };
+    expect(isAgentTankMode(failed)).toBe(true);
+  });
+
+  it("isAgentTankMode stays off in Testing until a failed gate report", () => {
+    const completePhases = [
+      {
+        id: "p1",
+        title: "Phase 1",
+        status: "completed" as const,
+        checklist: [{ id: "c1", text: "Do thing", done: true }],
+      },
+    ];
+    const awaitingConfirm = {
+      ...newSession("s-test-await", "agent"),
+      mode: "agent" as const,
+      planStatus: "executing" as const,
+      planPhases: completePhases,
+      testingConfirmedAt: null,
+      testRun: null,
+    };
+    expect(isAgentTankMode(awaitingConfirm)).toBe(false);
+
+    const awaitingGate = {
+      ...awaitingConfirm,
+      testingConfirmedAt: new Date().toISOString(),
+      testRun: null,
+    };
+    expect(isAgentTankMode(awaitingGate)).toBe(false);
+
+    const failed = {
+      ...awaitingGate,
+      testRun: {
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        status: "failed" as const,
+        specs: [],
+        suites: [],
+        digest: "fail",
+      },
+    };
+    expect(isAgentTankMode(failed)).toBe(true);
+
+    expect(
+      isAgentTankMode({ ...failed, testGateCircuitOpen: true }),
+    ).toBe(false);
+  });
+
   it("propose_testing_ready rejects open checklist and confirms when complete", () => {
     const open = {
       ...newSession("s-test-open", "agent"),

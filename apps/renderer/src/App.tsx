@@ -265,9 +265,11 @@ export function App() {
       className={`app-shell ${
         phase === "planning"
           ? "app-shell-planning"
-          : phase === "testing"
-            ? "app-shell-testing"
-            : "app-shell-building"
+          : phase === "checking"
+            ? "app-shell-checking"
+            : phase === "testing"
+              ? "app-shell-testing"
+              : "app-shell-building"
       }`}
     >
       <header className="chrome">

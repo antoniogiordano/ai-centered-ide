@@ -16,6 +16,7 @@ import {
   planHasOpenWork,
   planBuildComplete,
   awaitsTestingConfirm,
+  canStartCheckGate,
   canStartTestGate,
   CHECKLIST_CONTINUE_USER_MESSAGE,
   PLAN_CONTINUE_USER_MESSAGE,
@@ -1122,7 +1123,7 @@ export class SessionManager {
 
   /**
    * User confirmed the draft plan in the UI. Optionally create/checkout a feat/* branch,
-   * then switch this chat to Build mode.
+   * then enter Check (pre-build test gate). Build starts automatically when Check passes.
    */
   async confirmPlan(input: {
     createBranch: boolean;
@@ -1144,6 +1145,38 @@ export class SessionManager {
           code: "VALIDATION_ERROR",
           userMessage: "Wait for the current turn to finish before starting build.",
           technicalDetail: `status=${this.state.status}`,
+        },
+      };
+    }
+
+    if (this.state.planPhases.length === 0) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Cannot start building with an empty plan.",
+          technicalDetail: "empty plan",
+        },
+      };
+    }
+    const openQuestions = this.state.planQuestions.filter((q) => q.status === "open");
+    if (openQuestions.length > 0) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: `Cannot start building: ${openQuestions.length} open question(s) remain.`,
+          technicalDetail: "open questions",
+        },
+      };
+    }
+    if (!this.state.planReadyProposal) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Agent has not proposed plan readiness yet.",
+          technicalDetail: "no planReadyProposal",
         },
       };
     }
@@ -1291,30 +1324,20 @@ export class SessionManager {
       }
     }
 
-    const started = applyStartBuilding(this.state);
-    if (started.error) {
-      return {
-        ok: false,
-        error: {
-          code: "VALIDATION_ERROR",
-          userMessage: started.error,
-          technicalDetail: started.error,
-        },
-      };
-    }
-
     const notice = {
       id: randomUUID(),
       role: "assistant" as const,
       content: createdBranch
-        ? `Plan confirmed. Switched to **Build** on \`${createdBranch}\`.${branchNote}`
-        : "Plan confirmed. Switched to **Build** (current branch).",
+        ? `Plan confirmed. Entering **Check** on \`${createdBranch}\` before Build.${branchNote}`
+        : "Plan confirmed. Entering **Check** (current branch) before Build.",
       createdAt: new Date().toISOString(),
     };
 
     this.state = {
-      ...started.state,
-      turns: [...started.state.turns, notice],
+      ...this.state,
+      mode: "agent",
+      planStatus: "checking",
+      turns: [...this.state.turns, notice],
       status: "idle",
       error: null,
       buildCommitOffer: null,
@@ -1336,16 +1359,8 @@ export class SessionManager {
     this.persist();
     this.push(true);
 
-    // Start Build used to leave the session idle until the user typed again —
-    // kick off execution immediately (fire-and-forget; do not block confirmPlan).
-    void this.sendMessage(
-      [
-        "Build mode is active. Begin executing the plan now.",
-        "Start with the first incomplete checklist item(s) using tools.",
-        "For short setup commands (e.g. npm init -y), use run_command immediately.",
-        "Do not wait for another instruction before taking the first action.",
-      ].join(" "),
-    );
+    // Pre-build Check gate — Build kicks off automatically when it passes.
+    void this.maybeRunCheckGateThenBuild();
 
     return { ok: true, state: this.state, branch: createdBranch };
   }
@@ -1636,7 +1651,9 @@ export class SessionManager {
       // Never auto-rekick after errors / approvals — user must Resume.
       if (result.state.status === "idle" && !result.state.error) {
         if (!this.maybeTankContinueBuild()) {
-          if (!this.maybePromptTestingReady()) {
+          if (this.state.planStatus === "checking") {
+            void this.maybeRunCheckGateThenBuild();
+          } else if (!this.maybePromptTestingReady()) {
             void this.maybeRunTestGateThenCommit();
           }
         }
@@ -1718,6 +1735,309 @@ export class SessionManager {
     this.push();
     void this.sendMessage(TESTING_READY_CONTINUE_USER_MESSAGE);
     return true;
+  }
+
+  /**
+   * After Start Build confirm: run the pre-build Check gate (same suites as Test).
+   * On green → applyStartBuilding and kick development. On fail → agent fix loop.
+   */
+  private async maybeRunCheckGateThenBuild(): Promise<void> {
+    if (this.state.status !== "idle") return;
+    if (this.state.error) return;
+    if (this.state.planStatus !== "checking") return;
+    if (!canStartCheckGate(this.state) && !this.state.testGatePassedAt) {
+      return;
+    }
+    if (this.testGateInFlight) return;
+    if (this.state.testGatePassedAt) {
+      await this.finishCheckAndStartBuild();
+      return;
+    }
+
+    const prior = this.state.testRun;
+    if (prior?.status === "failed" && !this.testDirtySinceLastRun) {
+      return;
+    }
+    if (prior?.status === "running") return;
+
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) return;
+
+    this.testGateInFlight = true;
+    try {
+      const profile = new ArchitectureStore(root).loadOrDetect().profile;
+      const specs = discoverTestRunSpecs(profile, { includeE2e: true });
+      if (specs.length === 0) {
+        const skippedAt = new Date().toISOString();
+        this.state = {
+          ...this.state,
+          testRun: {
+            startedAt: skippedAt,
+            finishedAt: skippedAt,
+            status: "skipped",
+            specs: [],
+            suites: [],
+            digest: "No lint/typecheck/unit/e2e commands in architecture profile.",
+          },
+          testGatePassedAt: skippedAt,
+          testGateAutoFixAttempts: 0,
+          testGateCircuitOpen: false,
+          testGateFailureFingerprint: null,
+          testGateSameFailureStreak: 0,
+          testGateEscalationLevel: 0,
+          testGateRecentSuiteKeys: [],
+        };
+        this.testLogs.clear();
+        this.testDirtySinceLastRun = false;
+        this.push();
+        await this.finishCheckAndStartBuild();
+        return;
+      }
+
+      const startedAt = new Date().toISOString();
+      this.testLogs.clear();
+      this.testDirtySinceLastRun = false;
+      this.testAbort?.abort();
+      this.testAbort = new AbortController();
+      this.state = {
+        ...this.state,
+        status: "running",
+        activityLabel: "Running check gate…",
+        testRun: {
+          startedAt,
+          status: "running",
+          specs,
+          suites: [],
+        },
+        testGatePassedAt: null,
+      };
+      this.push();
+
+      const outcome = await runTestSuites({
+        workspaceRoot: root,
+        specs,
+        failFast: true,
+        signal: this.testAbort.signal,
+        onSuiteStart: (spec) => {
+          this.state = {
+            ...this.state,
+            activityLabel: `Check gate · ${spec.id}…`,
+          };
+          this.push();
+        },
+        onSuiteEnd: (result) => {
+          const prev = this.state.testRun;
+          if (!prev || prev.status !== "running") return;
+          const suites = [
+            ...prev.suites.filter((s) => s.id !== result.id),
+            result,
+          ];
+          this.state = {
+            ...this.state,
+            testRun: {
+              ...prev,
+              suites,
+            },
+          };
+          this.push();
+        },
+      });
+
+      for (const [id, log] of outcome.logs) {
+        this.testLogs.set(id, log);
+      }
+
+      const finishedAt = new Date().toISOString();
+      if (!outcome.failed) {
+        this.state = {
+          ...this.state,
+          status: "idle",
+          activityLabel: null,
+          testRun: {
+            startedAt,
+            finishedAt,
+            status: "passed",
+            specs,
+            suites: outcome.suites,
+          },
+          testGatePassedAt: finishedAt,
+          testGateAutoFixAttempts: 0,
+          testGateCircuitOpen: false,
+          testGateFailureFingerprint: null,
+          testGateSameFailureStreak: 0,
+          testGateEscalationLevel: 0,
+          testGateRecentSuiteKeys: [],
+        };
+        this.push();
+        await this.finishCheckAndStartBuild();
+        return;
+      }
+
+      const logsRecord = Object.fromEntries(this.testLogs.entries());
+      const fingerprint = fingerprintTestFailure(
+        { suites: outcome.suites },
+        logsRecord,
+      );
+      const suiteKey = failedSuiteIds(outcome.suites).join("+") || "unknown";
+      const escalation = decideTestGateEscalation({
+        fingerprint,
+        previousFingerprint: this.state.testGateFailureFingerprint,
+        previousStreak: this.state.testGateSameFailureStreak,
+        previousSuiteKeys: this.state.testGateRecentSuiteKeys,
+        currentSuiteKey: suiteKey,
+      });
+      const digest = buildTestFailureDigest(
+        {
+          specs,
+          suites: outcome.suites,
+        },
+        { logs: logsRecord, escalation },
+      );
+      const checkDigest = digest.replace(
+        /\[IDE · TEST GATE\]/g,
+        "[IDE · CHECK GATE]",
+      );
+      const decision = decideTestGateAutoContinue({
+        paidProvider: this.isPaidActiveProvider(),
+        previousAttempts: this.state.testGateAutoFixAttempts,
+      });
+      this.state = {
+        ...this.state,
+        status: "idle",
+        activityLabel: null,
+        testRun: {
+          startedAt,
+          finishedAt,
+          status: "failed",
+          specs,
+          suites: outcome.suites,
+          digest: checkDigest,
+        },
+        testGatePassedAt: null,
+        testGateAutoFixAttempts: decision.attempts,
+        testGateCircuitOpen: decision.circuitOpen,
+        testGateFailureFingerprint: escalation.fingerprint,
+        testGateSameFailureStreak: escalation.sameFailureStreak,
+        testGateEscalationLevel: escalation.level,
+        testGateRecentSuiteKeys: escalation.recentSuiteKeys,
+      };
+      this.push();
+      if (decision.autoContinue) {
+        void this.sendMessage(checkDigest);
+      }
+    } catch (error) {
+      const decision = decideTestGateAutoContinue({
+        paidProvider: this.isPaidActiveProvider(),
+        previousAttempts: this.state.testGateAutoFixAttempts,
+      });
+      const errDigest = `Check gate error: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      const fingerprint = fingerprintTestFailure(
+        {
+          suites: [
+            {
+              id: "gate",
+              kind: "unit",
+              command: "check-gate",
+              status: "failed",
+              exitCode: 1,
+              durationMs: 0,
+              summary: errDigest,
+              logChars: 0,
+              logChunkSize: 8000,
+              logChunks: 0,
+              failedTests: [],
+            },
+          ],
+        },
+      );
+      const escalation = decideTestGateEscalation({
+        fingerprint,
+        previousFingerprint: this.state.testGateFailureFingerprint,
+        previousStreak: this.state.testGateSameFailureStreak,
+        previousSuiteKeys: this.state.testGateRecentSuiteKeys,
+        currentSuiteKey: "gate",
+      });
+      this.state = {
+        ...this.state,
+        status: "idle",
+        activityLabel: null,
+        testRun: {
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          status: "failed",
+          specs: this.state.testRun?.specs ?? [],
+          suites: this.state.testRun?.suites ?? [],
+          digest: errDigest,
+        },
+        testGatePassedAt: null,
+        testGateAutoFixAttempts: decision.attempts,
+        testGateCircuitOpen: decision.circuitOpen,
+        testGateFailureFingerprint: escalation.fingerprint,
+        testGateSameFailureStreak: escalation.sameFailureStreak,
+        testGateEscalationLevel: escalation.level,
+        testGateRecentSuiteKeys: escalation.recentSuiteKeys,
+      };
+      this.testDirtySinceLastRun = true;
+      this.push();
+      if (decision.autoContinue) {
+        void this.sendMessage(
+          this.state.testRun?.digest ?? TEST_FAILURE_CONTINUE_USER_MESSAGE,
+        );
+      }
+    } finally {
+      this.testGateInFlight = false;
+    }
+  }
+
+  /** Check passed → switch to Build and kick the agent. */
+  private async finishCheckAndStartBuild(): Promise<void> {
+    if (this.state.planStatus !== "checking") return;
+    if (this.state.status !== "idle") return;
+    if (!this.state.testGatePassedAt) return;
+
+    const rememberedBase = this.state.buildBaseBranch;
+    const started = applyStartBuilding(this.state);
+    if (started.error) {
+      this.state = {
+        ...this.state,
+        status: "error",
+        error: started.error,
+      };
+      this.persist();
+      this.push();
+      return;
+    }
+
+    const notice = {
+      id: randomUUID(),
+      role: "assistant" as const,
+      content:
+        "Check passed. Switched to **Build** — begin executing the plan.",
+      createdAt: new Date().toISOString(),
+    };
+
+    this.state = {
+      ...started.state,
+      turns: [...started.state.turns, notice],
+      status: "idle",
+      error: null,
+      buildBaseBranch: rememberedBase,
+    };
+    this.testLogs.clear();
+    this.testDirtySinceLastRun = true;
+    this.persist();
+    this.push(true);
+
+    void this.sendMessage(
+      [
+        "Build mode is active. Begin executing the plan now.",
+        "Start with the first incomplete checklist item(s) using tools.",
+        "For short setup commands (e.g. npm init -y), use run_command immediately.",
+        "Do not wait for another instruction before taking the first action.",
+      ].join(" "),
+    );
   }
 
   /**
@@ -2553,7 +2873,9 @@ export class SessionManager {
       // Never auto-rekick after errors / approvals — user must Resume.
       if (result.state.status === "idle" && !result.state.error) {
         if (!this.maybeTankContinueBuild()) {
-          if (!this.maybePromptTestingReady()) {
+          if (this.state.planStatus === "checking") {
+            void this.maybeRunCheckGateThenBuild();
+          } else if (!this.maybePromptTestingReady()) {
             void this.maybeRunTestGateThenCommit();
           }
         }

@@ -189,6 +189,48 @@ textarea {
   background: transparent;
 }
 
+.app-shell-checking {
+  background-color: #120f18;
+  background-image:
+    radial-gradient(
+      ellipse 120% 95% at 18% -12%,
+      rgba(167, 139, 250, 0.26),
+      transparent 55%
+    ),
+    radial-gradient(
+      ellipse 95% 75% at 92% 12%,
+      rgba(139, 92, 246, 0.14),
+      transparent 50%
+    ),
+    radial-gradient(
+      ellipse 70% 50% at 50% 100%,
+      rgba(167, 139, 250, 0.08),
+      transparent 55%
+    );
+}
+
+.app-shell-checking .chrome {
+  background: rgba(18, 15, 24, 0.52);
+  border-bottom-color: rgba(167, 139, 250, 0.28);
+}
+
+.app-shell-checking .topbar,
+.app-shell-checking .workspace-bar,
+.app-shell-checking .session-bar,
+.app-shell-checking .git-bar,
+.app-shell-checking .session-tabs {
+  border-color: rgba(167, 139, 250, 0.18);
+}
+
+.app-shell-checking .pane {
+  background: rgba(18, 15, 24, 0.38);
+  border-right-color: rgba(167, 139, 250, 0.16);
+}
+
+.app-shell-checking .pane-body {
+  background: transparent;
+}
+
 .app-shell-architecture {
   background-color: #0c1414;
   background-image:
@@ -943,6 +985,12 @@ textarea {
   color: #6ee7b7;
   background: rgba(52, 211, 153, 0.14);
   border: 1px solid rgba(52, 211, 153, 0.45);
+}
+
+.session-tab-phase-checking {
+  color: #c4b5fd;
+  background: rgba(167, 139, 250, 0.16);
+  border: 1px solid rgba(167, 139, 250, 0.4);
 }
 
 .session-tab-phase-architecture {

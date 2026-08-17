@@ -10,13 +10,28 @@ const emptyObjectSchema = {
 
 const PLANNING_ONLY: ToolPhase[] = ["planning"];
 const BUILDING_ONLY: ToolPhase[] = ["building"];
-const TESTING_ONLY: ToolPhase[] = ["testing"];
-/** Plan progress (Build) + draft (Plan) — never Testing. */
+/**
+ * Hand-off to the IDE Test gate — available in Build and early Testing
+ * (before/while confirming; rejected once already confirmed).
+ */
+const BUILDING_AND_TESTING: ToolPhase[] = ["building", "testing"];
+/** Pre-build Check + post-build Test report tools. */
+const CHECKING_AND_TESTING: ToolPhase[] = ["checking", "testing"];
+/** Plan progress (Build) + draft (Plan) — never Check/Test. */
 const PLANNING_AND_BUILDING: ToolPhase[] = ["planning", "building"];
 /** Implementation + bugfix (no plan mutation). */
-const BUILDING_AND_TESTING: ToolPhase[] = ["building", "testing"];
+const BUILDING_CHECKING_AND_TESTING: ToolPhase[] = [
+  "building",
+  "checking",
+  "testing",
+];
 /** Explore / read across all product phases. */
-const ALL_PHASES: ToolPhase[] = ["planning", "building", "testing"];
+const ALL_PHASES: ToolPhase[] = [
+  "planning",
+  "checking",
+  "building",
+  "testing",
+];
 
 export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
@@ -492,9 +507,9 @@ export function registerStarterTools(registry: ToolRegistry): void {
   registry.register({
     name: "propose_testing_ready",
     description:
-      "After the build checklist is fully done: confirm the work is complete so the IDE can run the Test gate (lint/typecheck/unit). Call this instead of narrating readiness. Does NOT run tests yourself — the IDE starts the gate after this tool succeeds. Rejected while checklist items remain open.",
+      "After the build checklist is fully done: confirm the work is complete so the IDE can run the Test gate (lint/typecheck/unit). Call this instead of narrating readiness. Does NOT run tests yourself — the IDE starts the gate after this tool succeeds. Rejected while checklist items remain open or if already confirmed.",
     riskLevel: "safe",
-    phases: BUILDING_ONLY,
+    phases: BUILDING_AND_TESTING,
     argsSchema: z.object({
       summary: z.string().max(500).optional(),
     }) as z.ZodType<Record<string, unknown>>,
@@ -828,7 +843,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Create a new text file OR fully overwrite an existing one (pass the entire file content). For edits to an existing file, ALWAYS prefer replace_in_file (exact search→replace) — it uses fewer tokens and avoids accidental drift. Use write_file only for brand-new paths or intentional full rewrites.",
     riskLevel: "reversible",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({
       path: z.string().min(1),
       content: z.string(),
@@ -853,7 +868,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "PREFERRED edit for existing files: exact substring replace (search → replace). search must match exactly once unless replaceAll=true. Include enough surrounding context to keep search unique. Prefer this over write_file for any partial change — cheaper and safer than rewriting the whole file.",
     riskLevel: "reversible",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({
       path: z.string().min(1),
       search: z.string().min(1),
@@ -965,7 +980,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     name: "git_status",
     description: "Get git status for the workspace.",
     riskLevel: "safe",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
     parameters: emptyObjectSchema,
     execute: async (_args, ctx) => {
@@ -978,7 +993,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     name: "git_diff",
     description: "Get git diff for the workspace.",
     riskLevel: "safe",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({ staged: z.boolean().optional() }) as z.ZodType<
       Record<string, unknown>
     >,
@@ -1000,7 +1015,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "DISABLED — git commit/push are harness-only. After the test gate passes, the IDE shows a Commit Build banner; do not attempt commits via tools or the terminal.",
     riskLevel: "sensitive",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({ message: z.string().min(1) }) as z.ZodType<
       Record<string, unknown>
     >,
@@ -1027,7 +1042,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Short one-shot host shell (`bash -lc` in workspace). Auto-loads nvm/fnm and honors .nvmrc/.node-version for THAT process only — env does not persist to the next call. For multi-step Node/npm/pnpm/git work prefer terminal_open once and reuse terminal_write/terminal_read. Do NOT use cat/ls/head/find/tree to inspect the repo — those are blocked; use list_dir, read_file, search_text, or search_graph / get_code_snippet instead.",
     riskLevel: "sensitive",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({
       command: z.string().min(1),
       cwd: z.string().optional(),
@@ -1065,9 +1080,9 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "get_test_report",
     description:
-      "Testing only. Structured summary of the last IDE test-gate run: suite status, platform (jest/vitest/eslint/tsc/cypress…), pass/fail/skip counts when parsed, and failed-test titles. Prefer this before read_test_log.",
+      "Check/Test only. Structured summary of the last IDE gate run: suite status, platform (jest/vitest/eslint/tsc/cypress…), pass/fail/skip counts when parsed, and failed-test titles. Prefer this before read_test_log. If action is wait_for_ide (no report yet, or status running), stop tool use — do not poll or sleep-retry.",
     riskLevel: "safe",
-    phases: TESTING_ONLY,
+    phases: CHECKING_AND_TESTING,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
     parameters: {
       type: "object",
@@ -1096,9 +1111,9 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "list_failed_tests",
     description:
-      "Testing only. List individual failed test titles from the last IDE test gate, optionally filtered by suiteId (unit, lint, typecheck…). Pair with get_test_report for counts/platform.",
+      "Check/Test only. List individual failed test titles from the last IDE gate, optionally filtered by suiteId (unit, lint, typecheck…). Pair with get_test_report for counts/platform.",
     riskLevel: "safe",
-    phases: TESTING_ONLY,
+    phases: CHECKING_AND_TESTING,
     argsSchema: z.object({
       suiteId: z.string().min(1).optional(),
     }) as z.ZodType<Record<string, unknown>>,
@@ -1119,8 +1134,20 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
           summary: "No test-gate report",
           output: {
             available: false,
+            action: "wait_for_ide",
             failed: [],
-            hint: "Wait for the IDE test gate to finish, then retry.",
+            hint: "Do not poll. End the turn — the IDE starts/finishes the gate.",
+          },
+        };
+      }
+      if (report.status === "running") {
+        return {
+          summary: "Test gate still running",
+          output: {
+            available: true,
+            action: "wait_for_ide",
+            failed: [],
+            hint: "Gate in progress. Stop tools until the IDE posts a digest.",
           },
         };
       }
@@ -1167,9 +1194,9 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "read_test_log",
     description:
-      "Testing only. Read a chunk of an IDE test-gate suite log after a verification run. Prefer get_test_report / list_failed_tests first. Pass suiteId from the digest or report. Prefer chunkIndex (0-based); or offsetChars.",
+      "Check/Test only. Read a chunk of an IDE gate suite log after a verification run. Prefer get_test_report / list_failed_tests first. Pass suiteId from the digest or report. Prefer chunkIndex (0-based); or offsetChars.",
     riskLevel: "safe",
-    phases: TESTING_ONLY,
+    phases: CHECKING_AND_TESTING,
     argsSchema: z.object({
       suiteId: z.string().min(1),
       chunkIndex: z.number().int().nonnegative().optional(),
@@ -1248,7 +1275,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Open a persistent interactive terminal (PTY) in the workspace. Prefer ONE session for a toolchain stream: the IDE bootstraps nvm/fnm + .nvmrc on open so node/npm stay available. Reuse the returned terminalId with terminal_write / terminal_read — do not open a new terminal per command.",
     riskLevel: "safe",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({
       title: z.string().optional(),
       cwd: z.string().optional(),
@@ -1280,7 +1307,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     name: "terminal_list",
     description: "List interactive terminals (id, title, status, pid).",
     riskLevel: "safe",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({}) as z.ZodType<Record<string, unknown>>,
     parameters: emptyObjectSchema,
     execute: async (_args, ctx) => {
@@ -1300,7 +1327,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Read recent streamed output from a terminal. Use after writes or while a process is running.",
     riskLevel: "safe",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({
       terminalId: z.string().min(1),
       maxChars: z.number().int().positive().optional(),
@@ -1341,7 +1368,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Send exact text to a terminal. The user gets 3s to confirm/cancel/edit (auto-approve on timeout). Prefer this for interactive commands; use terminal_ask when the user must choose. Do NOT send git commit or git push — those are harness-only via the Commit Build / Integrate banners.",
     riskLevel: "reversible",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({
       terminalId: z.string().min(1),
       text: z.string(),
@@ -1397,7 +1424,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     description:
       "Ask the user an exclusive A/B/C… choice (+ optional free text). You may suggest stdin text; the user can confirm or edit. Optionally writes the final text to the terminal (no extra 3s confirm).",
     riskLevel: "reversible",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({
       terminalId: z.string().min(1),
       prompt: z.string().min(1),
@@ -1478,7 +1505,7 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
     name: "terminal_close",
     description: "Close an interactive terminal and kill its process tree.",
     riskLevel: "safe",
-    phases: BUILDING_AND_TESTING,
+    phases: BUILDING_CHECKING_AND_TESTING,
     argsSchema: z.object({
       terminalId: z.string().min(1),
     }) as z.ZodType<Record<string, unknown>>,

@@ -31,11 +31,15 @@ export function BuildContinueBanner(props: { state: SessionState | null }) {
   const testFailed =
     Boolean(state) &&
     state?.testRun?.status === "failed" &&
-    Boolean(state && planBuildComplete(state));
+    Boolean(
+      state &&
+        (planBuildComplete(state) || state.planStatus === "checking"),
+    );
   const checklistOpen =
     Boolean(state) &&
     state?.mode !== "plan" &&
     state?.planStatus !== "drafting" &&
+    state?.planStatus !== "checking" &&
     Boolean(state && planHasOpenWork(state));
   const show =
     Boolean(state) &&
@@ -89,13 +93,17 @@ export function BuildContinueBanner(props: { state: SessionState | null }) {
           {isProviderError
             ? "Provider error · build paused"
             : circuitOpen
-              ? "Test gate circuit open · paid provider"
+              ? state?.planStatus === "checking"
+                ? "Check gate circuit open · paid provider"
+                : "Test gate circuit open · paid provider"
               : escalationLevel >= 2
                 ? "Test gate · strong escalation"
                 : escalationLevel > 0
                   ? "Test gate · strategy escalation"
                   : testFailed
-                    ? "Test gate failed"
+                    ? state.planStatus === "checking"
+                      ? "Check gate failed"
+                      : "Test gate failed"
                     : "Build paused · checklist incomplete"}
         </strong>
         {isProviderError ? <span>{error}</span> : null}

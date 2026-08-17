@@ -68,8 +68,8 @@ type Props = {
   onConfirmed?: (() => void) | undefined;
 };
 
-/**
- * Foot-of-chat controls to confirm a ready plan and enter Build.
+  /**
+ * Foot-of-chat controls to confirm a ready plan and enter Check (then Build).
  * Shown only after the agent turn finishes (plan is already in the transcript).
  */
 export function StartBuildBanner(props: Props) {
@@ -254,13 +254,13 @@ export function StartBuildBanner(props: Props) {
   }
 
   return (
-    <div className="start-build-banner" role="region" aria-label="Start build">
+    <div className="start-build-banner" role="region" aria-label="Start check and build">
       <div className="start-build-banner-top">
         <div className="build-continue-copy">
-          <strong>Plan ready · start build</strong>
+          <strong>Plan ready · Check then Build</strong>
           <span>
-            Choose a branch (optional), then start. The plan is already in the
-            chat and Plan pane.
+            Choose a branch (optional), then start. Check runs the baseline
+            test gate on the branch before Build begins.
           </span>
         </div>
         <button
@@ -394,7 +394,7 @@ export function StartBuildBanner(props: Props) {
             className="btn btn-primary"
             disabled={!canConfirm}
           >
-            {createBranch ? "Create branch & start" : "Start without branch"} ·
+            {createBranch ? "Create branch & start Check" : "Start Check"} ·
             Enter
           </button>
         </div>

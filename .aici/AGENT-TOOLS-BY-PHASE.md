@@ -7,14 +7,16 @@ Source of truth: `packages/tools` (`createDefaultRegistry`, `ToolDefinition.phas
 | Product phase (UI) | When | Tool registry phase |
 | --- | --- | --- |
 | **Plan** | `mode === "plan"` or `planStatus === "drafting"` | `planning` |
-| **Build** | After Start Build, checklist still open | `building` |
+| **Check** | After Start Build confirm / feat branch, until pre-build gate passes | `checking` |
+| **Build** | After Check passes, checklist still open | `building` |
 | **Test** | Checklist complete until commit/PR offer (await confirm, gate running, or fix loop) | `testing` |
 
 Notes:
 
-- Registry phases are `planning` | `building` | `testing`.
-- CBM / graph tools are registered for all three phases, but **omitted from the model** until the workspace is indexed.
+- Registry phases are `planning` | `checking` | `building` | `testing`.
+- CBM / graph tools are registered for all phases, but **omitted from the model** until the workspace is indexed.
 - Execution still goes through the Tool Gateway + risk policy.
+- **Check** and **Test** share the same IDE gate machinery (`discoverTestRunSpecs` + `runTestSuites`); Check is baseline-before-build, Test is verification-after-build.
 
 ---
 
@@ -50,7 +52,7 @@ Explore + draft the delivery plan. No file writes, git, shell, terminals, or tes
 | `replace_check` | safe | Replace one checklist item |
 | `delete_check` | safe | Delete one checklist item |
 | `set_questions` | safe | Replace Plan Q&A questions (`[]` clears) |
-| `propose_plan_ready` | safe | Ask user to confirm Start Build |
+| `propose_plan_ready` | safe | Ask user to confirm Start Build (→ Check → Build) |
 
 ### Attachments
 
@@ -71,6 +73,32 @@ Explore + draft the delivery plan. No file writes, git, shell, terminals, or tes
 | `detect_changes` | safe | Git diff → impacted symbols |
 
 **Not exposed in Plan:** `write_file`, `replace_in_file`, git_*, `run_command`, `terminal_*`, `checkpoint_restore`, `propose_testing_ready`, `get_test_report`, `list_failed_tests`, `read_test_log`.
+
+---
+
+## Check (`checking`)
+
+Pre-build baseline. Entered after the user confirms Start Build (optional `feat/*` branch). The IDE runs the same lint/typecheck/unit/e2e gate as Test. **Plan is frozen** — do not implement the feature yet; only fix baseline failures. When Check passes, Build starts automatically.
+
+### Gate report (Check + Test)
+
+| Tool | Risk | Role |
+| --- | --- | --- |
+| `get_test_report` | safe | Suite status, platform, pass/fail counts |
+| `list_failed_tests` | safe | Failed test titles (optional `suiteId`) |
+| `read_test_log` | safe | Raw log chunk for a suite |
+
+### Bug-fix still available
+
+Explore/read tools, CBM (if indexed), `replace_in_file` / `write_file`, git_*, `run_command`, `terminal_*`, `import_attachment`, architecture read/upsert.
+
+### Explicitly removed in Check
+
+- All plan mutation: `upsert_plan`, `add_phase`, `replace_phase`, `delete_phase`, `add_check`, `replace_check`, `delete_check`, `set_questions`, `propose_plan_ready`
+- `propose_testing_ready`
+- `checkpoint_restore`
+
+Do **not** re-launch full lint/test suites via `run_command` / `terminal_*` — the IDE re-runs the gate after fixes.
 
 ---
 
@@ -112,7 +140,7 @@ Implement the agreed checklist. Structure of the plan is locked; progress via `u
 
 Entered when the checklist is complete and there is no commit/PR offer yet. **Plan is frozen** — `read_plan` only. Bug-fix against the IDE Test gate.
 
-### Test gate (Testing only)
+### Test gate (Check + Test)
 
 | Tool | Risk | Role |
 | --- | --- | --- |
@@ -127,8 +155,9 @@ Explore/read tools, CBM (if indexed), `replace_in_file` / `write_file`, git_*, `
 ### Explicitly removed in Testing
 
 - All plan mutation: `upsert_plan`, `add_phase`, `replace_phase`, `delete_phase`, `add_check`, `replace_check`, `delete_check`, `set_questions`, `propose_plan_ready`
-- `propose_testing_ready` (already confirmed)
 - `checkpoint_restore`
+
+`propose_testing_ready` remains available until confirmed (then the tool rejects duplicates). While the IDE gate has not finished (`action=wait_for_ide`), the agent must not tank/poll — tank mode only runs when a **failed** report exists.
 
 Do **not** re-launch full lint/test suites via `run_command` / `terminal_*` — the IDE re-runs the gate after fixes.
 
@@ -136,21 +165,21 @@ Do **not** re-launch full lint/test suites via `run_command` / `terminal_*` — 
 
 ## Quick matrix
 
-| Tool | Plan | Build | Test |
-| --- | --- | --- | --- |
-| `list_dir` / `read_file` / `search_text` | ✓ | ✓ | ✓ |
-| CBM graph tools (if indexed) | ✓ | ✓ | ✓ |
-| `read_architecture` / `upsert_architecture` | ✓ | ✓ | ✓ |
-| `read_plan` | ✓ | ✓ | ✓ (read-only) |
-| `upsert_plan` | ✓ | ✓ (progress) | — |
-| Plan micro-CRUD + `set_questions` + `propose_plan_ready` | ✓ | — | — |
-| `import_attachment` | ✓ | ✓ | ✓ |
-| `write_file` | — | ✓ (new / full rewrite) | ✓ |
-| `replace_in_file` | — | ✓ (preferred edits) | ✓ |
-| `git_*` / `run_command` / `terminal_*` | — | ✓ | ✓ |
-| `checkpoint_restore` | — | ✓ | — |
-| `propose_testing_ready` | — | ✓ | — |
-| `get_test_report` / `list_failed_tests` / `read_test_log` | — | — | ✓ |
+| Tool | Plan | Check | Build | Test |
+| --- | --- | --- | --- | --- |
+| `list_dir` / `read_file` / `search_text` | ✓ | ✓ | ✓ | ✓ |
+| CBM graph tools (if indexed) | ✓ | ✓ | ✓ | ✓ |
+| `read_architecture` / `upsert_architecture` | ✓ | ✓ | ✓ | ✓ |
+| `read_plan` | ✓ | ✓ (read-only) | ✓ | ✓ (read-only) |
+| `upsert_plan` | ✓ | — | ✓ (progress) | — |
+| Plan micro-CRUD + `set_questions` + `propose_plan_ready` | ✓ | — | — | — |
+| `import_attachment` | ✓ | ✓ | ✓ | ✓ |
+| `write_file` | — | ✓ | ✓ (new / full rewrite) | ✓ |
+| `replace_in_file` | — | ✓ | ✓ (preferred edits) | ✓ |
+| `git_*` / `run_command` / `terminal_*` | — | ✓ | ✓ | ✓ |
+| `checkpoint_restore` | — | — | ✓ | — |
+| `propose_testing_ready` | — | — | ✓ | ✓ (until confirmed) |
+| `get_test_report` / `list_failed_tests` / `read_test_log` | — | ✓ | — | ✓ |
 
 ---
 

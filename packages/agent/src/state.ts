@@ -226,7 +226,7 @@ export function buildSystemPrompt(state: SessionState): string {
     "PHASE: PLANNING — the plan is being created (not executed).",
     "Available tools: when indexed — search_graph / search_code / get_architecture / get_code_snippet / trace_path (primary), plus list_dir/read_file/search_text (fallback), plus read_architecture, upsert_architecture, import_attachment (copy chat attachments into the workspace), read_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, upsert_plan (full rewrite), propose_plan_ready.",
     "Unavailable: write_file, replace_in_file, git_*, run_command, terminal_*, checkpoint_restore, get_test_report, list_failed_tests, read_test_log.",
-    "IMPORTANT: Never tell the user you cannot run shell commands. Commands run only after Start Build. When the user asks to run npm/git/shell now, call propose_plan_ready so the IDE can switch to Build — then you will get run_command / terminal_*.",
+    "IMPORTANT: Never tell the user you cannot run shell commands. Commands run only after Start Build (Check gate, then Build). When the user asks to run npm/git/shell now, call propose_plan_ready so the IDE can switch — then you will get run_command / terminal_*.",
     "",
     architectureBlock,
     "",
@@ -259,9 +259,27 @@ export function buildSystemPrompt(state: SessionState): string {
     "2) After user answers (or says to proceed / only run a command): reshape with micro CRUD; if they want execution now, call propose_plan_ready.",
     "3) Never implement, rewrite files, or pretend development has started.",
     "4) When the user explicitly wants to run shell/npm/git (e.g. \"npm init\", \"install\", \"just initialize\"): keep a minimal plan focused on that, set_questions({questions:[]}), then call propose_plan_ready immediately. Do not keep interviewing.",
-    "5) Otherwise, when the plan is solid AND all open questions are answered, call propose_plan_ready with a short suggestedBranch (feat/kebab-case). The IDE opens Start Build for USER confirmation — do NOT start building yourself.",
+    "5) Otherwise, when the plan is solid AND all open questions are answered, call propose_plan_ready with a short suggestedBranch (feat/kebab-case). The IDE opens Start Build for USER confirmation — Check runs first, then Build. Do NOT start building yourself.",
     "6) Do NOT call propose_plan_ready while open questions remain.",
     "TANK MODE (planning): until propose_plan_ready is accepted by the user (Start Build), you must keep using tools — plan CRUD / set_questions. NEVER stop on exploration-only narration. Brief graph explore → plan tools. The IDE re-prompts until the plan is ready or open questions await the user.",
+    formatPlanForPrompt(state),
+  ];
+
+  const checkingRules = [
+    "PHASE: CHECK — pre-build baseline. The IDE runs the same lint/typecheck/unit/e2e gate as Testing before development starts.",
+    architectureBlock,
+    testGateBlock,
+    ...(escalationBlock ? [escalationBlock] : []),
+    "Plan is READ-ONLY: use read_plan if you need context. Do NOT call upsert_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, propose_plan_ready, propose_testing_ready, or checkpoint_restore.",
+    "Do NOT start implementing the feature plan yet — only fix baseline failures so Check can pass.",
+    "Start with get_test_report (and list_failed_tests). Use read_test_log only when you need raw log chunks.",
+    "If get_test_report / list_failed_tests return action=wait_for_ide (no report yet or status running): STOP tools this turn. Do not poll, sleep, or invent failures — the IDE owns the gate.",
+    "Fix with replace_in_file (preferred) or write_file (new / full rewrite). You may use git_*, run_command, and terminal_* for diagnosis — do NOT re-launch the full IDE Check gate suites yourself; the IDE re-runs them after your fixes.",
+    "File edits (critical — prefer surgical changes):",
+    "- For changes to an EXISTING file: ALWAYS use replace_in_file (exact search→replace). Include enough context so search matches once.",
+    "- Use write_file ONLY to create a new file, or when you intentionally overwrite an entire existing file.",
+    "Code reading: when indexed prefer search_graph / get_code_snippet; otherwise read_file / search_text. Never cat/ls/find via shell.",
+    "Keep going until the Check gate passes — then the IDE starts Build automatically.",
     formatPlanForPrompt(state),
   ];
 
@@ -319,13 +337,15 @@ export function buildSystemPrompt(state: SessionState): string {
     testGateBlock,
     ...(escalationBlock ? [escalationBlock] : []),
     "Plan is READ-ONLY: use read_plan if you need context. Do NOT call upsert_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, or checkpoint_restore.",
+    "If testing is not confirmed yet: call propose_testing_ready (do not only narrate). Then stop — the IDE starts the gate.",
     "Start with get_test_report (and list_failed_tests). Use read_test_log only when you need raw log chunks.",
+    "If get_test_report / list_failed_tests return action=wait_for_ide (no report yet or status running): STOP tools this turn. Do not poll, sleep, or invent failures — the IDE owns the gate.",
     "Fix with replace_in_file (preferred) or write_file (new / full rewrite). You may use git_*, run_command, and terminal_* for diagnosis — do NOT re-launch the full IDE Test gate suites yourself; the IDE re-runs them after your fixes.",
     "File edits (critical — prefer surgical changes):",
     "- For changes to an EXISTING file: ALWAYS use replace_in_file (exact search→replace). Include enough context so search matches once.",
     "- Use write_file ONLY to create a new file, or when you intentionally overwrite an entire existing file.",
     "Code reading: when indexed prefer search_graph / get_code_snippet; otherwise read_file / search_text. Never cat/ls/find via shell.",
-    "Keep going until failures are fixed — prefer tools over narration.",
+    "Keep going until failures are fixed — prefer tools over narration. Do not thrash read-only tools without edits.",
     formatPlanForPrompt(state),
   ];
 
@@ -334,9 +354,11 @@ export function buildSystemPrompt(state: SessionState): string {
     ...workspaceLine,
     ...(phase === "planning"
       ? planningRules
-      : phase === "testing"
-        ? testingRules
-        : buildRules),
+      : phase === "checking"
+        ? checkingRules
+        : phase === "testing"
+          ? testingRules
+          : buildRules),
   ].join("\n");
 }
 
@@ -350,8 +372,9 @@ export function buildContext(state: SessionState, userMessage: string): Turn[] {
   };
 
   const building = productPhaseForState(state) === "building";
+  const checking = productPhaseForState(state) === "checking";
   const testing = productPhaseForState(state) === "testing";
-  if (!building && !testing) {
+  if (!building && !checking && !testing) {
     const history = state.turns.filter(
       (t) => t.role === "user" || t.role === "assistant",
     );
@@ -1827,16 +1850,27 @@ export function hasOpenPlanQuestions(
  * Keep the agent loop running without user input:
  * - building: until checklist/phases are complete
  * - planning (mode=plan): until propose_plan_ready (Start Build) or open questions await the user
- * - testing: while the gate is running/failed and commit is not yet offered (fix loop)
+ * - checking/testing: ONLY while a failed gate report exists to fix — never while
+ *   awaiting IDE gate start/run (that caused get_test_report spin loops)
  */
 export function isAgentTankMode(state: SessionState): boolean {
   const phase = productPhaseForState(state);
   if (phase === "building") {
     return sharedPlanHasOpenWork(state);
   }
+  if (phase === "checking") {
+    if (state.testGatePassedAt) return false;
+    if (state.testGateCircuitOpen) return false;
+    // Await first run / in-progress → IDE owns the turn.
+    return state.testRun?.status === "failed";
+  }
   if (phase === "testing") {
-    // Stay in tank while verifying / fixing until commit/PR offer appears.
-    return !state.buildCommitOffer && !state.buildIntegrateOffer;
+    if (state.buildCommitOffer || state.buildIntegrateOffer) return false;
+    if (state.testGateCircuitOpen) return false;
+    // Await propose_testing_ready, gate start, or in-progress → no tank.
+    if (!state.testingConfirmedAt) return false;
+    if (!state.testRun || state.testRun.status === "running") return false;
+    return state.testRun.status === "failed";
   }
   // Only the Plan workflow tanks — not casual ask/autonomous with drafting status.
   if (phase === "planning" && state.mode === "plan") {
@@ -1869,13 +1903,23 @@ export const PLAN_CONTINUE_NUDGE = [
 ].join("\n");
 
 export const TEST_CONTINUE_NUDGE = [
-  "[IDE · TANK] Testing is not finished — do not stop on narration.",
+  "[IDE · TANK] Testing fix loop — a failed gate report exists.",
   "Plan is frozen (read_plan only). No upsert_plan / phase CRUD / checkpoint_restore.",
   "Immediately with tools:",
-  "1) get_test_report (+ list_failed_tests). read_test_log only if you need raw chunks.",
+  "1) get_test_report (+ list_failed_tests). If action=wait_for_ide, STOP — do not poll.",
   "2) Fix with replace_in_file (preferred) or write_file (new / full rewrite).",
   "3) Do not re-run the full IDE Test gate suites yourself — the IDE re-runs after your fixes.",
-  "Prefer tools over narration until the gate passes.",
+  "Prefer tools over narration until the gate passes. Do not thrash without edits.",
+].join("\n");
+
+export const CHECK_CONTINUE_NUDGE = [
+  "[IDE · TANK] Check fix loop — a failed gate report exists.",
+  "Pre-build baseline: plan is frozen (read_plan only). Do not implement the feature yet.",
+  "Immediately with tools:",
+  "1) get_test_report (+ list_failed_tests). If action=wait_for_ide, STOP — do not poll.",
+  "2) Fix baseline failures with replace_in_file (preferred) or write_file (new / full rewrite).",
+  "3) Do not re-run the full IDE Check gate suites yourself — the IDE re-runs after your fixes.",
+  "Prefer tools over narration until Check passes (then Build starts).",
 ].join("\n");
 
 export {

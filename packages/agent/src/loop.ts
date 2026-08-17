@@ -21,6 +21,7 @@ import {
   applyUpsertPlan,
   buildContext,
   bumpSessionSequence,
+  CHECK_CONTINUE_NUDGE,
   CHECKLIST_CONTINUE_NUDGE,
   compactProviderMessages,
   isAgentTankMode,
@@ -37,6 +38,61 @@ import {
 
 function isTankMode(state: SessionState): boolean {
   return isAgentTankMode(state);
+}
+
+const GATE_EDIT_TOOLS = new Set(["write_file", "replace_in_file"]);
+
+/** In-loop Check/Test tank: stop after this many rounds with no successful edits. */
+export const MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT = 6;
+
+function batchHadSuccessfulEdit(
+  toolCalls: ToolCall[],
+  batchResults: ToolResult[],
+): boolean {
+  const byId = new Map(batchResults.map((r) => [r.callId, r]));
+  for (const call of toolCalls) {
+    if (!GATE_EDIT_TOOLS.has(call.name)) continue;
+    if (byId.get(call.id)?.success) return true;
+  }
+  return false;
+}
+
+/**
+ * Detect read/report-only thrash during Check/Test fix tank.
+ * Opens the circuit so the session does not auto-rekick forever.
+ */
+function noteGateFixRound(
+  state: SessionState,
+  hadEdit: boolean,
+  tankRoundsWithoutEdit: number,
+): { stop: boolean; tankRoundsWithoutEdit: number; state: SessionState } {
+  const phase = productPhaseForState(state);
+  if (phase !== "checking" && phase !== "testing") {
+    return { stop: false, tankRoundsWithoutEdit: 0, state };
+  }
+  if (!isTankMode(state)) {
+    return { stop: false, tankRoundsWithoutEdit: 0, state };
+  }
+  const next = hadEdit ? 0 : tankRoundsWithoutEdit + 1;
+  if (next < MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT) {
+    return { stop: false, tankRoundsWithoutEdit: next, state };
+  }
+  const label = phase === "checking" ? "Check" : "Test";
+  const notice: Turn = {
+    id: randomUUID(),
+    role: "assistant",
+    content: `**Build paused** · ${label} fix loop stalled (no file edits after ${next} rounds). Press **Resume · Enter** when you want to continue.`,
+    createdAt: new Date().toISOString(),
+  };
+  return {
+    stop: true,
+    tankRoundsWithoutEdit: next,
+    state: {
+      ...state,
+      testGateCircuitOpen: true,
+      turns: [...state.turns, notice],
+    },
+  };
 }
 
 function buildToolExecutionContext(
@@ -209,14 +265,17 @@ function pushTankContinue(
   const nextRound = tankRounds + 1;
   const phase = productPhaseForState(workingState);
   const planning = phase === "planning";
+  const checking = phase === "checking";
   const testing = phase === "testing";
   const { done, total } = planChecklistProgress(workingState);
   const open = Math.max(0, total - done);
   const label = planning
     ? `Tank · planning · go ${nextRound}`
-    : testing
-      ? `Tank · testing · go ${nextRound}`
-      : `Tank · ${done}/${total} done · ${open} open · go ${nextRound}`;
+    : checking
+      ? `Tank · check · go ${nextRound}`
+      : testing
+        ? `Tank · testing · go ${nextRound}`
+        : `Tank · ${done}/${total} done · ${open} open · go ${nextRound}`;
   let state = workingState;
   if (nextRound === 1 || nextRound % 5 === 0) {
     const notice: Turn = {
@@ -224,9 +283,11 @@ function pushTankContinue(
       role: "assistant",
       content: planning
         ? `**Tank mode** · planning still open — upsert_plan / questions / propose_plan_ready (round ${nextRound})…`
-        : testing
-          ? `**Tank mode** · testing — get_test_report / fix failures (round ${nextRound})…`
-          : `**Tank mode** · checklist **${done}/${total} done** (${open} open) — continue from the next open item; do not uncheck or restart (round ${nextRound})…`,
+        : checking
+          ? `**Tank mode** · check — get_test_report / fix baseline failures (round ${nextRound})…`
+          : testing
+            ? `**Tank mode** · testing — get_test_report / fix failures (round ${nextRound})…`
+            : `**Tank mode** · checklist **${done}/${total} done** (${open} open) — continue from the next open item; do not uncheck or restart (round ${nextRound})…`,
       createdAt: new Date().toISOString(),
     };
     state = { ...state, turns: [...state.turns, notice] };
@@ -252,9 +313,11 @@ function pushTankContinue(
     role: "user",
     content: planning
       ? PLAN_CONTINUE_NUDGE
-      : testing
-        ? TEST_CONTINUE_NUDGE
-        : CHECKLIST_CONTINUE_NUDGE,
+      : checking
+        ? CHECK_CONTINUE_NUDGE
+        : testing
+          ? TEST_CONTINUE_NUDGE
+          : CHECKLIST_CONTINUE_NUDGE,
   });
   return { state, tankRounds: nextRound };
 }
@@ -355,6 +418,7 @@ export async function runAgentTurn(
   machine.begin();
   const emit = deps.onProgress ?? (() => undefined);
   let tankRounds = 0;
+  let tankRoundsWithoutEdit = 0;
 
   let workingState: SessionState = { ...state };
   const registry = createDefaultRegistry();
@@ -556,6 +620,23 @@ export async function runAgentTurn(
         });
       }
       if (isTankMode(workingState)) {
+        const thrash = noteGateFixRound(
+          workingState,
+          false,
+          tankRoundsWithoutEdit,
+        );
+        tankRoundsWithoutEdit = thrash.tankRoundsWithoutEdit;
+        workingState = thrash.state;
+        if (thrash.stop) {
+          if (thrash.state.testGateCircuitOpen) {
+            emit({
+              type: "session_patch",
+              patch: { testGateCircuitOpen: true },
+            });
+          }
+          machine.complete();
+          break;
+        }
         const tank = pushTankContinue(workingState, messages, tankRounds, emit);
         workingState = tank.state;
         tankRounds = tank.tankRounds;
@@ -581,6 +662,7 @@ export async function runAgentTurn(
     });
 
     let stop = false;
+    const batchStart = toolResults.length;
     for (const call of toolCalls) {
       allToolCalls.push(call);
       const label = toolActivityLabel(call);
@@ -719,6 +801,26 @@ export async function runAgentTurn(
           toolResults,
         },
       );
+    }
+
+    {
+      const thrash = noteGateFixRound(
+        workingState,
+        batchHadSuccessfulEdit(toolCalls, toolResults.slice(batchStart)),
+        tankRoundsWithoutEdit,
+      );
+      tankRoundsWithoutEdit = thrash.tankRoundsWithoutEdit;
+      workingState = thrash.state;
+      if (thrash.stop) {
+        if (thrash.state.testGateCircuitOpen) {
+          emit({
+            type: "session_patch",
+            patch: { testGateCircuitOpen: true },
+          });
+        }
+        machine.complete();
+        break;
+      }
     }
 
     emit({ type: "activity", label: "Thinking…", status: "thinking" });
@@ -923,6 +1025,7 @@ export async function resumeAgentTurn(
   machine.begin();
   const emit = deps.onProgress ?? (() => undefined);
   let tankRounds = 0;
+  let tankRoundsWithoutEdit = 0;
   const registry = createDefaultRegistry();
   const gateway = deps.gateway ?? new ToolGateway(registry);
 
@@ -1223,6 +1326,23 @@ export async function resumeAgentTurn(
         });
       }
       if (isTankMode(workingState)) {
+        const thrash = noteGateFixRound(
+          workingState,
+          false,
+          tankRoundsWithoutEdit,
+        );
+        tankRoundsWithoutEdit = thrash.tankRoundsWithoutEdit;
+        workingState = thrash.state;
+        if (thrash.stop) {
+          if (thrash.state.testGateCircuitOpen) {
+            emit({
+              type: "session_patch",
+              patch: { testGateCircuitOpen: true },
+            });
+          }
+          machine.complete();
+          break;
+        }
         const tank = pushTankContinue(workingState, messages, tankRounds, emit);
         workingState = tank.state;
         tankRounds = tank.tankRounds;
@@ -1246,6 +1366,7 @@ export async function resumeAgentTurn(
     });
 
     let batchStop = false;
+    const batchStart = toolResults.length;
     for (const call of toolCalls) {
       allToolCalls.push(call);
       const label = toolActivityLabel(call);
@@ -1378,6 +1499,26 @@ export async function resumeAgentTurn(
           toolResults,
         },
       );
+    }
+
+    {
+      const thrash = noteGateFixRound(
+        workingState,
+        batchHadSuccessfulEdit(toolCalls, toolResults.slice(batchStart)),
+        tankRoundsWithoutEdit,
+      );
+      tankRoundsWithoutEdit = thrash.tankRoundsWithoutEdit;
+      workingState = thrash.state;
+      if (thrash.stop) {
+        if (thrash.state.testGateCircuitOpen) {
+          emit({
+            type: "session_patch",
+            patch: { testGateCircuitOpen: true },
+          });
+        }
+        machine.complete();
+        break;
+      }
     }
     emit({ type: "activity", label: "Thinking…", status: "thinking" });
   }

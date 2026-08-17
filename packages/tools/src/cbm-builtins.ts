@@ -1,7 +1,12 @@
 import { z } from "zod";
 import type { ToolRegistry, ToolPhase } from "./registry.js";
 
-const READ_PHASES: ToolPhase[] = ["planning", "building", "testing"];
+const READ_PHASES: ToolPhase[] = [
+  "planning",
+  "checking",
+  "building",
+  "testing",
+];
 
 const CBM_MODEL_TOOLS: Array<{
   name: string;

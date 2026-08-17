@@ -127,6 +127,30 @@ describe("phase tool gating", () => {
     expect(names).not.toContain("read_test_log");
   });
 
+  it("checking exposes report + fix tools like testing (plan frozen)", () => {
+    const registry = createDefaultRegistry();
+    const names = registry.listForPhase("checking").map((t) => t.name);
+    expect(names).toEqual(
+      expect.arrayContaining([
+        "read_plan",
+        "get_test_report",
+        "list_failed_tests",
+        "read_test_log",
+        "replace_in_file",
+        "write_file",
+        "run_command",
+        "terminal_open",
+        "git_status",
+        "read_file",
+        "search_graph",
+      ]),
+    );
+    expect(names).not.toContain("upsert_plan");
+    expect(names).not.toContain("propose_plan_ready");
+    expect(names).not.toContain("propose_testing_ready");
+    expect(names).not.toContain("checkpoint_restore");
+  });
+
   it("testing exposes report + fix tools but freezes plan and checkpoints", () => {
     const registry = createDefaultRegistry();
     const names = registry.listForPhase("testing").map((t) => t.name);
@@ -154,7 +178,7 @@ describe("phase tool gating", () => {
     expect(names).not.toContain("delete_check");
     expect(names).not.toContain("set_questions");
     expect(names).not.toContain("propose_plan_ready");
-    expect(names).not.toContain("propose_testing_ready");
     expect(names).not.toContain("checkpoint_restore");
+    expect(names).toContain("propose_testing_ready");
   });
 });

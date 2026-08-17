@@ -1,4 +1,5 @@
 import type { SessionState, TestRunSpec, TestSuiteResult } from "@ai-ide/shared";
+import { deriveProductPhase } from "@ai-ide/shared";
 
 type PlatformRow = {
   key: string;
@@ -159,17 +160,20 @@ export function TestingReportBoard(props: { state: SessionState | null }) {
   const run = props.state?.testRun ?? null;
   const rows = buildRows(props.state);
   const overall = run?.status ?? null;
+  const isCheck =
+    props.state != null && deriveProductPhase(props.state) === "checking";
+  const reportTitle = isCheck ? "Check report" : "Testing report";
+  const waitingHint = isCheck
+    ? "Pre-build Check: the IDE runs lint / typecheck / unit / e2e on the feature branch before Build starts."
+    : "Waiting for the agent to call propose_testing_ready, then the IDE Test gate will run lint / typecheck / unit / e2e here.";
 
   if (!run || rows.length === 0) {
     return (
       <div className="testing-report">
         <div className="testing-report-header">
           <div>
-            <strong>Testing report</strong>
-            <p className="verify-hint">
-              Waiting for the agent to call propose_testing_ready, then the IDE
-              Test gate will run lint / typecheck / unit / e2e here.
-            </p>
+            <strong>{reportTitle}</strong>
+            <p className="verify-hint">{waitingHint}</p>
           </div>
         </div>
         <div className="empty-state verify-empty testing-report-empty">
@@ -188,10 +192,10 @@ export function TestingReportBoard(props: { state: SessionState | null }) {
   const runningCount = rows.filter((r) => r.running).length;
 
   return (
-    <div className="testing-report" role="region" aria-label="Testing report">
+    <div className="testing-report" role="region" aria-label={reportTitle}>
       <div className="testing-report-header">
         <div>
-          <strong>Testing report</strong>
+          <strong>{reportTitle}</strong>
           <p className="verify-hint">
             {overall === "running"
               ? `Gate running · ${runningCount} in flight · ${passedSuites} passed · ${failedSuites} failed`

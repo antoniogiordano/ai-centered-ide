@@ -532,6 +532,7 @@ export function isTestGateSyntheticPrompt(content: string): boolean {
   if (!text) return false;
   if (text === TEST_FAILURE_CONTINUE_USER_MESSAGE) return true;
   if (text.startsWith("[IDE · TEST GATE]")) return true;
+  if (text.startsWith("[IDE · CHECK GATE]")) return true;
   return false;
 }
 
@@ -701,7 +702,37 @@ export function formatAgentTestReport(
   if (!report) {
     return {
       available: false,
+      action: "wait_for_ide",
       message: "No IDE test-gate run yet for this session.",
+      hint: "Do not poll, sleep-retry, or invent failures. End the turn — the IDE starts the gate. Wait for the next digest or Resume.",
+    };
+  }
+  if (report.status === "running") {
+    return {
+      available: true,
+      action: "wait_for_ide",
+      status: "running",
+      startedAt: report.startedAt,
+      finishedAt: null,
+      suiteCount: report.suites.length,
+      suites: report.suites.map((s) => ({
+        id: s.id,
+        kind: s.kind,
+        platform: s.platform ?? null,
+        status: s.status,
+        command: s.command,
+        exitCode: s.exitCode,
+        durationMs: s.durationMs,
+        counts: s.counts ?? null,
+        failedTests: s.failedTests ?? [],
+        failedTestCount: s.failedTests?.length ?? 0,
+        logChunks: s.logChunks,
+      })),
+      totals: null,
+      escalationLevel: options?.escalationLevel ?? 0,
+      circuitOpen: Boolean(options?.circuitOpen),
+      sameFailureStreak: options?.sameFailureStreak ?? 0,
+      hint: "Gate is still running. Stop tool use this turn — do not thrash get_test_report.",
     };
   }
   const suites = report.suites.map((s) => ({
@@ -732,6 +763,7 @@ export function formatAgentTestReport(
   );
   return {
     available: true,
+    action: report.status === "failed" ? "fix_failures" : "none",
     status: report.status,
     startedAt: report.startedAt,
     finishedAt: report.finishedAt ?? null,

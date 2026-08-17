@@ -143,7 +143,27 @@ Tests:       1 failed, 12 passed, 13 total
       ],
     });
     expect(report.available).toBe(true);
+    expect(report.action).toBe("fix_failures");
     expect(report.totals).toMatchObject({ passed: 4, failed: 1, total: 5 });
+  });
+
+  it("formatAgentTestReport asks the agent to wait when gate missing or running", () => {
+    expect(formatAgentTestReport(null)).toMatchObject({
+      available: false,
+      action: "wait_for_ide",
+    });
+    expect(
+      formatAgentTestReport({
+        startedAt: new Date().toISOString(),
+        status: "running",
+        specs: [],
+        suites: [],
+      }),
+    ).toMatchObject({
+      available: true,
+      action: "wait_for_ide",
+      status: "running",
+    });
   });
 });
 

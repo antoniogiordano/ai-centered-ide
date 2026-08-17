@@ -49,7 +49,12 @@ export const PlanPhaseSchema = z.object({
 });
 export type PlanPhase = z.infer<typeof PlanPhaseSchema>;
 
-export const PlanStatusSchema = z.enum(["drafting", "finalized", "executing"]);
+export const PlanStatusSchema = z.enum([
+  "drafting",
+  "finalized",
+  "checking",
+  "executing",
+]);
 export type PlanStatus = z.infer<typeof PlanStatusSchema>;
 
 /** Agent proposes the plan is ready; user confirms in UI before Build mode. */
@@ -366,9 +371,14 @@ export type SessionState = z.infer<typeof SessionStateSchema>;
 
 /**
  * Product phase for a chat session.
- * planning | building | testing (post-build verification gate)
+ * planning | checking (pre-build baseline gate) | building | testing (post-build gate)
  */
-export const ProductPhaseSchema = z.enum(["planning", "building", "testing"]);
+export const ProductPhaseSchema = z.enum([
+  "planning",
+  "checking",
+  "building",
+  "testing",
+]);
 export type ProductPhase = z.infer<typeof ProductPhaseSchema>;
 
 export function deriveProductPhase(state: {
@@ -387,6 +397,10 @@ export function deriveProductPhase(state: {
   if (state.mode === "plan" || state.planStatus === "drafting") {
     return "planning";
   }
+  // Pre-build Check (after Start Build confirm / feat branch, before development).
+  if (state.planStatus === "checking") {
+    return "checking";
+  }
   if (state.testRun?.status === "running") {
     return "testing";
   }
@@ -402,6 +416,16 @@ export function deriveProductPhase(state: {
     return "testing";
   }
   return "building";
+}
+
+/** IDE may start the pre-build Check gate (baseline lint/typecheck/unit). */
+export function canStartCheckGate(state: {
+  planStatus: string;
+  testGatePassedAt?: string | null;
+}): boolean {
+  if (state.planStatus !== "checking") return false;
+  if (state.testGatePassedAt) return false;
+  return true;
 }
 
 /** Checklist done, agent has not confirmed testing yet — prompt for propose_testing_ready. */
@@ -439,6 +463,28 @@ export function canStartTestGate(state: {
   if (state.testGatePassedAt) return false;
   if (state.buildCommitOffer) return false;
   return true;
+}
+
+/**
+ * True when the IDE owns the gate and the agent must not tank/poll:
+ * Check before first run, or Check/Test while status is `running`.
+ */
+export function isAwaitingIdeGate(state: {
+  planStatus?: string | null;
+  testRun?: { status?: string | null } | null;
+  testingConfirmedAt?: string | null;
+  testGatePassedAt?: string | null;
+}): boolean {
+  if (state.testGatePassedAt) return false;
+  if (state.testRun?.status === "running") return true;
+  if (state.planStatus === "checking" && !state.testRun) return true;
+  if (
+    state.testingConfirmedAt &&
+    (!state.testRun || state.testRun.status === "running")
+  ) {
+    return true;
+  }
+  return false;
 }
 
 export function planHasOpenWork(state: {
@@ -501,7 +547,7 @@ export const SessionSummarySchema = z.object({
   title: z.string().min(1),
   updatedAt: z.string().datetime(),
   workspaceName: z.string().nullable(),
-  /** Plan / Build / Test (per chat). */
+  /** Plan / Check / Build / Test (per chat). */
   phase: ProductPhaseSchema.default("planning"),
 });
 export type SessionSummary = z.infer<typeof SessionSummarySchema>;

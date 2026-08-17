@@ -2,7 +2,7 @@ import type { ZodType } from "zod";
 import type { RiskLevel } from "@ai-ide/shared";
 import type { ToolExecutionContext } from "./gateway.js";
 
-export type ToolPhase = "planning" | "building" | "testing";
+export type ToolPhase = "planning" | "checking" | "building" | "testing";
 
 export type ToolDefinition = {
   name: string;

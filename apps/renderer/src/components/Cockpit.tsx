@@ -1092,13 +1092,19 @@ function BuildCockpit(props: {
 
   const showTerminal = (props.state?.liveTerminals?.length ?? 0) > 0;
   const phase = props.state ? deriveProductPhase(props.state) : "building";
-  const showTestingReport = phase === "testing";
+  const showTestingReport = phase === "testing" || phase === "checking";
 
   return (
     <div className={`build-cockpit ${showTerminal ? "build-cockpit-with-terminal" : ""}`}>
       <section
         className="build-cockpit-plan"
-        aria-label={showTestingReport ? "Testing report" : "Plan"}
+        aria-label={
+          phase === "checking"
+            ? "Check report"
+            : showTestingReport
+              ? "Testing report"
+              : "Plan"
+        }
       >
         {showTestingReport ? (
           <TestingReportBoard state={props.state} />

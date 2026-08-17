@@ -17,12 +17,14 @@ function modShiftHint(key: string): string {
 }
 
 function phaseLetter(phase: string | undefined): string {
+  if (phase === "checking") return "C";
   if (phase === "building") return "B";
   if (phase === "testing") return "T";
   return "P";
 }
 
 function phaseTitle(phase: string | undefined): string {
+  if (phase === "checking") return "Check";
   if (phase === "building") return "Build";
   if (phase === "testing") return "Test";
   return "Plan";
