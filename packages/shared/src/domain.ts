@@ -223,6 +223,16 @@ export const TurnSchema = z.object({
   id: z.string().min(1),
   role: z.enum(["user", "assistant", "system", "tool"]),
   content: z.string(),
+  /**
+   * Chain of thought the model emitted while producing this turn, concatenated
+   * across every provider round it took. Present only when the provider streams
+   * reasoning and the user has thinking enabled.
+   *
+   * This is a record for the reader, not context for the model: the loop feeds
+   * reasoning back to the provider from its own in-flight message list, and
+   * rebuilding history from turns deliberately drops it.
+   */
+  reasoning: z.string().optional(),
   toolCalls: z.array(ToolCallSchema).optional(),
   toolResults: z.array(ToolResultSchema).optional(),
   attachments: z.array(AttachmentMetaSchema).optional(),
@@ -295,6 +305,127 @@ export const PendingAgentAskSchema = z.object({
 });
 export type PendingAgentAsk = z.infer<typeof PendingAgentAskSchema>;
 
+/**
+ * One thing only a human can do before the gate has any chance of passing:
+ * paste a connection string, create an OAuth client, provision a database
+ * branch. The agent declares these with request_human_setup instead of grinding
+ * a fix loop against a wall it cannot move.
+ *
+ * Env items carry their own verification: the IDE re-reads the key names of the
+ * target file (never the values) and reports which ones are filled, so the human
+ * edits the file in their editor and the checklist ticks itself. Items with no
+ * env keys are outside the IDE's reach and the human confirms them by hand.
+ */
+export const HumanSetupItemSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1).max(200),
+  /** Where to get the value / what to click, in a sentence or two. */
+  detail: z.string().max(2_000).default(""),
+  /** Gitignored env file the keys belong to, relative to the workspace root. */
+  envFile: z.string().min(1).nullable().default(null),
+  envKeys: z.array(z.string().min(1)).max(20).default([]),
+  /** Keys found with a non-empty value at the last check. Values never travel. */
+  envKeysPresent: z.array(z.string().min(1)).default([]),
+  /** Where the human signs up / reads the docs. */
+  docUrl: z.string().max(500).nullable().default(null),
+  /** Manual items only: the human ticked it off. */
+  done: z.boolean().default(false),
+});
+export type HumanSetupItem = z.infer<typeof HumanSetupItemSchema>;
+
+export const HumanSetupRequestSchema = z.object({
+  id: z.string().min(1),
+  /** What is failing and why no code change can fix it. */
+  reason: z.string().min(1).max(2_000),
+  items: z.array(HumanSetupItemSchema).min(1).max(12),
+  createdAt: z.string().datetime(),
+  /** Last time the IDE verified the env keys. */
+  checkedAt: z.string().datetime().nullable().default(null),
+});
+export type HumanSetupRequest = z.infer<typeof HumanSetupRequestSchema>;
+
+/** Env items are satisfied by the file; manual items by the human ticking them. */
+export function humanSetupItemSatisfied(item: HumanSetupItem): boolean {
+  if (item.envKeys.length > 0) {
+    return item.envKeys.every((key) => item.envKeysPresent.includes(key));
+  }
+  return item.done;
+}
+
+export function humanSetupProgress(request: HumanSetupRequest | null): {
+  done: number;
+  total: number;
+} {
+  const items = request?.items ?? [];
+  return {
+    done: items.filter(humanSetupItemSatisfied).length,
+    total: items.length,
+  };
+}
+
+/** True while at least one declared item is still not satisfied. */
+export function humanSetupBlocking(
+  request: HumanSetupRequest | null | undefined,
+): boolean {
+  if (!request) return false;
+  return request.items.some((item) => !humanSetupItemSatisfied(item));
+}
+
+/**
+ * A banner the human must see: harness intercepts (vision dropped the pixels)
+ * or the agent calling `post_notice`. Unlike a transcript line, this sits in
+ * the chrome until dismissed or until `expiresAt`.
+ */
+export const SessionNoticeKindSchema = z.enum(["warning", "error"]);
+export type SessionNoticeKind = z.infer<typeof SessionNoticeKindSchema>;
+
+export const SessionNoticeActionSchema = z.enum(["none", "switch_model"]);
+export type SessionNoticeAction = z.infer<typeof SessionNoticeActionSchema>;
+
+export const SessionNoticeSchema = z.object({
+  id: z.string().min(1),
+  kind: SessionNoticeKindSchema,
+  title: z.string().min(1).max(200),
+  detail: z.string().max(4_000).default(""),
+  /** Tank / auto-continue wait until the human dismisses this. */
+  blocking: z.boolean().default(false),
+  expiresAt: z.string().datetime().nullable().default(null),
+  createdAt: z.string().datetime(),
+  source: z.enum(["harness", "agent"]).default("agent"),
+  action: SessionNoticeActionSchema.default("none"),
+});
+export type SessionNotice = z.infer<typeof SessionNoticeSchema>;
+
+export const HARNESS_VISION_NOTICE_ID = "harness:vision-downgrade";
+const NOTICE_CAP = 8;
+
+export function pruneExpiredNotices(
+  notices: SessionNotice[],
+  nowMs = Date.now(),
+): SessionNotice[] {
+  const kept = notices.filter(
+    (notice) => !notice.expiresAt || Date.parse(notice.expiresAt) > nowMs,
+  );
+  return kept.length === notices.length ? notices : kept;
+}
+
+export function noticesBlocking(
+  notices: SessionNotice[] | undefined,
+  nowMs = Date.now(),
+): boolean {
+  return pruneExpiredNotices(notices ?? [], nowMs).some(
+    (notice) => notice.blocking,
+  );
+}
+
+export function upsertSessionNotice(
+  notices: SessionNotice[],
+  notice: SessionNotice,
+): SessionNotice[] {
+  const without = notices.filter((item) => item.id !== notice.id);
+  return [notice, ...without].slice(0, NOTICE_CAP);
+}
+
 export const SessionStateSchema = z.object({
   sessionId: z.string().min(1),
   sequence: z.number().int().nonnegative(),
@@ -319,6 +450,8 @@ export const SessionStateSchema = z.object({
    * Used as default merge/PR target after the test gate.
    */
   buildBaseBranch: z.string().nullable().default(null),
+  /** Feat branch created at Start Build, if any. Used to discard the branch. */
+  featBranch: z.string().nullable().default(null),
   /**
    * Set when the post-build commit/integrate flow finished (commit + merge/PR,
    * or skipped). Enables the Archive chat banner. Cleared on Start Build.
@@ -339,10 +472,26 @@ export const SessionStateSchema = z.object({
    */
   testGateAutoFixAttempts: z.number().int().nonnegative().default(0),
   /**
-   * When true (paid provider only), the IDE stops auto-injecting test-gate
-   * continue prompts until the user hits Resume.
+   * When true, the IDE stops auto-injecting test-gate continue prompts until
+   * the user hits Resume. Opened by the paid auto-fix limit, by a fix loop
+   * that keeps reading without editing, or by setup only a human can do.
    */
   testGateCircuitOpen: z.boolean().default(false),
+  /**
+   * Why the circuit opened, so the UI can say it instead of always blaming the
+   * paid limit. Null while the circuit is closed.
+   */
+  testGateCircuitReason: z
+    .enum(["paid_limit", "stalled", "human_setup"])
+    .nullable()
+    .default(null),
+  /**
+   * Blocking manual setup the agent asked for (request_human_setup). Persisted:
+   * creating a database branch or an OAuth client can outlive the IDE process.
+   */
+  humanSetup: HumanSetupRequestSchema.nullable().default(null),
+  /** Chrome banners (harness intercepts + agent post_notice). */
+  notices: z.array(SessionNoticeSchema).max(8).default([]),
   /** Fingerprint of the last failed gate (suite ids + error signal). */
   testGateFailureFingerprint: z.string().nullable().default(null),
   /** Consecutive gate failures with the same fingerprint. */
@@ -375,6 +524,8 @@ export const SessionStateSchema = z.object({
   ]),
   /** Live assistant text while streaming (Cursor-style). */
   partialAssistantText: z.string().nullable(),
+  /** Live chain of thought for the turn in flight; folded into the turn at the end. */
+  partialReasoningText: z.string().nullable().default(null),
   /** Human-readable activity: "Thinking…", "Reading README.md…". */
   activityLabel: z.string().nullable(),
   /** In-flight / just-finished tools for the current turn (transcript rows). */
@@ -640,13 +791,58 @@ export class AppError extends Error {
   }
 }
 
+/**
+ * Turn a thrown value into text a human can read. `String({…})` is
+ * `[object Object]`, which is what used to land in the session error banner
+ * when the AI SDK (or a proxy) failed with a plain object instead of Error.
+ */
+export function stringifyUnknownError(error: unknown, depth = 0): string {
+  if (error == null || depth > 4) return "";
+  if (typeof error === "string") return error.trim();
+  if (typeof error === "number" || typeof error === "boolean") {
+    return String(error);
+  }
+  if (error instanceof Error) {
+    const msg = error.message.trim();
+    const cause =
+      "cause" in error ? stringifyUnknownError(error.cause, depth + 1) : "";
+    if (msg && msg !== "[object Object]") {
+      if (cause && !msg.includes(cause)) return `${msg}: ${cause}`;
+      return msg;
+    }
+    return cause || error.name || "";
+  }
+  if (typeof error === "object") {
+    const rec = error as Record<string, unknown>;
+    const nested = [
+      stringifyUnknownError(rec.message, depth + 1),
+      stringifyUnknownError(rec.error, depth + 1),
+      stringifyUnknownError(rec.cause, depth + 1),
+      typeof rec.responseBody === "string" ? rec.responseBody.trim() : "",
+      stringifyUnknownError(rec.data, depth + 1),
+    ].find((part) => part && part !== "[object Object]");
+    if (nested) return nested;
+    try {
+      const json = JSON.stringify(error);
+      if (json && json !== "{}" && json !== "[]" && json !== "[object Object]") {
+        return json.slice(0, 2000);
+      }
+    } catch {
+      /* circular */
+    }
+  }
+  const fallback = String(error);
+  return fallback === "[object Object]" ? "" : fallback;
+}
+
 /** Session / UI string: user message plus technical detail when useful. */
 export function formatAppErrorDisplay(error: {
   userMessage: string;
   technicalDetail?: string | null;
 }): string {
   const user = error.userMessage.trim();
-  const detail = (error.technicalDetail ?? "").trim();
+  const raw = (error.technicalDetail ?? "").trim();
+  const detail = raw === "[object Object]" ? "" : raw;
   if (!detail || detail === user) return user || "Unknown error.";
   if (user.includes(detail)) return user;
   const capped = detail.length > 1200 ? `${detail.slice(0, 1197)}…` : detail;
@@ -675,12 +871,16 @@ export function createEmptySessionState(sessionId: string): SessionState {
     buildCommitOffer: null,
     buildIntegrateOffer: null,
     buildBaseBranch: null,
+    featBranch: null,
     buildFlowCompletedAt: null,
     testRun: null,
     testingConfirmedAt: null,
     testGatePassedAt: null,
     testGateAutoFixAttempts: 0,
     testGateCircuitOpen: false,
+    testGateCircuitReason: null,
+    humanSetup: null,
+    notices: [],
     testGateFailureFingerprint: null,
     testGateSameFailureStreak: 0,
     testGateEscalationLevel: 0,
@@ -690,6 +890,7 @@ export function createEmptySessionState(sessionId: string): SessionState {
     activeToolCallId: null,
     status: "idle",
     partialAssistantText: null,
+    partialReasoningText: null,
     activityLabel: null,
     liveTools: [],
     liveTerminals: [],

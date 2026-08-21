@@ -5,15 +5,35 @@ import type {
   AgentMode,
   AttachmentMeta,
   AttachmentPayload,
+  HumanSetupItem,
+  HumanSetupRequest,
+  SessionNotice,
+  SessionLog,
+  SessionOutcome,
   SessionState,
   SessionSummary,
   TestSuiteResult,
+  Turn,
   WorkspaceRef,
 } from "@ai-ide/shared";
 import {
   accumulateSessionModelUsage,
+  applyUsageToSessionLog,
+  appendSessionError,
   createEmptySessionState,
   deriveProductPhase,
+  emptySessionLog,
+  ensurePhaseSlice,
+  setSessionOutcome,
+  formatHumanSetupResumeMessage,
+  stringifyUnknownError,
+  HARNESS_VISION_NOTICE_ID,
+  humanSetupBlocking,
+  humanSetupItemSatisfied,
+  noticesBlocking,
+  pruneExpiredNotices,
+  upsertSessionNotice,
+  presentEnvKeys,
   planHasOpenWork,
   planBuildComplete,
   awaitsTestingConfirm,
@@ -29,11 +49,13 @@ import {
   fingerprintTestFailure,
   failedSuiteIds,
   TEST_FAILURE_CONTINUE_USER_MESSAGE,
+  inferProviderKind,
+  isMeteredModel,
   type ProviderUsage,
   type SessionModelUsage,
 } from "@ai-ide/shared";
 import type { ProjectStorage } from "@ai-ide/storage";
-import { MockProvider, OpenAiCompatibleProvider } from "@ai-ide/provider";
+import { AiSdkProvider, MockProvider, type AiProvider } from "@ai-ide/provider";
 import {
   applyPlanAnswers,
   applyRejectPlanReady,
@@ -55,12 +77,19 @@ import {
   GitService,
   GhCli,
 } from "@ai-ide/workspace";
-import type { AgentAskAnswer, AskHost, TerminalHost } from "@ai-ide/tools";
+import type {
+  AgentAskAnswer,
+  AskHost,
+  HumanSetupHost,
+  NoticeHost,
+  TerminalHost,
+} from "@ai-ide/tools";
 import { discoverE2eScreenshots, runTestSuites } from "@ai-ide/tools";
 import { app, shell } from "electron";
 import type { CredentialStore } from "@ai-ide/storage";
 import { getAppCredential } from "@ai-ide/storage";
 import { TerminalManager } from "./terminals.js";
+import { PreviewManager, type PreviewHost } from "./preview.js";
 import { CbmEngine } from "./engine/cbm-engine.js";
 import type { CbmHost } from "@ai-ide/tools";
 import { ProviderRegistryStore } from "./provider-registry.js";
@@ -173,6 +202,24 @@ function isBusy(status: SessionState["status"]): boolean {
   );
 }
 
+/**
+ * Turn `catch (error)` into something the user can act on.
+ *
+ * An aborted stream or a native binding can throw an Error whose `message` is
+ * empty; the session then sat in status "error" with nothing on screen and every
+ * auto-continue path refusing to run. The stack goes to the dev log because
+ * nothing else in the app records why a turn died.
+ */
+function describeTurnFailure(error: unknown): string {
+  console.error("[session] turn failed", error);
+  const text = stringifyUnknownError(error);
+  if (text && text !== "[object Object]") return text;
+  if (error instanceof Error) {
+    return `${error.name || "Error"} thrown without a message. See the dev log for the stack.`;
+  }
+  return "The turn failed without an error message.";
+}
+
 function summarizeStreamingToolArgs(
   name: string,
   argumentsJson: string,
@@ -239,7 +286,16 @@ export class SessionManager {
   private readonly terminals = new TerminalManager();
   private terminalHost: TerminalHost;
   private askHost: AskHost;
+  private humanSetupHost: HumanSetupHost;
+  private noticeHost: NoticeHost;
+  /**
+   * Blocking manual setup, owned by the manager. An agent turn returns the state
+   * it started from, so a checklist declared mid-turn would be dropped when the
+   * turn ends — the same reason providerHud is re-attached on every push.
+   */
+  private humanSetupStore: HumanSetupRequest | null = null;
   private readonly engine = new CbmEngine();
+  private preview: PreviewManager;
   private cbmHost: CbmHost;
   private confirmWaiters = new Map<
     string,
@@ -271,6 +327,7 @@ export class SessionManager {
   /** After Cancel on Start Build — do not tank-continue until the user chats. */
   private planningPausedUntilUserMessage = false;
   private providerStore: ProviderRegistryStore | null = null;
+  private sessionLog: SessionLog;
   /** Full logs from the last IDE test-gate run (suiteId → text). */
   private testLogs = new Map<string, string>();
   /** After a failed gate, only re-run once the agent mutates the workspace. */
@@ -298,7 +355,15 @@ export class SessionManager {
     this.createdAt = boot.createdAt;
     this.terminalHost = this.createTerminalHost();
     this.askHost = this.createAskHost();
+    this.humanSetupHost = this.createHumanSetupHost();
+    this.noticeHost = this.createNoticeHost();
+    this.humanSetupStore = boot.state.humanSetup;
+    this.preview = new PreviewManager(this.createPreviewHost());
     this.cbmHost = this.createCbmHost();
+    this.sessionLog = this.loadOrCreateSessionLog(
+      this.state,
+      this.createdAt,
+    );
     this.terminals.onChange(() => this.scheduleLiveTerminalSync());
     this.terminals.onChunk((event) => {
       for (const listener of this.terminalChunkListeners) listener(event);
@@ -312,6 +377,24 @@ export class SessionManager {
 
   getEngine(): CbmEngine {
     return this.engine;
+  }
+
+  getPreview(): PreviewManager {
+    return this.preview;
+  }
+
+  private createPreviewHost(): PreviewHost {
+    return {
+      workspaceRoot: () => this.state.workspace?.resolvedRootPath ?? null,
+      projectId: () => this.state.workspace?.projectId ?? null,
+      openTerminal: (opts) => this.terminals.open(opts),
+      writeTerminal: (terminalId, text) =>
+        this.terminals.writeRaw(terminalId, text),
+      closeTerminal: (terminalId) => {
+        this.terminals.close(terminalId);
+      },
+      onTerminalData: (listener) => this.terminals.onChunk(listener),
+    };
   }
 
   private createCbmHost(): CbmHost {
@@ -603,6 +686,204 @@ export class SessionManager {
     };
   }
 
+  /**
+   * Which of `keys` the env file already defines with a value.
+   *
+   * Key names only: the file is parsed in the main process and the values never
+   * reach the model, the renderer, or SQLite (see parseEnvKeyPresence).
+   */
+  private presentKeysIn(envFile: string | null, keys: string[]): string[] {
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root || !envFile || keys.length === 0) return [];
+    try {
+      return presentEnvKeys(new FilesystemService(root).read(envFile), keys);
+    } catch {
+      return [];
+    }
+  }
+
+  private recheckItems(items: HumanSetupItem[]): HumanSetupItem[] {
+    return items.map((item) => ({
+      ...item,
+      envKeysPresent: this.presentKeysIn(item.envFile, item.envKeys),
+    }));
+  }
+
+  private createNoticeHost(): NoticeHost {
+    return {
+      post: async (input) => {
+        const now = new Date();
+        const expiresAt =
+          typeof input.ttlSeconds === "number"
+            ? new Date(now.getTime() + input.ttlSeconds * 1000).toISOString()
+            : null;
+        const notice: SessionNotice = {
+          id: randomUUID(),
+          kind: input.kind,
+          title: input.title,
+          detail: input.detail ?? "",
+          blocking: Boolean(input.blocking),
+          expiresAt,
+          createdAt: now.toISOString(),
+          source: "agent",
+          action: "none",
+        };
+        this.state = {
+          ...this.state,
+          notices: upsertSessionNotice(
+            pruneExpiredNotices(this.state.notices),
+            notice,
+          ),
+        };
+        this.persist();
+        this.push();
+        return { id: notice.id, expiresAt };
+      },
+    };
+  }
+
+  dismissNotice(noticeId: string): void {
+    const next = this.state.notices.filter((item) => item.id !== noticeId);
+    if (next.length === this.state.notices.length) return;
+    this.state = { ...this.state, notices: next };
+    this.persist();
+    this.push();
+  }
+
+  private postHarnessNotice(notice: SessionNotice): void {
+    this.state = {
+      ...this.state,
+      notices: upsertSessionNotice(
+        pruneExpiredNotices(this.state.notices),
+        notice,
+      ),
+    };
+  }
+
+  private createHumanSetupHost(): HumanSetupHost {
+    return {
+      declare: async (input) => {
+        const now = new Date().toISOString();
+        const items: HumanSetupItem[] = this.recheckItems(
+          input.items.map((item) => ({
+            id: randomUUID(),
+            title: item.title,
+            detail: item.detail ?? "",
+            envFile: item.envFile ?? null,
+            envKeys: item.envKeys ?? [],
+            envKeysPresent: [],
+            docUrl: item.docUrl ?? null,
+            done: false,
+          })),
+        );
+        const request: HumanSetupRequest = {
+          id: randomUUID(),
+          reason: input.reason,
+          items,
+          createdAt: now,
+          checkedAt: now,
+        };
+        const checked = items.map((item) => ({
+          id: item.id,
+          title: item.title,
+          envFile: item.envFile,
+          presentKeys: item.envKeysPresent,
+          missingKeys: item.envKeys.filter(
+            (key) => !item.envKeysPresent.includes(key),
+          ),
+          satisfied: humanSetupItemSatisfied(item),
+        }));
+        // Nothing to ask for: keep the agent moving instead of parking the gate.
+        if (!humanSetupBlocking(request)) {
+          return { items: checked, allSatisfied: true };
+        }
+        this.humanSetupStore = request;
+        this.state = {
+          ...this.state,
+          humanSetup: request,
+          testGateCircuitOpen: true,
+          testGateCircuitReason: "human_setup",
+        };
+        this.persist();
+        this.push();
+        return { items: checked, allSatisfied: false };
+      },
+    };
+  }
+
+  /**
+   * The paid/stall circuit decides whether the digest goes back to the agent; a
+   * pending human checklist vetoes it, since the failure is not the agent's to
+   * fix (the declaration can land while the gate is still running).
+   */
+  private gateAutoContinueAllowed(autoContinue: boolean): boolean {
+    return autoContinue && !humanSetupBlocking(this.humanSetupStore);
+  }
+
+  /** Re-read the env files behind the checklist (Recheck in the banner). */
+  recheckHumanSetup(): void {
+    const current = this.humanSetupStore;
+    if (!current) return;
+    const request: HumanSetupRequest = {
+      ...current,
+      items: this.recheckItems(current.items),
+      checkedAt: new Date().toISOString(),
+    };
+    this.humanSetupStore = request;
+    this.state = { ...this.state, humanSetup: request };
+    this.persist();
+    this.push();
+  }
+
+  /** Tick a manual item (accounts, dashboards — nothing the IDE can verify). */
+  setHumanSetupItemDone(itemId: string, done: boolean): void {
+    const current = this.humanSetupStore;
+    if (!current) return;
+    const request: HumanSetupRequest = {
+      ...current,
+      items: current.items.map((item) =>
+        item.id === itemId ? { ...item, done } : item,
+      ),
+    };
+    this.humanSetupStore = request;
+    this.state = { ...this.state, humanSetup: request };
+    this.persist();
+    this.push();
+  }
+
+  /**
+   * Human is done (or gave up): close the checklist, reopen the gate, and tell
+   * the agent which keys are filled now so it does not ask for them again.
+   */
+  resolveHumanSetup(input?: { skipped?: boolean }): void {
+    const current = this.humanSetupStore;
+    if (!current) return;
+    const verified: HumanSetupRequest = {
+      ...current,
+      items: this.recheckItems(current.items),
+      checkedAt: new Date().toISOString(),
+    };
+    this.humanSetupStore = null;
+    this.testDirtySinceLastRun = true;
+    this.state = {
+      ...this.state,
+      humanSetup: null,
+      testGateCircuitOpen: false,
+      testGateCircuitReason: null,
+      testGateAutoFixAttempts: 0,
+      status: "thinking",
+      activityLabel: "Resuming after setup…",
+      error: null,
+    };
+    this.persist();
+    this.push();
+    void this.sendMessage(
+      formatHumanSetupResumeMessage(verified, {
+        skipped: Boolean(input?.skipped),
+      }),
+    );
+  }
+
   private createTerminalHost(): TerminalHost {
     return {
       open: async (opts) => {
@@ -754,7 +1035,10 @@ export class SessionManager {
     planQuestions: SessionState["planQuestions"];
     planReadyProposal: SessionState["planReadyProposal"];
     buildBaseBranch?: string | null;
+    featBranch?: string | null;
     buildFlowCompletedAt?: string | null;
+    humanSetup?: HumanSetupRequest | null;
+    notices?: SessionNotice[];
     sessionKind?: SessionState["sessionKind"];
     approvalGrants: SessionState["approvalGrants"];
     sessionModelUsage?: SessionModelUsage[];
@@ -779,7 +1063,18 @@ export class SessionManager {
       planQuestions: normalizePlanQuestions(row.planQuestions),
       planReadyProposal: row.planReadyProposal ?? null,
       buildBaseBranch: row.buildBaseBranch ?? null,
+      featBranch: row.featBranch ?? null,
       buildFlowCompletedAt: row.buildFlowCompletedAt ?? null,
+      humanSetup: row.humanSetup ?? null,
+      notices: pruneExpiredNotices(row.notices ?? []),
+      // The checklist survives a restart: creating a database branch or an OAuth
+      // client is not something the human finishes inside one IDE session.
+      ...(row.humanSetup
+        ? {
+            testGateCircuitOpen: true,
+            testGateCircuitReason: "human_setup" as const,
+          }
+        : {}),
       approvalGrants: row.approvalGrants,
       sessionModelUsage: row.sessionModelUsage ?? [],
       contextSummary: row.contextSummary ?? null,
@@ -788,6 +1083,7 @@ export class SessionManager {
       turns,
       status: "idle",
     };
+    this.humanSetupStore = state.humanSetup;
     this.storage.setPreference(ACTIVE_SESSION_KEY, row.id);
     return { state, createdAt: row.createdAt };
   }
@@ -812,6 +1108,10 @@ export class SessionManager {
   }
 
   getState(): SessionState {
+    const notices = pruneExpiredNotices(this.state.notices);
+    if (notices !== this.state.notices) {
+      this.state = { ...this.state, notices };
+    }
     return this.state;
   }
 
@@ -840,8 +1140,23 @@ export class SessionManager {
     }));
   }
 
+  /**
+   * Every push carries the tab list, and a streaming turn pushes tens of times a
+   * second — each one used to re-read and re-parse every conversation row from
+   * SQLite on the main thread. Only this class writes conversations, so a cache
+   * dropped on write is both cheap and exact.
+   */
+  private conversationRows: ReturnType<
+    ProjectStorage["listConversations"]
+  > | null = null;
+
+  private invalidateConversationRows(): void {
+    this.conversationRows = null;
+  }
+
   private conversationsForWorkspace(root: string | null) {
-    return this.storage.listConversations().filter((c) => {
+    this.conversationRows ??= this.storage.listConversations();
+    return this.conversationRows.filter((c) => {
       const path = c.workspace?.resolvedRootPath ?? null;
       return path === root;
     });
@@ -866,6 +1181,22 @@ export class SessionManager {
         ...this.state,
         providerHud: this.providerStore.buildHud(),
       };
+    }
+    // Same for the manual-setup checklist: the state an agent turn returns knows
+    // nothing about a checklist declared while that turn was running.
+    if (this.humanSetupStore && this.state.humanSetup !== this.humanSetupStore) {
+      this.state = {
+        ...this.state,
+        humanSetup: this.humanSetupStore,
+        testGateCircuitOpen: true,
+        testGateCircuitReason: "human_setup",
+      };
+    } else if (!this.humanSetupStore && this.state.humanSetup) {
+      this.state = { ...this.state, humanSetup: null };
+    }
+    const notices = pruneExpiredNotices(this.state.notices);
+    if (notices !== this.state.notices) {
+      this.state = { ...this.state, notices };
     }
     this.state = { ...this.state, sequence: this.state.sequence + 1 };
     for (const listener of this.listeners) {
@@ -893,7 +1224,10 @@ export class SessionManager {
       planQuestions: this.state.planQuestions,
       planReadyProposal: this.state.planReadyProposal,
       buildBaseBranch: this.state.buildBaseBranch,
+      featBranch: this.state.featBranch,
       buildFlowCompletedAt: this.state.buildFlowCompletedAt,
+      humanSetup: this.humanSetupStore,
+      notices: pruneExpiredNotices(this.state.notices),
       sessionKind: this.state.sessionKind,
       approvalGrants: this.state.approvalGrants,
       sessionModelUsage: this.state.sessionModelUsage,
@@ -905,6 +1239,86 @@ export class SessionManager {
     });
     this.storage.replaceTurns(this.state.sessionId, this.state.turns);
     this.storage.setPreference(ACTIVE_SESSION_KEY, this.state.sessionId);
+    this.invalidateConversationRows();
+    this.flushSessionLog();
+  }
+
+  private loadOrCreateSessionLog(
+    state: SessionState,
+    startedAt: string,
+  ): SessionLog {
+    return (
+      this.storage.getSessionLog(state.sessionId) ??
+      emptySessionLog({
+        sessionId: state.sessionId,
+        projectId: state.workspace?.projectId ?? "global",
+        title: titleFromTurns(state.turns),
+        workspaceName: state.workspace?.name ?? null,
+        startedAt,
+        featBranch: state.featBranch,
+        buildBaseBranch: state.buildBaseBranch,
+      })
+    );
+  }
+
+  private flushSessionLog(): void {
+    const now = new Date().toISOString();
+    const hud = this.state.providerHud;
+    const phase = deriveProductPhase(this.state);
+    let log =
+      this.sessionLog.sessionId === this.state.sessionId
+        ? this.sessionLog
+        : this.loadOrCreateSessionLog(this.state, this.createdAt);
+    log = {
+      ...log,
+      title: titleFromTurns(this.state.turns),
+      projectId: this.state.workspace?.projectId ?? log.projectId,
+      workspaceName: this.state.workspace?.name ?? log.workspaceName,
+      featBranch: this.state.featBranch ?? log.featBranch,
+      buildBaseBranch: this.state.buildBaseBranch ?? log.buildBaseBranch,
+      updatedAt: now,
+    };
+    log = ensurePhaseSlice(log, {
+      phase,
+      model: hud?.model ?? "unknown",
+      providerId: hud?.id ?? null,
+      providerName: hud?.name ?? "unset",
+      at: now,
+    });
+    if (this.state.error) {
+      log = appendSessionError(log, {
+        message: this.state.error,
+        phase,
+        ...(hud?.model ? { model: hud.model } : {}),
+        at: now,
+      });
+    }
+    this.sessionLog = log;
+    this.storage.upsertSessionLog(log);
+  }
+
+  private markSessionOutcome(
+    outcome: SessionOutcome,
+    detail?: string | null,
+    end = false,
+  ): void {
+    this.sessionLog = setSessionOutcome(this.sessionLog, {
+      outcome,
+      ...(detail !== undefined ? { detail } : {}),
+      end,
+    });
+    this.storage.upsertSessionLog(this.sessionLog);
+  }
+
+  listSessionLogs(): SessionLog[] {
+    const projectId = this.state.workspace?.projectId;
+    return this.storage.listSessionLogs(projectId ?? undefined);
+  }
+
+  getSessionLog(sessionId?: string): SessionLog | null {
+    const id = sessionId ?? this.state.sessionId;
+    if (id === this.sessionLog.sessionId) return this.sessionLog;
+    return this.storage.getSessionLog(id);
   }
 
   private clearTokenFlush(): void {
@@ -931,6 +1345,14 @@ export class SessionManager {
       },
     );
     this.state = { ...this.state, providerHud: hud, sessionModelUsage };
+    this.sessionLog = applyUsageToSessionLog(this.sessionLog, delta, {
+      model: hud.model ?? active?.defaultModel ?? "unknown",
+      providerId: hud.id,
+      providerName: hud.name,
+      paid: hud.paid,
+      pricing: active?.pricing ?? null,
+      phase: deriveProductPhase(this.state),
+    });
     this.persist();
     this.push();
   }
@@ -940,6 +1362,9 @@ export class SessionManager {
       this.applyProviderUsage({
         inputTokens: event.inputTokens,
         outputTokens: event.outputTokens,
+        ...(event.cachedInputTokens !== undefined
+          ? { cachedInputTokens: event.cachedInputTokens }
+          : {}),
       });
       return;
     }
@@ -962,6 +1387,20 @@ export class SessionManager {
         activityLabel: null,
         partialAssistantText: event.text,
       };
+      if (!this.tokenFlushTimer) {
+        this.tokenFlushTimer = setTimeout(() => {
+          this.tokenFlushTimer = null;
+          this.push();
+        }, 40);
+      }
+      return;
+    }
+
+    if (event.type === "reasoning") {
+      // Reasoning arrives before the answer and is far chattier, so it rides
+      // the same 40ms flush as tokens instead of pushing state per delta. The
+      // activity label is left alone: the model is still thinking.
+      this.state = { ...this.state, partialReasoningText: event.text };
       if (!this.tokenFlushTimer) {
         this.tokenFlushTimer = setTimeout(() => {
           this.tokenFlushTimer = null;
@@ -1102,6 +1541,7 @@ export class SessionManager {
     const id = randomUUID();
     const now = new Date().toISOString();
     const workspace = this.state.workspace;
+    this.humanSetupStore = null;
     this.state = {
       ...createEmptySessionState(id),
       workspace,
@@ -1113,6 +1553,7 @@ export class SessionManager {
       planSteps: [],
     };
     this.createdAt = now;
+    this.sessionLog = this.loadOrCreateSessionLog(this.state, now);
     this.persist();
     this.push(true);
     // New chat: refresh codebase graph so search_graph is not stuck on a stale/stub index.
@@ -1135,6 +1576,7 @@ export class SessionManager {
         ...this.state,
         status: "idle",
         partialAssistantText: null,
+        partialReasoningText: null,
         activityLabel: null,
         activeToolCallId: null,
         liveTools: [],
@@ -1146,13 +1588,18 @@ export class SessionManager {
     const hydrated = this.hydrateFromRow(row);
     this.state = hydrated.state;
     this.createdAt = hydrated.createdAt;
+    this.sessionLog = this.loadOrCreateSessionLog(this.state, this.createdAt);
     this.push(true);
     return this.state;
   }
 
-  closeSession(sessionId: string): SessionState {
+  closeSession(
+    sessionId: string,
+    opts?: { outcome?: SessionOutcome },
+  ): SessionState {
     const root = this.state.workspace?.resolvedRootPath ?? null;
     const scoped = this.conversationsForWorkspace(root);
+    this.finalizeClosedLog(sessionId, opts?.outcome);
     if (scoped.length <= 1 && scoped[0]?.id === sessionId) {
       // Always keep one session in this workspace — reset it instead of deleting.
       if (sessionId === this.state.sessionId && isBusy(this.state.status)) {
@@ -1162,11 +1609,14 @@ export class SessionManager {
       const id = randomUUID();
       const now = new Date().toISOString();
       this.storage.deleteConversation(sessionId);
+      this.invalidateConversationRows();
+      this.humanSetupStore = null;
       this.state = {
         ...createEmptySessionState(id),
         workspace,
       };
       this.createdAt = now;
+      this.sessionLog = this.loadOrCreateSessionLog(this.state, now);
       this.persist();
       this.push(true);
       return this.state;
@@ -1182,6 +1632,7 @@ export class SessionManager {
     if (!closingActive) {
       this.persist();
       this.storage.deleteConversation(sessionId);
+      this.invalidateConversationRows();
       this.push(true);
       return this.state;
     }
@@ -1191,11 +1642,118 @@ export class SessionManager {
     const remaining = scoped.filter((c) => c.id !== sessionId);
     const next = remaining[0]!;
     this.storage.deleteConversation(sessionId);
+    this.invalidateConversationRows();
     const hydrated = this.hydrateFromRow(next);
     this.state = hydrated.state;
     this.createdAt = hydrated.createdAt;
+    this.sessionLog = this.loadOrCreateSessionLog(this.state, this.createdAt);
     this.push(true);
     return this.state;
+  }
+
+  private finalizeClosedLog(
+    sessionId: string,
+    outcome?: SessionOutcome,
+  ): void {
+    if (sessionId === this.sessionLog.sessionId) {
+      this.flushSessionLog();
+      this.markSessionOutcome(
+        outcome ?? this.sessionLog.outcome,
+        this.sessionLog.outcomeDetail,
+        true,
+      );
+      return;
+    }
+    const log = this.storage.getSessionLog(sessionId);
+    if (!log) return;
+    this.storage.upsertSessionLog(
+      setSessionOutcome(log, {
+        outcome: outcome ?? log.outcome,
+        end: true,
+      }),
+    );
+  }
+
+  async discardSession(input: {
+    sessionId: string;
+    deleteBranch: boolean;
+  }): Promise<{
+    ok: boolean;
+    state: SessionState;
+    sessions: SessionSummary[];
+    activeSessionId: string;
+    branchDeleted?: string | null;
+    error?: { code: string; userMessage: string; technicalDetail: string };
+  }> {
+    const sessionId = input.sessionId;
+    const row =
+      sessionId === this.state.sessionId
+        ? null
+        : this.storage.getConversation(sessionId);
+    const featBranch =
+      sessionId === this.state.sessionId
+        ? this.state.featBranch
+        : (row?.featBranch ?? null);
+    const baseBranch =
+      sessionId === this.state.sessionId
+        ? this.state.buildBaseBranch
+        : (row?.buildBaseBranch ?? null);
+    let branchDeleted: string | null = null;
+
+    if (input.deleteBranch && featBranch?.startsWith("feat/")) {
+      const root = this.state.workspace?.resolvedRootPath;
+      if (!root) {
+        return {
+          ok: false,
+          state: this.state,
+          sessions: this.listSessionSummaries(),
+          activeSessionId: this.state.sessionId,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage: "Open a workspace before deleting a feat branch.",
+            technicalDetail: "no workspace",
+          },
+        };
+      }
+      try {
+        const git = new GitService(root);
+        const info = await git.branchInfo();
+        const checkout =
+          baseBranch?.trim() ||
+          (info.localBranch !== featBranch ? info.localBranch : null) ||
+          "main";
+        await git.discardLocalFeatBranch({
+          branch: featBranch,
+          checkout,
+        });
+        branchDeleted = featBranch;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          state: this.state,
+          sessions: this.listSessionSummaries(),
+          activeSessionId: this.state.sessionId,
+          error: {
+            code: "VALIDATION_ERROR",
+            userMessage:
+              detail === "DIRTY_WORKTREE"
+                ? "Working tree is dirty — commit or stash first, or confirm discarding uncommitted work."
+                : `Could not delete ${featBranch}.`,
+            technicalDetail: detail,
+          },
+        };
+      }
+    }
+
+    this.closeSession(sessionId, { outcome: "discarded" });
+    return {
+      ok: true,
+      state: this.state,
+      sessions: this.listSessionSummaries(),
+      activeSessionId: this.state.sessionId,
+      branchDeleted,
+    };
   }
 
   setMode(mode: AgentMode): void {
@@ -1438,17 +1996,21 @@ export class SessionManager {
       buildCommitOffer: null,
       buildIntegrateOffer: null,
       buildBaseBranch: rememberedBase,
+      featBranch: createdBranch ?? this.state.featBranch,
       buildFlowCompletedAt: null,
       testRun: null,
       testingConfirmedAt: null,
       testGatePassedAt: null,
       testGateAutoFixAttempts: 0,
       testGateCircuitOpen: false,
+      testGateCircuitReason: null,
       testGateFailureFingerprint: null,
       testGateSameFailureStreak: 0,
       testGateEscalationLevel: 0,
       testGateRecentSuiteKeys: [],
+      humanSetup: null,
     };
+    this.humanSetupStore = null;
     this.testLogs.clear();
     this.testDirtySinceLastRun = true;
     this.persist();
@@ -1467,6 +2029,7 @@ export class SessionManager {
     // Persist the current chat under its existing workspace — do not retarget it.
     this.persist();
     this.clearTerminalWaiters("dispose");
+    void this.preview.stop();
     this.terminals.disposeAll();
     void this.engine.detachWorkspace();
 
@@ -1515,6 +2078,7 @@ export class SessionManager {
         content: `Workspace opened: **${workspace.name}**\n\`${workspace.resolvedRootPath}\`\n\nYou can describe a goal in the composer. Mode is currently **plan**.`,
         createdAt: now,
       };
+      this.humanSetupStore = null;
       this.state = {
         ...createEmptySessionState(id),
         workspace,
@@ -1532,6 +2096,7 @@ export class SessionManager {
     this.recordRecent(workspace);
     this.persist();
     this.push(true);
+    this.preview.refreshWorkspace();
     void this.engine.attachWorkspace(workspace.resolvedRootPath);
     return workspace;
   }
@@ -1568,6 +2133,7 @@ export class SessionManager {
       status: "idle",
       error: "Interrupted by user.",
       partialAssistantText: null,
+      partialReasoningText: null,
       activityLabel: null,
       activeToolCallId: null,
       liveTools: [],
@@ -1596,6 +2162,7 @@ export class SessionManager {
       this.state = {
         ...this.state,
         testGateCircuitOpen: false,
+        testGateCircuitReason: null,
         testGateAutoFixAttempts: 0,
       };
       const digest = this.state.testRun?.digest?.trim();
@@ -1663,6 +2230,7 @@ export class SessionManager {
       status: "thinking",
       error: null,
       partialAssistantText: null,
+      partialReasoningText: null,
       activityLabel: "Thinking…",
       activeToolCallId: null,
       liveTools: [],
@@ -1698,6 +2266,8 @@ export class SessionManager {
                 checkpoint: new CheckpointService(root, checkpointRoot),
                 terminals: this.terminalHost,
                 ask: this.askHost,
+                humanSetup: this.humanSetupHost,
+                notice: this.noticeHost,
                 cbm: this.cbmHost,
                 testLogs: {
                   get: (suiteId: string) => this.testLogs.get(suiteId),
@@ -1739,15 +2309,22 @@ export class SessionManager {
       } else {
         this.pausedTurn = null;
       }
+      const visionNotice = this.visionDowngradeNotice(provider);
+      const notices = this.state.notices;
       this.state = {
         ...result.state,
+        notices,
         sequence: Math.max(this.state.sequence, result.state.sequence),
         liveTools: [],
         partialAssistantText: null,
+        partialReasoningText: null,
         activityLabel:
           result.state.status === "awaiting_approval"
             ? result.state.activityLabel
             : null,
+        ...(visionNotice
+          ? { turns: [...result.state.turns, visionNotice] }
+          : {}),
       };
       this.persist();
       this.push();
@@ -1767,8 +2344,9 @@ export class SessionManager {
       this.state = {
         ...this.state,
         status: "error",
-        error: error instanceof Error ? error.message : String(error),
+        error: describeTurnFailure(error),
         partialAssistantText: null,
+        partialReasoningText: null,
         activityLabel: null,
         activeToolCallId: null,
         liveTools: [],
@@ -1776,6 +2354,50 @@ export class SessionManager {
       this.persist();
       this.push();
     }
+  }
+
+  /**
+   * A turn whose screenshots never reached the model reads exactly like a model
+   * refusing to look at them, and the human has no way to tell the two apart.
+   * So say it in the transcript, with the endpoint's own words.
+   */
+  private visionDowngradeNotice(provider: AiProvider): Turn | null {
+    const downgrade = provider.takeVisionDowngrade?.();
+    if (!downgrade) return null;
+    const active = this.providerStore?.getActive();
+    if (active) {
+      const known = active.models?.find((entry) => entry.id === downgrade.model);
+      if (known?.vision !== true) {
+        this.providerStore?.patchModelCapabilities(active.id, downgrade.model, {
+          vision: false,
+          source: "listed",
+        });
+      }
+    }
+    this.postHarnessNotice({
+      id: HARNESS_VISION_NOTICE_ID,
+      kind: "error",
+      title: "Images were not sent",
+      detail: `\`${downgrade.model}\` refused them, so this turn ran on text only. Anything the agent says about a screenshot is a guess.\n\nEndpoint: ${downgrade.detail}\n\nSwitch to a vision model, or describe what you see.`,
+      blocking: true,
+      expiresAt: null,
+      createdAt: new Date().toISOString(),
+      source: "harness",
+      action: "switch_model",
+    });
+    return {
+      id: randomUUID(),
+      role: "assistant" as const,
+      content: [
+        `**Images were not sent.** \`${downgrade.model}\` refused them, so this turn ran on text only —`,
+        "anything the agent says about a screenshot is a guess.",
+        "",
+        `Endpoint said: \`${downgrade.detail}\``,
+        "",
+        "Switch to a vision model for this provider, or describe what you see.",
+      ].join("\n"),
+      createdAt: new Date().toISOString(),
+    };
   }
 
   /**
@@ -1788,6 +2410,10 @@ export class SessionManager {
     if (this.state.status !== "idle") return false;
     if (this.state.error) return false;
     if (this.state.pendingApprovals.length > 0) return false;
+    // The agent asked for setup only the human can do: re-kicking it now would
+    // just spend turns on a wall it cannot move.
+    if (humanSetupBlocking(this.humanSetupStore)) return false;
+    if (noticesBlocking(this.state.notices)) return false;
     const phase = deriveProductPhase(this.state);
     if (phase === "building") {
       if (!planHasOpenWork(this.state)) return false;
@@ -1828,6 +2454,8 @@ export class SessionManager {
     if (this.state.status !== "idle") return false;
     if (this.state.error) return false;
     if (this.state.pendingApprovals.length > 0) return false;
+    if (humanSetupBlocking(this.humanSetupStore)) return false;
+    if (noticesBlocking(this.state.notices)) return false;
     if (!awaitsTestingConfirm(this.state)) return false;
     this.state = {
       ...this.state,
@@ -1848,6 +2476,9 @@ export class SessionManager {
     if (this.state.status !== "idle") return;
     if (this.state.error) return;
     if (this.state.planStatus !== "checking") return;
+    // Suites would fail on the same missing credential — wait for the human.
+    if (humanSetupBlocking(this.humanSetupStore)) return;
+    if (noticesBlocking(this.state.notices)) return;
     if (!canStartCheckGate(this.state) && !this.state.testGatePassedAt) {
       return;
     }
@@ -1885,6 +2516,7 @@ export class SessionManager {
           testGatePassedAt: skippedAt,
           testGateAutoFixAttempts: 0,
           testGateCircuitOpen: false,
+          testGateCircuitReason: null,
           testGateFailureFingerprint: null,
           testGateSameFailureStreak: 0,
           testGateEscalationLevel: 0,
@@ -1966,6 +2598,7 @@ export class SessionManager {
           testGatePassedAt: finishedAt,
           testGateAutoFixAttempts: 0,
           testGateCircuitOpen: false,
+          testGateCircuitReason: null,
           testGateFailureFingerprint: null,
           testGateSameFailureStreak: 0,
           testGateEscalationLevel: 0,
@@ -2001,7 +2634,7 @@ export class SessionManager {
         "[IDE · CHECK GATE]",
       );
       const decision = decideTestGateAutoContinue({
-        paidProvider: this.isPaidActiveProvider(),
+        meteredModel: this.isMeteredActiveModel(),
         previousAttempts: this.state.testGateAutoFixAttempts,
       });
       this.state = {
@@ -2019,13 +2652,14 @@ export class SessionManager {
         testGatePassedAt: null,
         testGateAutoFixAttempts: decision.attempts,
         testGateCircuitOpen: decision.circuitOpen,
+        testGateCircuitReason: decision.circuitOpen ? "paid_limit" : null,
         testGateFailureFingerprint: escalation.fingerprint,
         testGateSameFailureStreak: escalation.sameFailureStreak,
         testGateEscalationLevel: escalation.level,
         testGateRecentSuiteKeys: escalation.recentSuiteKeys,
       };
       this.push();
-      if (decision.autoContinue) {
+      if (this.gateAutoContinueAllowed(decision.autoContinue)) {
         const shots = this.collectE2eFailureScreenshots(
           outcome.suites,
           startedAt,
@@ -2037,7 +2671,7 @@ export class SessionManager {
       }
     } catch (error) {
       const decision = decideTestGateAutoContinue({
-        paidProvider: this.isPaidActiveProvider(),
+        meteredModel: this.isMeteredActiveModel(),
         previousAttempts: this.state.testGateAutoFixAttempts,
       });
       const errDigest = `Check gate error: ${
@@ -2084,6 +2718,7 @@ export class SessionManager {
         testGatePassedAt: null,
         testGateAutoFixAttempts: decision.attempts,
         testGateCircuitOpen: decision.circuitOpen,
+        testGateCircuitReason: decision.circuitOpen ? "paid_limit" : null,
         testGateFailureFingerprint: escalation.fingerprint,
         testGateSameFailureStreak: escalation.sameFailureStreak,
         testGateEscalationLevel: escalation.level,
@@ -2091,7 +2726,7 @@ export class SessionManager {
       };
       this.testDirtySinceLastRun = true;
       this.push();
-      if (decision.autoContinue) {
+      if (this.gateAutoContinueAllowed(decision.autoContinue)) {
         void this.sendMessage(
           this.state.testRun?.digest ?? TEST_FAILURE_CONTINUE_USER_MESSAGE,
         );
@@ -2159,6 +2794,9 @@ export class SessionManager {
     if (this.state.status !== "idle") return;
     if (this.state.error) return;
     if (this.state.buildCommitOffer) return;
+    // Suites would fail on the same missing credential — wait for the human.
+    if (humanSetupBlocking(this.humanSetupStore)) return;
+    if (noticesBlocking(this.state.notices)) return;
     if (!planBuildComplete(this.state)) return;
     if (!canStartTestGate(this.state) && !this.state.testGatePassedAt) {
       // Missing testingConfirmedAt — maybePromptTestingReady handles the nudge.
@@ -2198,6 +2836,7 @@ export class SessionManager {
           testGatePassedAt: skippedAt,
           testGateAutoFixAttempts: 0,
           testGateCircuitOpen: false,
+          testGateCircuitReason: null,
           testGateFailureFingerprint: null,
           testGateSameFailureStreak: 0,
           testGateEscalationLevel: 0,
@@ -2279,6 +2918,7 @@ export class SessionManager {
           testGatePassedAt: finishedAt,
           testGateAutoFixAttempts: 0,
           testGateCircuitOpen: false,
+          testGateCircuitReason: null,
           testGateFailureFingerprint: null,
           testGateSameFailureStreak: 0,
           testGateEscalationLevel: 0,
@@ -2310,7 +2950,7 @@ export class SessionManager {
         { logs: logsRecord, escalation },
       );
       const decision = decideTestGateAutoContinue({
-        paidProvider: this.isPaidActiveProvider(),
+        meteredModel: this.isMeteredActiveModel(),
         previousAttempts: this.state.testGateAutoFixAttempts,
       });
       this.state = {
@@ -2328,13 +2968,14 @@ export class SessionManager {
         testGatePassedAt: null,
         testGateAutoFixAttempts: decision.attempts,
         testGateCircuitOpen: decision.circuitOpen,
+        testGateCircuitReason: decision.circuitOpen ? "paid_limit" : null,
         testGateFailureFingerprint: escalation.fingerprint,
         testGateSameFailureStreak: escalation.sameFailureStreak,
         testGateEscalationLevel: escalation.level,
         testGateRecentSuiteKeys: escalation.recentSuiteKeys,
       };
       this.push();
-      if (decision.autoContinue) {
+      if (this.gateAutoContinueAllowed(decision.autoContinue)) {
         const shots = this.collectE2eFailureScreenshots(
           outcome.suites,
           startedAt,
@@ -2346,7 +2987,7 @@ export class SessionManager {
       }
     } catch (error) {
       const decision = decideTestGateAutoContinue({
-        paidProvider: this.isPaidActiveProvider(),
+        meteredModel: this.isMeteredActiveModel(),
         previousAttempts: this.state.testGateAutoFixAttempts,
       });
       const errDigest = `Test gate error: ${
@@ -2393,6 +3034,7 @@ export class SessionManager {
         testGatePassedAt: null,
         testGateAutoFixAttempts: decision.attempts,
         testGateCircuitOpen: decision.circuitOpen,
+        testGateCircuitReason: decision.circuitOpen ? "paid_limit" : null,
         testGateFailureFingerprint: escalation.fingerprint,
         testGateSameFailureStreak: escalation.sameFailureStreak,
         testGateEscalationLevel: escalation.level,
@@ -2400,7 +3042,7 @@ export class SessionManager {
       };
       this.testDirtySinceLastRun = true;
       this.push();
-      if (decision.autoContinue) {
+      if (this.gateAutoContinueAllowed(decision.autoContinue)) {
         void this.sendMessage(
           this.state.testRun?.digest ?? TEST_FAILURE_CONTINUE_USER_MESSAGE,
         );
@@ -2460,9 +3102,19 @@ export class SessionManager {
     ].join("\n");
   }
 
-  private isPaidActiveProvider(): boolean {
-    if (this.state.providerHud?.paid === true) return true;
-    return this.providerStore?.getActive()?.paid === true;
+  /**
+   * Whether the model that would run the next fix turn costs money. A `:free`
+   * or zero-rated model on a paid account bills nothing, so the gate's auto-fix
+   * cap must not treat it like a metered one.
+   */
+  private isMeteredActiveModel(): boolean {
+    const active = this.providerStore?.getActive() ?? null;
+    const paid = this.state.providerHud?.paid === true || active?.paid === true;
+    return isMeteredModel({
+      paid,
+      model: this.state.providerHud?.model ?? active?.defaultModel ?? null,
+      pricing: active?.pricing ?? null,
+    });
   }
 
   private testGateToolApi() {
@@ -2679,6 +3331,130 @@ export class SessionManager {
     }
   }
 
+  async draftGitMessage(kind: "commit" | "stash"): Promise<{
+    ok: boolean;
+    message?: string;
+    files?: string[];
+    error?: { code: string; userMessage: string; technicalDetail: string };
+  }> {
+    const root = this.state.workspace?.resolvedRootPath;
+    if (!root) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage: "Open a workspace first.",
+          technicalDetail: "no workspace",
+        },
+      };
+    }
+    const git = new GitService(root);
+    const summary = await git.changeSummary();
+    if (summary.files.length === 0) {
+      return {
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          userMessage:
+            kind === "stash"
+              ? "Nothing to stash — the working tree is clean."
+              : "Nothing to commit — the working tree is clean.",
+          technicalDetail: "clean worktree",
+        },
+      };
+    }
+    const isStash = kind === "stash";
+    try {
+      const provider = await this.createProvider();
+      const messages = [
+        {
+          role: "system" as const,
+          content: isStash
+            ? [
+                "You write short git stash messages.",
+                "Reply with ONLY the stash message — no quotes, no markdown, no preamble.",
+                "One line, under 72 characters, describe the parked work.",
+              ].join("\n")
+            : [
+                "You write short git commit messages.",
+                "Reply with ONLY the commit message — no quotes, no markdown fences, no preamble.",
+                "Prefer conventional commits when it fits (feat:/fix:/chore:).",
+                "Keep it to 1–2 sentences, under 72 characters for the subject when possible.",
+              ].join("\n"),
+        },
+        {
+          role: "user" as const,
+          content: [
+            `Branch: ${this.state.featBranch ?? this.state.workspace?.name ?? "unknown"}`,
+            "Changed files:",
+            summary.files.slice(0, 40).join("\n") || "(none)",
+            "",
+            "Diff:",
+            summary.diff || "(no tracked diff — untracked files only)",
+          ].join("\n"),
+        },
+      ];
+      let text = "";
+      for await (const chunk of provider.chat(messages)) {
+        if (chunk.type === "content") text += chunk.delta;
+        if (
+          chunk.type === "done" &&
+          chunk.usage &&
+          (chunk.usage.inputTokens > 0 || chunk.usage.outputTokens > 0)
+        ) {
+          this.applyProviderUsage(chunk.usage);
+        }
+        if (chunk.type === "error") {
+          return {
+            ok: false,
+            error: {
+              code: chunk.error.code,
+              userMessage: chunk.error.userMessage,
+              technicalDetail: chunk.error.technicalDetail,
+            },
+          };
+        }
+      }
+      const message = text
+        .trim()
+        .replace(/^```[\s\S]*?\n/, "")
+        .replace(/```$/, "")
+        .replace(/^["']|["']$/g, "")
+        .trim()
+        .split("\n")[0]
+        ?.trim();
+      if (!message) {
+        return {
+          ok: false,
+          error: {
+            code: "PROVIDER_ERROR",
+            userMessage: isStash
+              ? "The model returned an empty stash name."
+              : "The model returned an empty commit message.",
+            technicalDetail: "empty draft",
+          },
+        };
+      }
+      return {
+        ok: true,
+        message: message.slice(0, isStash ? 200 : 4000),
+        files: summary.files,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          code: "PROVIDER_ERROR",
+          userMessage: isStash
+            ? "Could not draft a stash name."
+            : "Could not draft a commit message.",
+          technicalDetail:
+            error instanceof Error ? error.message : String(error),
+        },
+      };
+    }
+  }
+
   async commitBuild(message: string): Promise<{
     ok: boolean;
     commit?: string;
@@ -2735,10 +3511,11 @@ export class SessionManager {
         };
       }
       const commit = await git.commit(trimmed);
+      const committedOn = this.state.buildCommitOffer.branch ?? "HEAD";
       const notice = {
         id: randomUUID(),
         role: "assistant" as const,
-        content: `Committed on \`${this.state.buildCommitOffer.branch ?? "HEAD"}\`: ${trimmed}`,
+        content: `Committed on \`${committedOn}\`: ${trimmed}`,
         createdAt: new Date().toISOString(),
       };
       this.state = {
@@ -2746,6 +3523,7 @@ export class SessionManager {
         buildCommitOffer: null,
         turns: [...this.state.turns, notice],
       };
+      this.markSessionOutcome("commit", committedOn);
       this.persist();
       this.push();
       await this.maybeOfferIntegrate();
@@ -2827,6 +3605,10 @@ export class SessionManager {
           buildIntegrateOffer: null,
           turns: [...this.state.turns, notice],
         };
+        this.markSessionOutcome(
+          "merged",
+          `${offer.headBranch} → ${offer.baseBranch}`,
+        );
         this.persist();
         this.push();
         this.markBuildFlowCompleteIfSettled();
@@ -2859,6 +3641,7 @@ export class SessionManager {
         buildIntegrateOffer: null,
         turns: [...this.state.turns, notice],
       };
+      this.markSessionOutcome("pr", pr.url);
       this.persist();
       this.push();
       this.markBuildFlowCompleteIfSettled();
@@ -2887,12 +3670,19 @@ export class SessionManager {
     const active = store?.getActive() ?? null;
     if (active) {
       const apiKey = (await store!.getApiKey(active.id)) || "";
-      return new OpenAiCompatibleProvider({
+      const catalogEntry = active.models?.find(
+        (entry) => entry.id === active.defaultModel,
+      );
+      return new AiSdkProvider({
+        kind: active.kind,
         baseUrl: active.baseUrl,
         apiKey,
         defaultModel: active.defaultModel || "gpt-4o-mini",
         thinking: active.thinking,
         reasoningEffort: active.reasoningEffort,
+        ...(catalogEntry?.vision === false ? { visionSupported: false } : {}),
+        ...(catalogEntry?.vision === true ? { visionSupported: true } : {}),
+        ...(catalogEntry?.tools === false ? { toolsSupported: false } : {}),
       });
     }
 
@@ -2905,7 +3695,8 @@ export class SessionManager {
       ? await getAppCredential(this.credentials, "default")
       : null;
     if (cfg?.baseUrl) {
-      return new OpenAiCompatibleProvider({
+      return new AiSdkProvider({
+        kind: inferProviderKind(cfg.baseUrl),
         baseUrl: cfg.baseUrl,
         apiKey: apiKey ?? "",
         defaultModel: cfg.defaultModel || "gpt-4o-mini",
@@ -2989,6 +3780,8 @@ export class SessionManager {
                 checkpoint: new CheckpointService(root, checkpointRoot),
                 terminals: this.terminalHost,
                 ask: this.askHost,
+                humanSetup: this.humanSetupHost,
+                notice: this.noticeHost,
                 cbm: this.cbmHost,
                 testLogs: {
                   get: (suiteId: string) => this.testLogs.get(suiteId),
@@ -3030,15 +3823,22 @@ export class SessionManager {
       } else {
         this.pausedTurn = null;
       }
+      const visionNotice = this.visionDowngradeNotice(provider);
+      const notices = this.state.notices;
       this.state = {
         ...result.state,
+        notices,
         sequence: Math.max(this.state.sequence, result.state.sequence),
         liveTools: [],
         partialAssistantText: null,
+        partialReasoningText: null,
         activityLabel:
           result.state.status === "awaiting_approval"
             ? result.state.activityLabel
             : null,
+        ...(visionNotice
+          ? { turns: [...result.state.turns, visionNotice] }
+          : {}),
       };
       this.persist();
       this.push();
@@ -3058,8 +3858,9 @@ export class SessionManager {
       this.state = {
         ...this.state,
         status: "error",
-        error: error instanceof Error ? error.message : String(error),
+        error: describeTurnFailure(error),
         partialAssistantText: null,
+        partialReasoningText: null,
         activityLabel: null,
         activeToolCallId: null,
         liveTools: [],
@@ -3108,6 +3909,7 @@ export class SessionManager {
   async dispose(): Promise<void> {
     this.abort?.abort();
     this.clearTerminalWaiters("dispose");
+    await this.preview.dispose();
     this.terminals.disposeAll();
     await this.engine.detachWorkspace();
   }

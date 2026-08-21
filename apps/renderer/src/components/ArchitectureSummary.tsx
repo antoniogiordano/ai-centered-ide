@@ -21,6 +21,7 @@ function chipList(profile: ArchitectureProfile | null): string[] {
   const chips: string[] = [];
   if (profile.repo?.packageManager) chips.push(profile.repo.packageManager);
   if (profile.repo?.shape) chips.push(profile.repo.shape);
+  if (profile.dev?.command) chips.push(`preview ${profile.dev.command}`);
   for (const r of profile.runtimes) {
     chips.push(r.version ? `${r.id} ${r.version}` : r.id);
   }

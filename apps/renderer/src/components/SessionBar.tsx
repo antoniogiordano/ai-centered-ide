@@ -7,7 +7,15 @@ import {
   type SessionSummary,
 } from "@ai-ide/shared";
 import { getBridge } from "../bridge";
+import { DiscardSessionDialog } from "./DiscardSessionDialog";
 import { SessionsDialog } from "./SessionsDialog";
+
+function modHint(key: string): string {
+  const isApple =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  return isApple ? `⌘${key}` : `Ctrl+${key}`;
+}
 
 function modShiftHint(key: string): string {
   const isApple =
@@ -34,10 +42,29 @@ export function SessionBar(props: {
   state: SessionState | null;
   sessions: SessionSummary[];
   activeSessionId: string | null;
+  onAddSession: () => void;
+  workspaceReady?: boolean;
+  previewOpen?: boolean;
+  planOpen?: boolean;
+  onTogglePreview?: () => void;
+  onTogglePlan?: () => void;
+  onOpenStats?: () => void;
 }) {
-  const { state, sessions, activeSessionId } = props;
+  const {
+    state,
+    sessions,
+    activeSessionId,
+    onAddSession,
+    workspaceReady,
+    previewOpen,
+    planOpen,
+    onTogglePreview,
+    onTogglePlan,
+    onOpenStats,
+  } = props;
   const bridge = getBridge();
   const [sessionsOpen, setSessionsOpen] = useState(false);
+  const [discardId, setDiscardId] = useState<string | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
     "idle",
   );
@@ -105,7 +132,7 @@ export function SessionBar(props: {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (sessionsOpen) return;
+      if (sessionsOpen || discardId) return;
       const tag = (e.target as HTMLElement | null)?.tagName;
       const typing =
         tag === "INPUT" ||
@@ -115,17 +142,22 @@ export function SessionBar(props: {
       if (typing) return;
       if (e.key.toLowerCase() === "n" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
-        void bridge?.session.create();
+        onAddSession();
         return;
       }
       if (e.key === "ArrowDown" && !e.metaKey && !e.ctrlKey) {
         e.preventDefault();
         setSessionsOpen(true);
+        return;
+      }
+      if (e.key === "Backspace" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        if (activeSessionId) setDiscardId(activeSessionId);
       }
     }
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [bridge, sessionsOpen]);
+  }, [bridge, sessionsOpen, discardId, activeSessionId, onAddSession]);
 
   const copyLabel =
     copyState === "copied"
@@ -181,6 +213,32 @@ export function SessionBar(props: {
           </div>
         </div>
         <div className="session-bar-actions">
+          {workspaceReady && onTogglePreview ? (
+            <button
+              type="button"
+              className={`btn btn-secondary btn-sm session-bar-action ${
+                previewOpen ? "workspace-bar-action-active" : ""
+              }`}
+              title={`Live preview of the running app (${modShiftHint("P")})`}
+              aria-pressed={previewOpen}
+              onClick={onTogglePreview}
+            >
+              Preview · {modShiftHint("P")}
+            </button>
+          ) : null}
+          {workspaceReady && onTogglePlan ? (
+            <button
+              type="button"
+              className={`btn btn-secondary btn-sm session-bar-action ${
+                planOpen ? "workspace-bar-action-active" : ""
+              }`}
+              title={`Plan and checklist (${modShiftHint("L")})`}
+              aria-pressed={planOpen}
+              onClick={onTogglePlan}
+            >
+              Plan · {modShiftHint("L")}
+            </button>
+          ) : null}
           <div className="btn-group" role="group" aria-label="Copy chat">
             <button
               type="button"
@@ -204,8 +262,18 @@ export function SessionBar(props: {
           <button
             type="button"
             className="btn btn-secondary btn-sm session-bar-action"
+            title={`Discard session (${modHint("⌫")})`}
+            onClick={() => {
+              if (activeSessionId) setDiscardId(activeSessionId);
+            }}
+          >
+            Discard · {modHint("⌫")}
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm session-bar-action"
             title="Add session · N"
-            onClick={() => void bridge?.session.create()}
+            onClick={onAddSession}
           >
             Add · N
           </button>
@@ -227,6 +295,30 @@ export function SessionBar(props: {
         sessions={tabSessions}
         activeSessionId={activeSessionId}
         onClose={() => setSessionsOpen(false)}
+        onDiscard={(id) => {
+          setSessionsOpen(false);
+          setDiscardId(id);
+        }}
+        {...(onOpenStats
+          ? {
+              onOpenStats: () => {
+                setSessionsOpen(false);
+                onOpenStats();
+              },
+            }
+          : {})}
+      />
+      <DiscardSessionDialog
+        open={Boolean(discardId)}
+        sessionId={discardId}
+        title={
+          tabSessions.find((s) => s.id === discardId)?.title ?? title
+        }
+        featBranch={
+          discardId === activeSessionId ? (state?.featBranch ?? null) : null
+        }
+        onClose={() => setDiscardId(null)}
+        onDiscarded={() => setDiscardId(null)}
       />
     </>
   );

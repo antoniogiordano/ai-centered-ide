@@ -76,7 +76,15 @@ export type ChatChunk =
   | {
       type: "done";
       finishReason: string;
-      usage?: { inputTokens: number; outputTokens: number };
+      usage?: {
+        inputTokens: number;
+        outputTokens: number;
+        /**
+         * Subset of inputTokens served from the provider's prompt cache, when
+         * the endpoint reports it. Billed at the cache-hit rate downstream.
+         */
+        cachedInputTokens?: number;
+      };
     }
   | { type: "error"; error: AppError };
 
@@ -92,6 +100,12 @@ export type ModelInfo = {
   contextWindowTokens?: number;
 };
 
+/** A turn whose images were stripped, and the endpoint's own reason. */
+export type VisionDowngrade = {
+  model: string;
+  detail: string;
+};
+
 export interface AiProvider {
   listModels(): Promise<ModelInfo[]>;
   chat(
@@ -99,6 +113,8 @@ export interface AiProvider {
     options?: ChatOptions,
   ): AsyncIterable<ChatChunk>;
   cancel(requestId?: string): void;
+  /** Present on providers that can silently fall back to text-only. */
+  takeVisionDowngrade?(): VisionDowngrade | null;
 }
 
 export type ProviderErrorKind =

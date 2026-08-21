@@ -33,8 +33,11 @@ export function SessionsDialog(props: {
   sessions: SessionSummary[];
   activeSessionId: string | null;
   onClose: () => void;
+  onDiscard?: (sessionId: string) => void;
+  onOpenStats?: () => void;
 }) {
-  const { open, sessions, activeSessionId, onClose } = props;
+  const { open, sessions, activeSessionId, onClose, onDiscard, onOpenStats } =
+    props;
   const bridge = getBridge();
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -49,12 +52,21 @@ export function SessionsDialog(props: {
         return;
       }
       if (isTypingTarget(e.target)) return;
+      if (e.key.toLowerCase() === "s" && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        onOpenStats?.();
+        return;
+      }
       const digit = /^Digit([1-9])$/.exec(e.code);
       if (digit) {
         const idx = Number(digit[1]) - 1;
         const session = sessions[idx];
         if (!session) return;
         e.preventDefault();
+        if (e.altKey && e.metaKey) {
+          onDiscard?.(session.id);
+          return;
+        }
         if (e.altKey) {
           void bridge?.session.close(session.id);
           return;
@@ -67,7 +79,7 @@ export function SessionsDialog(props: {
     }
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, sessions, activeSessionId, bridge, onClose]);
+  }, [open, sessions, activeSessionId, bridge, onClose, onDiscard, onOpenStats]);
 
   if (!open) return null;
 
@@ -88,13 +100,24 @@ export function SessionsDialog(props: {
               Switch chat
             </h2>
           </div>
-          <button
-            type="button"
-            className="btn btn-secondary btn-sm"
-            onClick={onClose}
-          >
-            Close · Esc
-          </button>
+          <div className="btn-group">
+            {onOpenStats ? (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={onOpenStats}
+              >
+                Stats · S
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={onClose}
+            >
+              Close · Esc
+            </button>
+          </div>
         </div>
         <div className="provider-dialog-body">
           <p className="provider-dialog-lead">
@@ -148,6 +171,15 @@ export function SessionsDialog(props: {
                   >
                     Close{index < 9 ? ` · ⌥${index + 1}` : ""}
                   </button>
+                  {onDiscard ? (
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => onDiscard(session.id)}
+                    >
+                      Discard{index < 9 ? ` · ⌘⌥${index + 1}` : ""}
+                    </button>
+                  ) : null}
                 </li>
               );
             })}

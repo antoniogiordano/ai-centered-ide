@@ -35,6 +35,8 @@ const TOOL_RISK: Record<string, RiskLevel> = {
   web_search: "safe",
   read_image: "safe",
   ask_user: "safe",
+  request_human_setup: "safe",
+  post_notice: "safe",
   git_commit: "sensitive",
   run_command: "sensitive",
   get_test_report: "safe",
@@ -146,9 +148,15 @@ export const COMMAND_DENYLIST = [
 const HARNESS_ONLY_GIT_RE =
   /\bgit\s+(commit|push|rebase|am|cherry-pick)(?:\s|$)/i;
 
+/**
+ * Classify a shell command. `blocked` is the only verdict that stops execution:
+ * the denylist and the harness-only git ops are the hard gate, and everything
+ * else is ordinary build work that the mode matrix and the checkpoint system
+ * already govern. `allowlisted` marks the read-only commands, which are safe to
+ * surface without ceremony.
+ */
 export function analyzeCommand(command: string): {
   blocked: boolean;
-  needsApproval: boolean;
   matchedDeny?: string;
   allowlisted: boolean;
 } {
@@ -157,26 +165,21 @@ export function analyzeCommand(command: string): {
   if (harnessGit) {
     return {
       blocked: true,
-      needsApproval: true,
       matchedDeny: `git ${harnessGit[1]!.toLowerCase()}`,
       allowlisted: false,
     };
   }
   for (const denied of COMMAND_DENYLIST) {
     if (normalized.includes(denied.toLowerCase())) {
-      return { blocked: true, needsApproval: true, matchedDeny: denied, allowlisted: false };
+      return { blocked: true, matchedDeny: denied, allowlisted: false };
     }
   }
-  const allowlisted = READONLY_COMMAND_ALLOWLIST.some((allowed) =>
-    normalized.startsWith(allowed.toLowerCase()),
-  );
-  if (allowlisted) {
-    return { blocked: false, needsApproval: false, allowlisted: true };
-  }
-  if (/&&|\||;|`|\$\(/.test(normalized)) {
-    return { blocked: false, needsApproval: true, allowlisted: false };
-  }
-  return { blocked: false, needsApproval: true, allowlisted: false };
+  return {
+    blocked: false,
+    allowlisted: READONLY_COMMAND_ALLOWLIST.some((allowed) =>
+      normalized.startsWith(allowed.toLowerCase()),
+    ),
+  };
 }
 
 const SHELL_FILE_INSPECT_BIN = new Set([

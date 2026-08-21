@@ -24,6 +24,9 @@ const UI_NEW_PROJECT = "ui:new-project";
 const UI_NEW_SESSION = "ui:new-session";
 const UI_OPEN_PROVIDER = "ui:open-provider";
 const UI_TOGGLE_ARCHITECTURE = "ui:toggle-architecture";
+const UI_TOGGLE_PREVIEW = "ui:toggle-preview";
+const UI_TOGGLE_PLAN = "ui:toggle-plan";
+const UI_TOGGLE_MODEL = "ui:toggle-model";
 
 type WindowState = {
   x?: number;
@@ -223,6 +226,22 @@ function installAppMenu(): void {
     {
       label: "View",
       submenu: [
+        {
+          label: "Live Preview",
+          accelerator: "CommandOrControl+Shift+P",
+          click: () => send(UI_TOGGLE_PREVIEW),
+        },
+        {
+          label: "Plan",
+          accelerator: "CommandOrControl+Shift+L",
+          click: () => send(UI_TOGGLE_PLAN),
+        },
+        {
+          label: "Switch Model",
+          accelerator: "CommandOrControl+Shift+M",
+          click: () => send(UI_TOGGLE_MODEL),
+        },
+        { type: "separator" },
         { role: "reload" },
         { role: "toggleDevTools" },
         { type: "separator" },
@@ -257,13 +276,16 @@ export function createMainWindow(_storage: ProjectStorage): BrowserWindow {
     ...(typeof windowState.x === "number" ? { x: windowState.x } : {}),
     ...(typeof windowState.y === "number" ? { y: windowState.y } : {}),
     show: false,
-    backgroundColor: "#0f1218",
+    backgroundColor: "#eef3f8",
     webPreferences: {
       preload: join(__dirname, "preload/index.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
+      // Guest page lives in a <webview> so it paints inside the preview hole.
+      // WebContentsView stays behind the renderer on Electron 36 / macOS.
+      webviewTag: true,
     },
   });
 
@@ -354,6 +376,21 @@ export function createMainWindow(_storage: ProjectStorage): BrowserWindow {
       win.webContents.send(UI_NEW_PROJECT);
       return;
     }
+    if (input.shift && key === "p") {
+      event.preventDefault();
+      win.webContents.send(UI_TOGGLE_PREVIEW);
+      return;
+    }
+    if (input.shift && key === "l") {
+      event.preventDefault();
+      win.webContents.send(UI_TOGGLE_PLAN);
+      return;
+    }
+    if (input.shift && key === "m") {
+      event.preventDefault();
+      win.webContents.send(UI_TOGGLE_MODEL);
+      return;
+    }
     if (input.shift) return;
 
     const channel =
@@ -427,11 +464,17 @@ app.whenReady().then(async () => {
   const credentials = await createKeytarCredentialStore();
   session.setCredentials(credentials);
   registerIpcHandlers(session, credentials, storage);
+  app.on("web-contents-created", (_event, contents) => {
+    if (contents.getType() !== "webview") return;
+    session.getPreview().attachGuest(contents);
+  });
   mainWindow = createMainWindow(storage);
+  session.getPreview().attachWindow(mainWindow);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0 && appStorage) {
       mainWindow = createMainWindow(appStorage);
+      if (appSession) appSession.getPreview().attachWindow(mainWindow);
     }
   });
 });

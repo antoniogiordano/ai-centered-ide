@@ -547,6 +547,7 @@ export class ArchitectureStore {
       "quality",
       "data",
       "api",
+      "dev",
     ] as const) {
       if ((overrides as Record<string, unknown>)[key] !== undefined) {
         sources[key] = source;

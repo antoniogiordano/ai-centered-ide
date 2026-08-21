@@ -7,7 +7,11 @@ import type {
 } from "@ai-ide/provider";
 import { chatContentText } from "@ai-ide/provider";
 import type { SessionState, ToolCall, ToolResult, Turn } from "@ai-ide/shared";
-import { formatAppErrorDisplay } from "@ai-ide/shared";
+import {
+  formatAppErrorDisplay,
+  MAX_GATE_EVIDENCE_ROUNDS,
+  MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT,
+} from "@ai-ide/shared";
 import {
   ToolGateway,
   createDefaultRegistry,
@@ -29,6 +33,7 @@ import {
   planChecklistProgress,
   planHasOpenWork,
   PLAN_CONTINUE_NUDGE,
+  sanitizeProviderMessagesInPlace,
   TEST_CONTINUE_NUDGE,
   productPhaseForState,
   tryParsePartialJson,
@@ -46,8 +51,40 @@ function isTankMode(state: SessionState): boolean {
 
 const GATE_EDIT_TOOLS = new Set(["write_file", "replace_in_file"]);
 
-/** In-loop Check/Test tank: stop after this many rounds with no successful edits. */
-export const MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT = 6;
+/**
+ * Evidence the gate itself told the agent to fetch. Pulling a piece of it for
+ * the first time is the work we asked for, not thrash — a failed e2e suite
+ * costs a report, the failed titles, a log chunk and a screenshot before any
+ * edit can be justified.
+ */
+const GATE_EVIDENCE_TOOLS = new Set([
+  "get_test_report",
+  "list_failed_tests",
+  "read_test_log",
+  "read_image",
+]);
+
+/** Per-turn thrash budget for the Check/Test fix tank. */
+export type GateFixBudget = {
+  roundsWithoutEdit: number;
+  /** Evidence already fetched this turn, so re-reading it counts as thrash. */
+  evidenceSeen: Set<string>;
+  evidenceRoundsLeft: number;
+};
+
+export function newGateFixBudget(): GateFixBudget {
+  return {
+    roundsWithoutEdit: 0,
+    evidenceSeen: new Set(),
+    evidenceRoundsLeft: MAX_GATE_EVIDENCE_ROUNDS,
+  };
+}
+
+/** One round of the tank: the executed batch, or null when the model only narrated. */
+export type GateFixRound = {
+  toolCalls: ToolCall[];
+  results: ToolResult[];
+} | null;
 
 function batchHadSuccessfulEdit(
   toolCalls: ToolCall[],
@@ -61,39 +98,86 @@ function batchHadSuccessfulEdit(
   return false;
 }
 
+function evidenceKey(call: ToolCall): string {
+  const args = call.arguments ?? {};
+  const stable = Object.keys(args)
+    .sort()
+    .map((k) => `${k}=${JSON.stringify(args[k])}`)
+    .join("&");
+  return `${call.name}(${stable})`;
+}
+
+/** Evidence keys this batch fetched successfully and had not fetched before. */
+function freshEvidenceKeys(
+  toolCalls: ToolCall[],
+  batchResults: ToolResult[],
+  seen: Set<string>,
+): string[] {
+  const byId = new Map(batchResults.map((r) => [r.callId, r]));
+  const fresh: string[] = [];
+  for (const call of toolCalls) {
+    if (!GATE_EVIDENCE_TOOLS.has(call.name)) continue;
+    if (!byId.get(call.id)?.success) continue;
+    const key = evidenceKey(call);
+    if (seen.has(key) || fresh.includes(key)) continue;
+    fresh.push(key);
+  }
+  return fresh;
+}
+
 /**
  * Detect read/report-only thrash during Check/Test fix tank.
  * Opens the circuit so the session does not auto-rekick forever.
  */
-function noteGateFixRound(
+export function noteGateFixRound(
   state: SessionState,
-  hadEdit: boolean,
-  tankRoundsWithoutEdit: number,
-): { stop: boolean; tankRoundsWithoutEdit: number; state: SessionState } {
+  budget: GateFixBudget,
+  round: GateFixRound,
+): { stop: boolean; budget: GateFixBudget; state: SessionState } {
   const phase = productPhaseForState(state);
   if (phase !== "checking" && phase !== "testing") {
-    return { stop: false, tankRoundsWithoutEdit: 0, state };
+    return { stop: false, budget: newGateFixBudget(), state };
   }
   if (!isTankMode(state)) {
-    return { stop: false, tankRoundsWithoutEdit: 0, state };
+    return { stop: false, budget: newGateFixBudget(), state };
   }
-  const next = hadEdit ? 0 : tankRoundsWithoutEdit + 1;
-  if (next < MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT) {
-    return { stop: false, tankRoundsWithoutEdit: next, state };
+  if (round && batchHadSuccessfulEdit(round.toolCalls, round.results)) {
+    return { stop: false, budget: { ...budget, roundsWithoutEdit: 0 }, state };
+  }
+  const fresh = round
+    ? freshEvidenceKeys(round.toolCalls, round.results, budget.evidenceSeen)
+    : [];
+  if (fresh.length > 0 && budget.evidenceRoundsLeft > 0) {
+    const evidenceSeen = new Set(budget.evidenceSeen);
+    for (const key of fresh) evidenceSeen.add(key);
+    return {
+      stop: false,
+      budget: {
+        ...budget,
+        evidenceSeen,
+        evidenceRoundsLeft: budget.evidenceRoundsLeft - 1,
+      },
+      state,
+    };
+  }
+  const roundsWithoutEdit = budget.roundsWithoutEdit + 1;
+  if (roundsWithoutEdit < MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT) {
+    return { stop: false, budget: { ...budget, roundsWithoutEdit }, state };
   }
   const label = phase === "checking" ? "Check" : "Test";
   const notice: Turn = {
     id: randomUUID(),
     role: "assistant",
-    content: `**Build paused** · ${label} fix loop stalled (no file edits after ${next} rounds). Press **Resume · Enter** when you want to continue.`,
+    content: `**Build paused** · ${label} fix loop stalled (no file edits in ${roundsWithoutEdit} rounds, after reading the gate evidence). Press **Resume · Enter** when you want to continue.`,
     createdAt: new Date().toISOString(),
   };
   return {
     stop: true,
-    tankRoundsWithoutEdit: next,
+    budget: { ...budget, roundsWithoutEdit },
     state: {
       ...state,
       testGateCircuitOpen: true,
+      testGateCircuitReason: "stalled",
       turns: [...state.turns, notice],
     },
   };
@@ -128,10 +212,67 @@ function buildToolExecutionContext(
     ...(baseCtx.terminals ? { terminals: baseCtx.terminals } : {}),
     ...(baseCtx.ask ? { ask: baseCtx.ask } : {}),
     ...(baseCtx.cbm ? { cbm: baseCtx.cbm } : {}),
+    ...(baseCtx.humanSetup ? { humanSetup: baseCtx.humanSetup } : {}),
+    ...(baseCtx.notice ? { notice: baseCtx.notice } : {}),
     ...(baseCtx.testLogs ? { testLogs: baseCtx.testLogs } : {}),
     ...(baseCtx.testGate ? { testGate: baseCtx.testGate } : {}),
     ...(baseCtx.attachments ? { attachments: baseCtx.attachments } : {}),
   };
+}
+
+/**
+ * True when this batch opened a blocking human-setup checklist.
+ *
+ * The turn must end here: the missing answer is a human creating an account or
+ * pasting a connection string, and no further round of thinking can produce it.
+ * Without this stop the model keeps narrating the same blocker and re-reading the
+ * same env files until the stall detector trips — which is exactly the loop
+ * request_human_setup exists to break.
+ *
+ * `allSatisfied` declarations do not stop anything: the values turned out to be
+ * there already, so the agent should carry on with the real work.
+ */
+/** Shown when the model stopped on the checklist without writing a closing line. */
+export const HUMAN_SETUP_WAIT_NOTICE =
+  "Waiting on the setup checklist above — those values can only come from you. I stopped here instead of retrying the gate.";
+
+export function declaredBlockingHumanSetup(
+  calls: Array<{ id: string; name: string }>,
+  results: ToolResult[],
+): boolean {
+  const ids = new Set(
+    calls
+      .filter((call) => call.name === "request_human_setup")
+      .map((call) => call.id),
+  );
+  if (ids.size === 0) return false;
+  return results.some((result) => {
+    if (!ids.has(result.callId) || !result.success) return false;
+    const output = result.output as
+      | { declared?: unknown; allSatisfied?: unknown }
+      | undefined;
+    return output?.declared === true && output.allSatisfied !== true;
+  });
+}
+
+export const NOTICE_WAIT_LINE =
+  "Stopped so you can see the banner above — I will not keep going as if nothing happened.";
+
+export function declaredBlockingNotice(
+  calls: Array<{ id: string; name: string }>,
+  results: ToolResult[],
+): boolean {
+  const ids = new Set(
+    calls.filter((call) => call.name === "post_notice").map((call) => call.id),
+  );
+  if (ids.size === 0) return false;
+  return results.some((result) => {
+    if (!ids.has(result.callId) || !result.success) return false;
+    const output = result.output as
+      | { posted?: unknown; blocking?: unknown }
+      | undefined;
+    return output?.posted === true && output.blocking === true;
+  });
 }
 
 /** Attach image_url parts to the latest user message (current turn only). */
@@ -327,6 +468,33 @@ function pushTankContinue(
   return { state, tankRounds: nextRound };
 }
 
+/** Keep in sync with `isContextOverflowError` in `@ai-ide/provider`. */
+function looksLikeContextOverflow(error: {
+  userMessage?: string;
+  technicalDetail?: string | null;
+}): boolean {
+  const t = `${error.userMessage ?? ""}\n${error.technicalDetail ?? ""}`.toLowerCase();
+  if (!t.trim()) return false;
+  if (t.includes("tokens to keep from the initial prompt")) return true;
+  if (t.includes("n_keep") && t.includes("context")) return true;
+  if (t.includes("greater than the context length")) return true;
+  if (t.includes("context_length_exceeded")) return true;
+  if (t.includes("maximum context length") || t.includes("max context length")) {
+    return true;
+  }
+  if (t.includes("exceeds the context") || t.includes("exceeds context length")) {
+    return true;
+  }
+  if (t.includes("context length exceeded")) return true;
+  if (t.includes("prompt is too long") || t.includes("prompt too long")) {
+    return true;
+  }
+  if (t.includes("please reduce the length of the messages")) return true;
+  if (t.includes("this model's maximum context")) return true;
+  if (t.includes("loaded context is too small")) return true;
+  return false;
+}
+
 /**
  * Refresh system prompt every round; summarize+compact only near the token trigger
  * (Cursor-style), instead of sliding-window truncating every tank iteration.
@@ -341,6 +509,8 @@ async function prepareMessagesForProvider(
     lastInputTokens?: number;
     contextWindowTokens?: number | null;
     emit: (event: AgentProgressEvent) => void;
+    /** Compact even when the live body is still under the char floor. */
+    force?: boolean;
   },
 ): Promise<SessionState> {
   const phase = productPhaseForState(state);
@@ -352,6 +522,7 @@ async function prepareMessagesForProvider(
     phase === "planning";
   if (!shouldConsider) {
     refreshSystemMessage(messages, state);
+    sanitizeProviderMessagesInPlace(messages);
     return state;
   }
 
@@ -369,6 +540,7 @@ async function prepareMessagesForProvider(
       ? { contextWindowTokens: deps.contextWindowTokens }
       : {}),
     ...(deps.signal ? { signal: deps.signal } : {}),
+    ...(deps.force === true ? { force: true } : {}),
   });
   if (result.compacted) {
     messages.length = 0;
@@ -391,16 +563,22 @@ async function prepareMessagesForProvider(
       },
     });
   }
+  refreshSystemMessage(messages, result.state);
+  sanitizeProviderMessagesInPlace(messages);
   return result.state;
 }
 
 export type AgentProgressEvent =
   | { type: "activity"; label: string; status: SessionState["status"] }
   | { type: "token"; text: string }
+  /** Chain of thought so far for the whole turn, not just the current round. */
+  | { type: "reasoning"; text: string }
   | {
       type: "usage";
       inputTokens: number;
       outputTokens: number;
+      /** Part of inputTokens the provider served from its prompt cache. */
+      cachedInputTokens?: number;
     }
   | {
       type: "tool_start";
@@ -437,6 +615,7 @@ export type AgentProgressEvent =
           | "contextCompactionCount"
           | "agentHistoryPath"
           | "testGateCircuitOpen"
+          | "testGateCircuitReason"
         >
       >;
       /** Live draft while tool args stream — do not persist. */
@@ -460,6 +639,8 @@ export type PausedAgentTurn = {
   approvalId: string;
   messages: ChatMessage[];
   assistantContent: string;
+  /** Chain of thought so far, so resuming does not lose the first rounds. */
+  assistantReasoning: string;
   toolResults: ToolResult[];
   allToolCalls: ToolCall[];
   /** Includes the call awaiting approval, then any not-yet-run siblings. */
@@ -483,7 +664,7 @@ export async function runAgentTurn(
   machine.begin();
   const emit = deps.onProgress ?? (() => undefined);
   let tankRounds = 0;
-  let tankRoundsWithoutEdit = 0;
+  let gateFixBudget = newGateFixBudget();
 
   let workingState: SessionState = { ...state };
   const registry = createDefaultRegistry();
@@ -508,6 +689,7 @@ export async function runAgentTurn(
   attachVisionToLatestUserMessage(messages, deps.visionImages);
 
   let assistantContent = "";
+  let assistantReasoning = "";
   const toolResults: ToolResult[] = [];
   const allToolCalls: ToolCall[] = [];
   const workspaceRoot =
@@ -547,6 +729,34 @@ export async function runAgentTurn(
         : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
     });
+    let overflowRetryUsed = false;
+    let retryForOverflow = false;
+    do {
+      if (retryForOverflow) {
+        emit({
+          type: "activity",
+          label: "Prompt exceeds model context — compacting…",
+          status: "thinking",
+        });
+        workingState = await prepareMessagesForProvider(messages, workingState, {
+          provider: deps.provider,
+          workspaceRoot,
+          lastInputTokens,
+          emit,
+          force: true,
+          ...(typeof deps.contextWindowTokens === "number"
+            ? { contextWindowTokens: deps.contextWindowTokens }
+            : {}),
+          ...(deps.signal ? { signal: deps.signal } : {}),
+        });
+        roundContent = "";
+        roundReasoning = "";
+        pendingToolCalls.clear();
+        streamedThisRound = false;
+        lastProvisionalEmit = 0;
+        overflowRetryUsed = true;
+        retryForOverflow = false;
+      }
     for await (const chunk of deps.provider.chat(messages, {
       ...(toolDefs.length ? { tools: toolDefs } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
@@ -560,6 +770,10 @@ export async function runAgentTurn(
       }
       if (chunk.type === "reasoning") {
         roundReasoning += chunk.delta;
+        // Rounds are an implementation detail of the tool loop, so the reader
+        // gets one continuous train of thought for the whole turn.
+        assistantReasoning += chunk.delta;
+        emit({ type: "reasoning", text: assistantReasoning });
       }
       if (chunk.type === "content") {
         if (!streamedThisRound) {
@@ -646,6 +860,10 @@ export async function runAgentTurn(
         }
       }
       if (chunk.type === "error") {
+        if (!overflowRetryUsed && looksLikeContextOverflow(chunk.error)) {
+          retryForOverflow = true;
+          break;
+        }
         return fail(workingState, formatAppErrorDisplay(chunk.error), {
           assistantContent,
           toolCalls: allToolCalls,
@@ -664,9 +882,13 @@ export async function runAgentTurn(
           type: "usage",
           inputTokens: chunk.usage.inputTokens,
           outputTokens: chunk.usage.outputTokens,
+          ...(chunk.usage.cachedInputTokens !== undefined
+            ? { cachedInputTokens: chunk.usage.cachedInputTokens }
+            : {}),
         });
       }
     }
+    } while (retryForOverflow);
 
     let toolCalls: ToolCall[] = [...pendingToolCalls.values()]
       .filter((c) => c.name)
@@ -703,18 +925,17 @@ export async function runAgentTurn(
         });
       }
       if (isTankMode(workingState)) {
-        const thrash = noteGateFixRound(
-          workingState,
-          false,
-          tankRoundsWithoutEdit,
-        );
-        tankRoundsWithoutEdit = thrash.tankRoundsWithoutEdit;
+        const thrash = noteGateFixRound(workingState, gateFixBudget, null);
+        gateFixBudget = thrash.budget;
         workingState = thrash.state;
         if (thrash.stop) {
           if (thrash.state.testGateCircuitOpen) {
             emit({
               type: "session_patch",
-              patch: { testGateCircuitOpen: true },
+              patch: {
+                testGateCircuitOpen: true,
+                testGateCircuitReason: "stalled",
+              },
             });
           }
           machine.complete();
@@ -837,6 +1058,7 @@ export async function runAgentTurn(
               },
             ],
             partialAssistantText: null,
+            partialReasoningText: null,
             activityLabel: "Waiting for approval…",
             liveTools: [],
           }),
@@ -846,6 +1068,7 @@ export async function runAgentTurn(
             approvalId: outcome.approvalId,
             messages: [...messages],
             assistantContent,
+            assistantReasoning,
             toolResults: [...toolResults],
             allToolCalls: [...allToolCalls],
             remainingCalls,
@@ -888,19 +1111,36 @@ export async function runAgentTurn(
       );
     }
 
+    if (declaredBlockingHumanSetup(toolCalls, toolResults.slice(batchStart))) {
+      if (!assistantContent.trim()) {
+        assistantContent = HUMAN_SETUP_WAIT_NOTICE;
+      }
+      machine.complete();
+      break;
+    }
+    if (declaredBlockingNotice(toolCalls, toolResults.slice(batchStart))) {
+      if (!assistantContent.trim()) {
+        assistantContent = NOTICE_WAIT_LINE;
+      }
+      machine.complete();
+      break;
+    }
+
     {
-      const thrash = noteGateFixRound(
-        workingState,
-        batchHadSuccessfulEdit(toolCalls, toolResults.slice(batchStart)),
-        tankRoundsWithoutEdit,
-      );
-      tankRoundsWithoutEdit = thrash.tankRoundsWithoutEdit;
+      const thrash = noteGateFixRound(workingState, gateFixBudget, {
+        toolCalls,
+        results: toolResults.slice(batchStart),
+      });
+      gateFixBudget = thrash.budget;
       workingState = thrash.state;
       if (thrash.stop) {
         if (thrash.state.testGateCircuitOpen) {
           emit({
             type: "session_patch",
-            patch: { testGateCircuitOpen: true },
+            patch: {
+              testGateCircuitOpen: true,
+              testGateCircuitReason: "stalled",
+            },
           });
         }
         machine.complete();
@@ -917,6 +1157,7 @@ export async function runAgentTurn(
     id: randomUUID(),
     role: "assistant",
     content: assistantContent || "(no response)",
+    ...(assistantReasoning ? { reasoning: assistantReasoning } : {}),
     toolCalls: allToolCalls.length ? allToolCalls : undefined,
     toolResults: toolResults.length ? toolResults : undefined,
     createdAt: new Date().toISOString(),
@@ -929,6 +1170,7 @@ export async function runAgentTurn(
       turns: appendAssistantTurn(workingState, assistantTurn),
       error: null,
       partialAssistantText: null,
+      partialReasoningText: null,
       activityLabel: null,
       activeToolCallId: null,
       liveTools: [],
@@ -1061,32 +1303,40 @@ function fail(
     });
   }
   const interrupted = message === "Interrupted by user.";
-  if (
-    !interrupted &&
-    productPhaseForState(state) === "building" &&
-    planHasOpenWork(state)
-  ) {
-    const { done, total } = planChecklistProgress(state);
-    const open = Math.max(0, total - done);
-    turns.push({
-      id: randomUUID(),
-      role: "assistant",
-      content: [
-        `**Build paused** · checklist **${done}/${total} done** (${open} open).`,
-        "",
-        message,
-        "",
-        "Press **Resume** when you want to continue.",
-      ].join("\n"),
-      createdAt: new Date().toISOString(),
-    });
-  } else if (!interrupted && !prose && tools.length === 0) {
-    turns.push({
-      id: randomUUID(),
-      role: "assistant",
-      content: message,
-      createdAt: new Date().toISOString(),
-    });
+  if (!interrupted) {
+    if (productPhaseForState(state) === "building" && planHasOpenWork(state)) {
+      const { done, total } = planChecklistProgress(state);
+      const open = Math.max(0, total - done);
+      turns.push({
+        id: randomUUID(),
+        role: "assistant",
+        content: [
+          `**Build paused** · checklist **${done}/${total} done** (${open} open).`,
+          "",
+          message,
+          "",
+          "Press **Resume** when you want to continue.",
+        ].join("\n"),
+        createdAt: new Date().toISOString(),
+      });
+    } else {
+      // Every other phase needs this too. The error banner lives above a long
+      // scroll and the Resume banner has phase-specific conditions, so without a
+      // turn at the end of the transcript a failed turn looks like the agent
+      // simply chose to stop talking.
+      turns.push({
+        id: randomUUID(),
+        role: "assistant",
+        content: [
+          "**Stopped** · the turn ended on an error.",
+          "",
+          message,
+          "",
+          "Press **Resume · Enter** when you want to continue.",
+        ].join("\n"),
+        createdAt: new Date().toISOString(),
+      });
+    }
   }
   return {
     state: bumpSessionSequence({
@@ -1095,6 +1345,7 @@ function fail(
       error: message,
       turns,
       partialAssistantText: null,
+      partialReasoningText: null,
       activityLabel: null,
       activeToolCallId: null,
       liveTools: [],
@@ -1121,7 +1372,7 @@ export async function resumeAgentTurn(
   machine.begin();
   const emit = deps.onProgress ?? (() => undefined);
   let tankRounds = 0;
-  let tankRoundsWithoutEdit = 0;
+  let gateFixBudget = newGateFixBudget();
   const registry = createDefaultRegistry();
   const gateway = deps.gateway ?? new ToolGateway(registry);
 
@@ -1143,6 +1394,7 @@ export async function resumeAgentTurn(
   let toolDefs = toolDefsFor(workingState);
   const messages: ChatMessage[] = [...pause.messages];
   let assistantContent = pause.assistantContent;
+  let assistantReasoning = pause.assistantReasoning;
   const toolResults: ToolResult[] = [...pause.toolResults];
   const allToolCalls: ToolCall[] = [...pause.allToolCalls];
   const userMessage = pause.userMessage;
@@ -1257,6 +1509,7 @@ export async function resumeAgentTurn(
             },
           ],
           partialAssistantText: null,
+          partialReasoningText: null,
           activityLabel: "Waiting for approval…",
           liveTools: [],
         }),
@@ -1266,6 +1519,7 @@ export async function resumeAgentTurn(
           approvalId: outcome.approvalId,
           messages: [...messages],
           assistantContent,
+          assistantReasoning,
           toolResults: [...toolResults],
           allToolCalls: [...allToolCalls],
           remainingCalls,
@@ -1284,6 +1538,9 @@ export async function resumeAgentTurn(
       role: "tool",
       tool_call_id: call.id,
       content: toolMessageContent(call.name, outcome.result),
+      // Same as the unattended path: pixels stay out of SessionState, and an
+      // approved screenshot is worthless if the model never sees it.
+      ...(outcome.images?.length ? { images: outcome.images } : {}),
     });
     if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
       stop = true;
@@ -1334,6 +1591,33 @@ export async function resumeAgentTurn(
         : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
     });
+    let overflowRetryUsed = false;
+    let retryForOverflow = false;
+    do {
+      if (retryForOverflow) {
+        emit({
+          type: "activity",
+          label: "Prompt exceeds model context — compacting…",
+          status: "thinking",
+        });
+        workingState = await prepareMessagesForProvider(messages, workingState, {
+          provider: deps.provider,
+          workspaceRoot,
+          lastInputTokens,
+          emit,
+          force: true,
+          ...(typeof deps.contextWindowTokens === "number"
+            ? { contextWindowTokens: deps.contextWindowTokens }
+            : {}),
+          ...(deps.signal ? { signal: deps.signal } : {}),
+        });
+        roundContent = "";
+        roundReasoning = "";
+        pendingToolCalls.clear();
+        streamedThisRound = false;
+        overflowRetryUsed = true;
+        retryForOverflow = false;
+      }
     for await (const chunk of deps.provider.chat(messages, {
       ...(toolDefs.length ? { tools: toolDefs } : {}),
       ...(deps.signal ? { signal: deps.signal } : {}),
@@ -1347,6 +1631,10 @@ export async function resumeAgentTurn(
       }
       if (chunk.type === "reasoning") {
         roundReasoning += chunk.delta;
+        // Rounds are an implementation detail of the tool loop, so the reader
+        // gets one continuous train of thought for the whole turn.
+        assistantReasoning += chunk.delta;
+        emit({ type: "reasoning", text: assistantReasoning });
       }
       if (chunk.type === "content") {
         if (!streamedThisRound) {
@@ -1384,6 +1672,10 @@ export async function resumeAgentTurn(
         }
       }
       if (chunk.type === "error") {
+        if (!overflowRetryUsed && looksLikeContextOverflow(chunk.error)) {
+          retryForOverflow = true;
+          break;
+        }
         return fail(workingState, formatAppErrorDisplay(chunk.error), {
           assistantContent,
           toolCalls: allToolCalls,
@@ -1402,9 +1694,13 @@ export async function resumeAgentTurn(
           type: "usage",
           inputTokens: chunk.usage.inputTokens,
           outputTokens: chunk.usage.outputTokens,
+          ...(chunk.usage.cachedInputTokens !== undefined
+            ? { cachedInputTokens: chunk.usage.cachedInputTokens }
+            : {}),
         });
       }
     }
+    } while (retryForOverflow);
 
     let toolCalls: ToolCall[] = [...pendingToolCalls.values()]
       .filter((c) => c.name)
@@ -1440,18 +1736,17 @@ export async function resumeAgentTurn(
         });
       }
       if (isTankMode(workingState)) {
-        const thrash = noteGateFixRound(
-          workingState,
-          false,
-          tankRoundsWithoutEdit,
-        );
-        tankRoundsWithoutEdit = thrash.tankRoundsWithoutEdit;
+        const thrash = noteGateFixRound(workingState, gateFixBudget, null);
+        gateFixBudget = thrash.budget;
         workingState = thrash.state;
         if (thrash.stop) {
           if (thrash.state.testGateCircuitOpen) {
             emit({
               type: "session_patch",
-              patch: { testGateCircuitOpen: true },
+              patch: {
+                testGateCircuitOpen: true,
+                testGateCircuitReason: "stalled",
+              },
             });
           }
           machine.complete();
@@ -1571,6 +1866,7 @@ export async function resumeAgentTurn(
               },
             ],
             partialAssistantText: null,
+            partialReasoningText: null,
             activityLabel: "Waiting for approval…",
             liveTools: [],
           }),
@@ -1580,6 +1876,7 @@ export async function resumeAgentTurn(
             approvalId: outcome.approvalId,
             messages: [...messages],
             assistantContent,
+            assistantReasoning,
             toolResults: [...toolResults],
             allToolCalls: [...allToolCalls],
             remainingCalls: [call],
@@ -1598,6 +1895,7 @@ export async function resumeAgentTurn(
         role: "tool",
         tool_call_id: call.id,
         content: toolMessageContent(call.name, outcome.result),
+        ...(outcome.images?.length ? { images: outcome.images } : {}),
       });
       if (!machine.recordToolResult(call.name, outcome.result.success, isTankMode(workingState))) {
         stop = true;
@@ -1605,19 +1903,36 @@ export async function resumeAgentTurn(
       }
     }
 
+    if (declaredBlockingHumanSetup(toolCalls, toolResults.slice(batchStart))) {
+      if (!assistantContent.trim()) {
+        assistantContent = HUMAN_SETUP_WAIT_NOTICE;
+      }
+      machine.complete();
+      break;
+    }
+    if (declaredBlockingNotice(toolCalls, toolResults.slice(batchStart))) {
+      if (!assistantContent.trim()) {
+        assistantContent = NOTICE_WAIT_LINE;
+      }
+      machine.complete();
+      break;
+    }
+
     if (isTankMode(workingState)) {
-      const thrash = noteGateFixRound(
-        workingState,
-        batchHadSuccessfulEdit(toolCalls, toolResults.slice(batchStart)),
-        tankRoundsWithoutEdit,
-      );
-      tankRoundsWithoutEdit = thrash.tankRoundsWithoutEdit;
+      const thrash = noteGateFixRound(workingState, gateFixBudget, {
+        toolCalls,
+        results: toolResults.slice(batchStart),
+      });
+      gateFixBudget = thrash.budget;
       workingState = thrash.state;
       if (thrash.stop) {
         if (thrash.state.testGateCircuitOpen) {
           emit({
             type: "session_patch",
-            patch: { testGateCircuitOpen: true },
+            patch: {
+              testGateCircuitOpen: true,
+              testGateCircuitReason: "stalled",
+            },
           });
         }
         machine.complete();
@@ -1645,6 +1960,7 @@ export async function resumeAgentTurn(
     id: randomUUID(),
     role: "assistant",
     content: assistantContent || "(no response)",
+    ...(assistantReasoning ? { reasoning: assistantReasoning } : {}),
     toolCalls: allToolCalls.length ? allToolCalls : undefined,
     toolResults: toolResults.length ? toolResults : undefined,
     createdAt: new Date().toISOString(),
@@ -1657,6 +1973,7 @@ export async function resumeAgentTurn(
       turns: appendAssistantTurn(workingState, assistantTurn),
       error: null,
       partialAssistantText: null,
+      partialReasoningText: null,
       activityLabel: null,
       activeToolCallId: null,
       liveTools: [],

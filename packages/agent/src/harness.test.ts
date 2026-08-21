@@ -4,9 +4,9 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ChatMessage, ChatChunk, ChatOptions } from "@ai-ide/provider";
 import {
-  expandMessagesForOpenAi,
   flattenVisionToText,
   messagesHaveVision,
+  toPrompt,
 } from "@ai-ide/provider";
 import type { AgentAskAnswer } from "@ai-ide/tools";
 import {
@@ -249,13 +249,13 @@ describe("harness scenario: e2e failure diagnosed from a screenshot", () => {
 
     // 4. On the wire the pixels move to a user message — OpenAI rejects images
     //    on tool messages.
-    const wire = expandMessagesForOpenAi(afterImage);
+    const wire = toPrompt(afterImage, { nativeToolImages: false }).messages;
     const hoisted = wire.filter(
       (m) => m.role === "user" && Array.isArray(m.content),
     );
-    expect(JSON.stringify(hoisted)).toContain("image_url");
+    expect(JSON.stringify(hoisted)).toContain(PNG.toString("base64"));
     for (const m of wire.filter((m) => m.role === "tool")) {
-      expect(JSON.stringify(m)).not.toContain("image_url");
+      expect(JSON.stringify(m)).not.toContain(PNG.toString("base64"));
     }
 
     // 5. ask_user blocked the turn and its answer came back in the tool result.
@@ -334,6 +334,199 @@ describe("harness scenario: e2e failure diagnosed from a screenshot", () => {
       "cannot view images",
     );
     expect(JSON.stringify(flattened)).not.toContain(PNG.toString("base64"));
+    rmSync(root, { recursive: true });
+  });
+
+  it("ends the turn as soon as it asks the human for blocking setup", async () => {
+    const root = makeWorkspace();
+    let round = 0;
+
+    const provider = {
+      async listModels() {
+        return [{ id: "mock-text" }];
+      },
+      cancel() {},
+      async *chat(): AsyncIterable<ChatChunk> {
+        round += 1;
+        if (round === 1) {
+          yield {
+            type: "tool_call",
+            id: "call_1",
+            name: "request_human_setup",
+            argumentsDelta: JSON.stringify({
+              reason: "The Neon connection string is still a placeholder.",
+              items: [
+                {
+                  title: "Create the e2e Neon branch",
+                  envFile: ".env.e2e",
+                  envKeys: ["DATABASE_URL"],
+                },
+              ],
+            }),
+            index: 0,
+          };
+          yield { type: "done", finishReason: "tool_calls" };
+          return;
+        }
+        // Anything past the declaration is the bug: the answer is a human
+        // pasting a secret, so no further round can make progress.
+        yield {
+          type: "tool_call",
+          id: `call_${round}`,
+          name: "read_file",
+          argumentsDelta: JSON.stringify({ path: ".env.e2e" }),
+          index: 0,
+        };
+        yield { type: "done", finishReason: "tool_calls" };
+      },
+    };
+
+    const result = await runAgentTurn(failedGateSession(root), "resume", {
+      provider,
+      toolCtx: {
+        workspaceRoot: root,
+        fs: new FilesystemService(root),
+        git: new GitService(root),
+        checkpoint: new CheckpointService(root, join(root, ".checkpoints")),
+        humanSetup: {
+          declare: async () => ({
+            items: [
+              {
+                id: "i1",
+                title: "Create the e2e Neon branch",
+                envFile: ".env.e2e",
+                presentKeys: [],
+                missingKeys: ["DATABASE_URL"],
+                satisfied: false,
+              },
+            ],
+            allSatisfied: false,
+          }),
+        },
+      },
+    });
+
+    expect(round).toBe(1);
+    expect(result.toolResults).toHaveLength(1);
+    expect(result.toolResults[0]?.success).toBe(true);
+    expect(result.assistantContent).toContain("setup checklist");
+    rmSync(root, { recursive: true });
+  });
+
+  it("keeps working when the values the human was asked for are already there", async () => {
+    const root = makeWorkspace();
+    let round = 0;
+
+    const provider = {
+      async listModels() {
+        return [{ id: "mock-text" }];
+      },
+      cancel() {},
+      async *chat(): AsyncIterable<ChatChunk> {
+        round += 1;
+        if (round === 1) {
+          yield {
+            type: "tool_call",
+            id: "call_1",
+            name: "request_human_setup",
+            argumentsDelta: JSON.stringify({
+              reason: "Checking whether the connection string landed.",
+              items: [
+                {
+                  title: "Create the e2e Neon branch",
+                  envFile: ".env.e2e",
+                  envKeys: ["DATABASE_URL"],
+                },
+              ],
+            }),
+            index: 0,
+          };
+          yield { type: "done", finishReason: "tool_calls" };
+          return;
+        }
+        yield { type: "content", delta: "Everything is set, re-running." };
+        yield { type: "done", finishReason: "stop" };
+      },
+    };
+
+    const result = await runAgentTurn(failedGateSession(root), "resume", {
+      provider,
+      toolCtx: {
+        workspaceRoot: root,
+        fs: new FilesystemService(root),
+        git: new GitService(root),
+        checkpoint: new CheckpointService(root, join(root, ".checkpoints")),
+        humanSetup: {
+          declare: async () => ({
+            items: [
+              {
+                id: "i1",
+                title: "Create the e2e Neon branch",
+                envFile: ".env.e2e",
+                presentKeys: ["DATABASE_URL"],
+                missingKeys: [],
+                satisfied: true,
+              },
+            ],
+            allSatisfied: true,
+          }),
+        },
+      },
+    });
+
+    expect(round).toBe(2);
+    expect(result.assistantContent).toContain("Everything is set");
+    rmSync(root, { recursive: true });
+  });
+
+  it("ends the turn as soon as it posts a blocking banner", async () => {
+    const root = makeWorkspace();
+    let round = 0;
+
+    const provider = {
+      async listModels() {
+        return [{ id: "mock-text" }];
+      },
+      cancel() {},
+      async *chat(): AsyncIterable<ChatChunk> {
+        round += 1;
+        if (round === 1) {
+          yield {
+            type: "tool_call",
+            id: "call_1",
+            name: "post_notice",
+            argumentsDelta: JSON.stringify({
+              kind: "error",
+              title: "Images were not sent",
+              blocking: true,
+            }),
+            index: 0,
+          };
+          yield { type: "done", finishReason: "tool_calls" };
+          return;
+        }
+        yield { type: "content", delta: "Guessing from the screenshot anyway." };
+        yield { type: "done", finishReason: "stop" };
+      },
+    };
+
+    const result = await runAgentTurn(failedGateSession(root), "look", {
+      provider,
+      toolCtx: {
+        workspaceRoot: root,
+        fs: new FilesystemService(root),
+        git: new GitService(root),
+        checkpoint: new CheckpointService(root, join(root, ".checkpoints")),
+        notice: {
+          post: async () => ({ id: "n1", expiresAt: null }),
+        },
+      },
+    });
+
+    expect(round).toBe(1);
+    expect(result.toolResults).toHaveLength(1);
+    expect(result.toolResults[0]?.success).toBe(true);
+    expect(result.assistantContent).toContain("banner");
     rmSync(root, { recursive: true });
   });
 });

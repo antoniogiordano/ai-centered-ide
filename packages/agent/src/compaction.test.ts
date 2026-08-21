@@ -290,6 +290,17 @@ describe("context compaction (Cursor-style)", () => {
     expect(triggerTokensForContextWindow(1000)).toBe(
       CONTEXT_COMPACT_TRIGGER_TOKENS,
     );
+    // 4k–8k local models must trigger *below* n_ctx, not at the old 8k floor.
+    expect(triggerTokensForContextWindow(4_096)).toBe(3_072);
+    expect(triggerTokensForContextWindow(8_192)).toBe(6_144);
+  });
+
+  it("lowers the char floor on small local windows so the system prompt counts", async () => {
+    const { minCharsForContextWindow, CONTEXT_COMPACT_MIN_CHARS } =
+      await import("./compaction.js");
+    expect(minCharsForContextWindow(null)).toBe(CONTEXT_COMPACT_MIN_CHARS);
+    expect(minCharsForContextWindow(128_000)).toBe(CONTEXT_COMPACT_MIN_CHARS);
+    expect(minCharsForContextWindow(4_096)).toBe(2_000);
   });
 
   it("falls back to sliding tail when summarizer fails", async () => {

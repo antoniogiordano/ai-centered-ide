@@ -13,6 +13,8 @@ import {
 } from "react";
 import type { SessionState } from "@ai-ide/shared";
 import { getBridge } from "../bridge";
+import { useNativeOverlay } from "../hooks/useNativeOverlay";
+import { onComposerInbox } from "../lib/composerInbox";
 import { ImageAnnotateDialog } from "./ImageAnnotateDialog";
 
 const isApple =
@@ -86,10 +88,10 @@ async function fileToBase64(file: File): Promise<string> {
   return btoa(binary);
 }
 
-/** Small JPEG thumb for IPC/transcript — keep under previewDataUrl schema cap. */
+/** JPEG preview for IPC/transcript — large enough to read UI in screenshots. */
 async function makeThumbnailDataUrl(
   src: string,
-  maxEdge = 96,
+  maxEdge = 480,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -246,6 +248,72 @@ export function ComposerBar(props: {
     setAttachments((prev) => prev.filter((a) => a.id !== id));
     setEditingId((cur) => (cur === id ? null : cur));
   }, []);
+
+  /**
+   * Material captured elsewhere: preview crop, full-view shot, picked element.
+   * The point of those keystrokes is that they end with the cursor in the
+   * composer, so this takes focus even though the user never clicked here.
+   */
+  useEffect(
+    () =>
+      onComposerInbox((item) => {
+        const image = item.image;
+        // Synchronous on purpose: the crop overlay unmounts in this same tick
+        // and the annotation dialog has to take over the native-view guard in
+        // the same commit, or the live page flashes back over the image.
+        if (image) {
+          setAttachments((prev) => {
+            if (prev.length >= MAX_ATTACHMENTS) return prev;
+            if (prev.filter((a) => a.kind === "image").length >= MAX_IMAGES) {
+              return prev;
+            }
+            return [
+              ...prev,
+              {
+                id: item.id,
+                kind: "image",
+                name: image.name,
+                mime: image.mime,
+                dataBase64: image.dataBase64,
+                ...(image.previewDataUrl
+                  ? { previewDataUrl: image.previewDataUrl }
+                  : {}),
+              },
+            ];
+          });
+        }
+        if (item.text) {
+          const text = item.text;
+          setValue((prev) =>
+            prev.trim()
+              ? `${prev.replace(/\s+$/, "")}\n\n${text}\n`
+              : `${text}\n`,
+          );
+        }
+        // If the cap rejected the image there is nothing to annotate, and the
+        // dialog stays closed because it resolves the id against the list.
+        if (item.annotate && image) setEditingId(item.id);
+        requestAnimationFrame(() => inputRef.current?.focus());
+
+        // The chip wants a small thumbnail, but a full-page PNG as previewDataUrl
+        // would be megabytes of state; downscale once the UI is already up.
+        if (!image) return;
+        void makeThumbnailDataUrl(
+          `data:${image.mime};base64,${image.dataBase64}`,
+        )
+          .then((previewDataUrl) => {
+            setAttachments((prev) =>
+              prev.map((a) =>
+                a.id === item.id ? { ...a, previewDataUrl } : a,
+              ),
+            );
+          })
+          .catch(() => undefined);
+      }),
+    [inputRef],
+  );
+
+  useNativeOverlay(Boolean(editing));
 
   async function submit(e?: FormEvent) {
     e?.preventDefault();

@@ -176,6 +176,34 @@ describe("searchText", () => {
     expect(hits).toHaveLength(1);
     rmSync(dir, { recursive: true });
   });
+
+  it("skips build output ignored by anchored gitignore entries", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
+    writeFileSync(join(dir, ".gitignore"), "/.next/\n/.next-e2e/\n*.pem\n");
+    writeFileSync(join(dir, "app.tsx"), "needle here");
+    writeFileSync(join(dir, "key.pem"), "needle here");
+    mkdirSync(join(dir, ".next", "static"), { recursive: true });
+    writeFileSync(join(dir, ".next", "static", "chunk.js.map"), "needle here");
+    mkdirSync(join(dir, ".next-e2e"), { recursive: true });
+    writeFileSync(join(dir, ".next-e2e", "chunk.js.map"), "needle here");
+
+    const hits = searchText(dir, "needle");
+
+    expect(hits.map((hit) => hit.path)).toEqual(["app.tsx"]);
+    rmSync(dir, { recursive: true });
+  });
+
+  it("clips very long matched lines", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aici-ws-"));
+    writeFileSync(join(dir, "bundle.js"), `needle${"x".repeat(50_000)}`);
+
+    const hits = searchText(dir, "needle", { maxTextChars: 100 });
+
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.text).toHaveLength(101);
+    expect(hits[0]!.textTruncated).toBe(true);
+    rmSync(dir, { recursive: true });
+  });
 });
 
 describe("ArchitectureStore", () => {

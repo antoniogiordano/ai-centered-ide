@@ -7,21 +7,31 @@ import {
   type GithubLoginTokenResponse,
   type GithubLoginCancelResponse,
   type ProviderGetConfigResponse,
+  type ProviderListModelsRequest,
   type ProviderListModelsResponse,
   type ProviderListResponse,
   type ProviderSetActiveResponse,
+  type ProviderSetModelResponse,
   type ProviderDeleteResponse,
+  type ProviderSaveConfigRequest,
   type ProviderSaveConfigResponse,
   type ProviderFetchPricingRequest,
+  type ProviderFetchPricingProgress,
   type ProviderFetchPricingResponse,
+  type ProviderVerifyRequest,
   type ProviderVerifyResponse,
   type SessionCloseResponse,
   type SessionCreateResponse,
+  type SessionDiscardResponse,
+  type SessionGetLogResponse,
+  type SessionListLogsResponse,
   type SessionGetResponse,
   type SessionListResponse,
   type SessionSendMessageResponse,
   type SessionConfirmPlanResponse,
   type SessionDraftBuildCommitResponse,
+  type SessionDraftGitMessageResponse,
+  type WorkspaceGitStashListResponse,
   type SessionCommitBuildResponse,
   type SessionDismissBuildCommitResponse,
   type SessionIntegrateBuildResponse,
@@ -32,8 +42,15 @@ import {
   type TerminalDataEvent,
   type TerminalListResponse,
   type EngineStatus,
+  type PreviewCaptureResponse,
+  type PreviewCommandResponse,
+  type PreviewElementSelection,
+  type PreviewStatus,
+  type PreviewRect,
+  type PreviewViewportId,
   type WorkspaceCreateProjectRequest,
   type WorkspaceCreateProjectResponse,
+  type WorkspaceGitCommandResponse,
   type WorkspaceGitStatusResponse,
   type WorkspaceListBranchesResponse,
   type WorkspaceListDirResponse,
@@ -46,15 +63,28 @@ import {
   type WorkspaceReadFileResponse,
   type WorkspaceDiffFilesResponse,
   type WorkspaceDiffFileResponse,
+  type SessionState,
 } from "@ai-ide/shared";
 
 export type DesktopBridge = {
   session: {
     get: () => Promise<SessionGetResponse>;
     list: () => Promise<SessionListResponse>;
-    create: () => Promise<SessionCreateResponse>;
+    create: (input?: {
+      branch?: string;
+      dirtyStrategy?: "stash" | "force";
+    }) => Promise<SessionCreateResponse>;
     switch: (sessionId: string) => Promise<SessionSwitchResponse>;
-    close: (sessionId: string) => Promise<SessionCloseResponse>;
+    close: (
+      sessionId: string,
+      outcome?: "archived" | "discarded",
+    ) => Promise<SessionCloseResponse>;
+    discard: (
+      sessionId: string,
+      deleteBranch: boolean,
+    ) => Promise<SessionDiscardResponse>;
+    listLogs: () => Promise<SessionListLogsResponse>;
+    getLog: (sessionId?: string) => Promise<SessionGetLogResponse>;
     subscribe: (cb: (event: SessionUpdateEvent) => void) => () => void;
     sendMessage: (
       content: string,
@@ -84,8 +114,11 @@ export type DesktopBridge = {
       dirtyStrategy?: "stash" | "commit_base";
       baseCommitMessage?: string;
     }) => Promise<SessionConfirmPlanResponse>;
-    rejectPlanReady: () => Promise<{ ok: boolean; state?: import("@ai-ide/shared").SessionState }>;
+    rejectPlanReady: () => Promise<{ ok: boolean; state?: SessionState }>;
     draftBuildCommit: () => Promise<SessionDraftBuildCommitResponse>;
+    draftGitMessage: (
+      kind: "commit" | "stash",
+    ) => Promise<SessionDraftGitMessageResponse>;
     commitBuild: (message: string) => Promise<SessionCommitBuildResponse>;
     dismissBuildCommit: () => Promise<SessionDismissBuildCommitResponse>;
     integrateBuild: (action: "pr" | "merge") => Promise<SessionIntegrateBuildResponse>;
@@ -110,6 +143,12 @@ export type DesktopBridge = {
       text: string;
       cancelled?: boolean;
     }) => Promise<void>;
+    humanSetup: (input: {
+      action: "recheck" | "toggle" | "resume" | "skip";
+      itemId?: string;
+      done?: boolean;
+    }) => Promise<void>;
+    dismissNotice: (input: { noticeId: string }) => Promise<void>;
     cancel: () => Promise<void>;
     exportDiagnostics: () => Promise<unknown>;
   };
@@ -128,6 +167,27 @@ export type DesktopBridge = {
     indexRefresh: () => Promise<{ ok: boolean; status: EngineStatus }>;
     stderr: () => Promise<{ stderr: string }>;
   };
+  preview: {
+    status: () => Promise<PreviewCommandResponse>;
+    subscribe: (cb: (status: PreviewStatus) => void) => () => void;
+    start: () => Promise<PreviewCommandResponse>;
+    stop: () => Promise<PreviewCommandResponse>;
+    setBounds: (rect: PreviewRect | null) => void;
+    setVisible: (visible: boolean) => void;
+    setViewport: (viewport: PreviewViewportId) => Promise<PreviewCommandResponse>;
+    navigate: (url: string) => Promise<PreviewCommandResponse>;
+    act: (
+      action: "back" | "forward" | "reload" | "stop",
+    ) => Promise<PreviewCommandResponse>;
+    clearData: () => Promise<PreviewCommandResponse>;
+    toggleDevTools: () => Promise<PreviewCommandResponse>;
+    capture: () => Promise<PreviewCaptureResponse>;
+    refreshSetup: () => Promise<PreviewCommandResponse>;
+    confirmSetup: () => Promise<PreviewCommandResponse>;
+    pickElement: () => Promise<PreviewCommandResponse>;
+    cancelPick: () => Promise<PreviewCommandResponse>;
+    onElement: (cb: (hit: PreviewElementSelection) => void) => () => void;
+  };
   workspace: {
     open: (path?: string) => Promise<WorkspaceOpenResponse>;
     pickDirectory: () => Promise<WorkspacePickDirectoryResponse>;
@@ -136,6 +196,17 @@ export type DesktopBridge = {
     ) => Promise<WorkspaceCreateProjectResponse>;
     listRecent: () => Promise<WorkspaceListRecentResponse>;
     gitStatus: () => Promise<WorkspaceGitStatusResponse>;
+    gitCheckout: (input: {
+      branch: string;
+      dirtyStrategy?: "stash" | "force";
+    }) => Promise<WorkspaceGitCommandResponse>;
+    gitPull: (remote?: string) => Promise<WorkspaceGitCommandResponse>;
+    gitPush: (remote?: string) => Promise<WorkspaceGitCommandResponse>;
+    gitSetRemote: (remote: string) => Promise<WorkspaceGitCommandResponse>;
+    gitStash: (message: string) => Promise<WorkspaceGitCommandResponse>;
+    gitStashList: () => Promise<WorkspaceGitStashListResponse>;
+    gitStashPop: (index?: number) => Promise<WorkspaceGitCommandResponse>;
+    gitCommit: (message: string) => Promise<WorkspaceGitCommandResponse>;
     listBranches: () => Promise<WorkspaceListBranchesResponse>;
     listDir: (path?: string) => Promise<WorkspaceListDirResponse>;
     readFile: (path: string) => Promise<WorkspaceReadFileResponse>;
@@ -161,45 +232,21 @@ export type DesktopBridge = {
     getConfig: () => Promise<ProviderGetConfigResponse>;
     list: () => Promise<ProviderListResponse>;
     setActive: (id: string) => Promise<ProviderSetActiveResponse>;
+    setModel: (model: string, providerId?: string) => Promise<ProviderSetModelResponse>;
     delete: (id: string) => Promise<ProviderDeleteResponse>;
-    verify: (input: {
-      baseUrl: string;
-      apiKey: string;
-      model?: string;
-    }) => Promise<ProviderVerifyResponse>;
-    listModels: (input: {
-      baseUrl: string;
-      apiKey: string;
-    }) => Promise<ProviderListModelsResponse>;
-    saveConfig: (input: {
-      id?: string;
-      name?: string;
-      baseUrl: string;
-      apiKey: string;
-      defaultModel: string;
-      paid?: boolean;
-      pricing?: import("@ai-ide/shared").ProviderPricing;
-      thinking?: boolean;
-      reasoningEffort?:
-        | "none"
-        | "minimal"
-        | "low"
-        | "medium"
-        | "high"
-        | "xhigh"
-        | "max";
-      contextWindowTokens?: number | null;
-      makeActive?: boolean;
-    }) => Promise<ProviderSaveConfigResponse>;
+    verify: (input: ProviderVerifyRequest) => Promise<ProviderVerifyResponse>;
+    listModels: (
+      input: ProviderListModelsRequest,
+    ) => Promise<ProviderListModelsResponse>;
+    saveConfig: (
+      input: ProviderSaveConfigRequest,
+    ) => Promise<ProviderSaveConfigResponse>;
     fetchPricing: (
       input: ProviderFetchPricingRequest,
     ) => Promise<ProviderFetchPricingResponse>;
     cancelFetchPricing: () => Promise<{ ok: boolean }>;
     onFetchPricingProgress: (
-      cb: (event: {
-        message: string;
-        at: string;
-      }) => void,
+      cb: (event: ProviderFetchPricingProgress) => void,
     ) => () => void;
   };
   ui: {
@@ -210,6 +257,9 @@ export type DesktopBridge = {
     onNewSession: (cb: () => void) => () => void;
     onOpenProvider: (cb: () => void) => () => void;
     onToggleArchitecture: (cb: () => void) => () => void;
+    onTogglePreview: (cb: () => void) => () => void;
+    onTogglePlan: (cb: () => void) => () => void;
+    onToggleModel: (cb: () => void) => () => void;
   };
 };
 
@@ -220,6 +270,9 @@ const UI_NEW_PROJECT = "ui:new-project";
 const UI_NEW_SESSION = "ui:new-session";
 const UI_OPEN_PROVIDER = "ui:open-provider";
 const UI_TOGGLE_ARCHITECTURE = "ui:toggle-architecture";
+const UI_TOGGLE_PREVIEW = "ui:toggle-preview";
+const UI_TOGGLE_PLAN = "ui:toggle-plan";
+const UI_TOGGLE_MODEL = "ui:toggle-model";
 
 function onUiEvent(channel: string, cb: () => void): () => void {
   const handler = () => cb();
@@ -231,11 +284,25 @@ const bridge: DesktopBridge = {
   session: {
     get: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_GET),
     list: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_LIST, {}),
-    create: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_CREATE, {}),
+    create: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_CREATE, input ?? {}),
     switch: (sessionId) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_SWITCH, { sessionId }),
-    close: (sessionId) =>
-      ipcRenderer.invoke(IPC_CHANNELS.SESSION_CLOSE, { sessionId }),
+    close: (sessionId, outcome) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_CLOSE, {
+        sessionId,
+        ...(outcome ? { outcome } : {}),
+      }),
+    discard: (sessionId, deleteBranch) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_DISCARD, {
+        sessionId,
+        deleteBranch,
+      }),
+    listLogs: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_LIST_LOGS, {}),
+    getLog: (sessionId) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_GET_LOG, {
+        ...(sessionId ? { sessionId } : {}),
+      }),
     subscribe: (cb) => {
       const channel = `${IPC_CHANNELS.SESSION_SUBSCRIBE}:update`;
       const handler = (_: unknown, event: SessionUpdateEvent) => cb(event);
@@ -259,6 +326,8 @@ const bridge: DesktopBridge = {
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_REJECT_PLAN_READY, {}),
     draftBuildCommit: () =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT, {}),
+    draftGitMessage: (kind) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_DRAFT_GIT_MESSAGE, { kind }),
     commitBuild: (message) =>
       ipcRenderer.invoke(IPC_CHANNELS.SESSION_COMMIT_BUILD, { message }),
     dismissBuildCommit: () =>
@@ -298,6 +367,16 @@ const bridge: DesktopBridge = {
         selectedOptionIds: input.selectedOptionIds ?? [],
         text: input.text,
         cancelled: Boolean(input.cancelled),
+      }),
+    humanSetup: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_HUMAN_SETUP, {
+        action: input.action,
+        ...(input.itemId ? { itemId: input.itemId } : {}),
+        ...(typeof input.done === "boolean" ? { done: input.done } : {}),
+      }),
+    dismissNotice: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SESSION_DISMISS_NOTICE, {
+        noticeId: input.noticeId,
       }),
     cancel: () => ipcRenderer.invoke(IPC_CHANNELS.SESSION_CANCEL, {}),
     exportDiagnostics: () =>
@@ -339,6 +418,44 @@ const bridge: DesktopBridge = {
       ipcRenderer.invoke(IPC_CHANNELS.ENGINE_INDEX_REFRESH, {}),
     stderr: () => ipcRenderer.invoke(IPC_CHANNELS.ENGINE_STDERR, {}),
   },
+  preview: {
+    status: () => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_STATUS, {}),
+    subscribe: (cb) => {
+      const channel = `${IPC_CHANNELS.PREVIEW_SUBSCRIBE}:update`;
+      const handler = (_: unknown, status: PreviewStatus) => cb(status);
+      ipcRenderer.on(channel, handler);
+      ipcRenderer.send(IPC_CHANNELS.PREVIEW_SUBSCRIBE);
+      return () => ipcRenderer.removeListener(channel, handler);
+    },
+    start: () => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_START, {}),
+    stop: () => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_STOP, {}),
+    setBounds: (rect) =>
+      ipcRenderer.send(IPC_CHANNELS.PREVIEW_SET_BOUNDS, { rect }),
+    setVisible: (visible) =>
+      ipcRenderer.send(IPC_CHANNELS.PREVIEW_SET_VISIBLE, { visible }),
+    setViewport: (viewport) =>
+      ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_SET_VIEWPORT, { viewport }),
+    navigate: (url) =>
+      ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_NAVIGATE, { url }),
+    act: (action) => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_ACT, { action }),
+    clearData: () => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CLEAR_DATA, {}),
+    toggleDevTools: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_TOGGLE_DEVTOOLS, {}),
+    capture: () => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CAPTURE, {}),
+    refreshSetup: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_REFRESH_SETUP, {}),
+    confirmSetup: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CONFIRM_SETUP, {}),
+    pickElement: () => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_PICK_ELEMENT, {}),
+    cancelPick: () => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CANCEL_PICK, {}),
+    onElement: (cb) => {
+      const channel = `${IPC_CHANNELS.PREVIEW_ELEMENT_SUBSCRIBE}:update`;
+      const handler = (_: unknown, hit: PreviewElementSelection) => cb(hit);
+      ipcRenderer.on(channel, handler);
+      ipcRenderer.send(IPC_CHANNELS.PREVIEW_ELEMENT_SUBSCRIBE);
+      return () => ipcRenderer.removeListener(channel, handler);
+    },
+  },
   workspace: {
     open: (path) =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_OPEN, path ? { path } : {}),
@@ -349,6 +466,31 @@ const bridge: DesktopBridge = {
     listRecent: () => ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_RECENT),
     gitStatus: () =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_STATUS, {}),
+    gitCheckout: (input) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_CHECKOUT, input),
+    gitPull: (remote) =>
+      ipcRenderer.invoke(
+        IPC_CHANNELS.WORKSPACE_GIT_PULL,
+        remote ? { remote } : {},
+      ),
+    gitPush: (remote) =>
+      ipcRenderer.invoke(
+        IPC_CHANNELS.WORKSPACE_GIT_PUSH,
+        remote ? { remote } : {},
+      ),
+    gitSetRemote: (remote) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_SET_REMOTE, { remote }),
+    gitStash: (message) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_STASH, { message }),
+    gitStashList: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_STASH_LIST, {}),
+    gitStashPop: (index) =>
+      ipcRenderer.invoke(
+        IPC_CHANNELS.WORKSPACE_GIT_STASH_POP,
+        typeof index === "number" ? { index } : {},
+      ),
+    gitCommit: (message) =>
+      ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_GIT_COMMIT, { message }),
     listBranches: () =>
       ipcRenderer.invoke(IPC_CHANNELS.WORKSPACE_LIST_BRANCHES, {}),
     listDir: (path) =>
@@ -387,6 +529,11 @@ const bridge: DesktopBridge = {
     list: () => ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_LIST, {}),
     setActive: (id: string) =>
       ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_SET_ACTIVE, { id }),
+    setModel: (model, providerId) =>
+      ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_SET_MODEL, {
+        model,
+        ...(providerId ? { providerId } : {}),
+      }),
     delete: (id: string) =>
       ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_DELETE, { id }),
     verify: (input) => ipcRenderer.invoke(IPC_CHANNELS.PROVIDER_VERIFY, input),
@@ -416,6 +563,9 @@ const bridge: DesktopBridge = {
     onNewSession: (cb) => onUiEvent(UI_NEW_SESSION, cb),
     onOpenProvider: (cb) => onUiEvent(UI_OPEN_PROVIDER, cb),
     onToggleArchitecture: (cb) => onUiEvent(UI_TOGGLE_ARCHITECTURE, cb),
+    onTogglePreview: (cb) => onUiEvent(UI_TOGGLE_PREVIEW, cb),
+    onTogglePlan: (cb) => onUiEvent(UI_TOGGLE_PLAN, cb),
+    onToggleModel: (cb) => onUiEvent(UI_TOGGLE_MODEL, cb),
   },
 };
 

@@ -1,10 +1,12 @@
 import {
+  memo,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type UIEvent,
+  type WheelEvent,
 } from "react";
 import type {
   PlanPhase,
@@ -21,17 +23,45 @@ import {
   MarkdownMessage,
   TranscriptLabel,
 } from "./TranscriptMessages";
+import { TranscriptImageAttachment } from "./TranscriptImageAttachment";
+import { ThinkingBlock } from "./ThinkingBlock";
 import { LiveTerminalPane } from "./LiveTerminalPane";
 import { DiffNavigator } from "./DiffNavigator";
 import { BuildContinueBanner } from "./BuildContinueBanner";
+import { HumanSetupBanner } from "./HumanSetupBanner";
+import { SessionNoticeBanner } from "./SessionNoticeBanner";
 import { StartBuildBanner } from "./StartBuildBanner";
 import { CommitBuildBanner } from "./CommitBuildBanner";
 import { IntegrateBuildBanner } from "./IntegrateBuildBanner";
 import { ArchiveChatBanner } from "./ArchiveChatBanner";
+import { GitConflictBanner } from "./GitConflictBanner";
+import type { GitConflictNotice } from "./GitBar";
 import { TestingReportBoard } from "./TestingReportBoard";
+import { SplitGroup } from "./SplitGroup";
 import { playChecklistChime } from "../lib/checklistSound";
 
 const SCROLL_STICK_THRESHOLD_PX = 96;
+
+/**
+ * A single tool payload can be a whole file or the output of a build, and the
+ * log renders it into the DOM as text. Past this many characters the reader
+ * gains nothing and the renderer pays for it in memory, so the log shows a head
+ * and says how much it dropped.
+ */
+const TOOL_LOG_MAX_CHARS = 40_000;
+
+function truncateToolLog(text: string): string {
+  if (text.length <= TOOL_LOG_MAX_CHARS) return text;
+  const hidden = text.length - TOOL_LOG_MAX_CHARS;
+  return `${text.slice(0, TOOL_LOG_MAX_CHARS)}\n…\n[${hidden} more characters hidden — use Copy chat (deep) for the full payload]`;
+}
+
+function modShiftHint(key: string): string {
+  const isApple =
+    typeof navigator !== "undefined" &&
+    /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  return isApple ? `⌘⇧${key}` : `Ctrl+Shift+${key}`;
+}
 
 const PHASE_STATUS_LABEL: Record<PlanPhase["status"], string> = {
   pending: "Pending",
@@ -142,7 +172,7 @@ function formatToolArgsForLog(
 ): string | null {
   if (!args || Object.keys(args).length === 0) return null;
   try {
-    return JSON.stringify(args, null, 2);
+    return truncateToolLog(JSON.stringify(args, null, 2));
   } catch {
     return String(args);
   }
@@ -150,9 +180,9 @@ function formatToolArgsForLog(
 
 function formatToolOutputForLog(output: unknown): string | null {
   if (output === undefined || output === null) return null;
-  if (typeof output === "string") return output;
+  if (typeof output === "string") return truncateToolLog(output);
   try {
-    return JSON.stringify(output, null, 2);
+    return truncateToolLog(JSON.stringify(output, null, 2));
   } catch {
     return String(output);
   }
@@ -197,8 +227,18 @@ function ToolLogCard(props: {
   const [expanded, setExpanded] = useState(false);
   const label = actionLabel(props.toolName);
   const target = toolTargetPreview(props.toolName, props.arguments);
-  const argsLog = formatToolArgsForLog(props.toolName, props.arguments);
-  const outputLog = formatToolOutputForLog(props.output);
+  // Serialising args and output is the expensive part of a tool row, and the
+  // agent repaints the transcript many times a second while it streams. A
+  // collapsed row shows neither, so it must not pay for either.
+  const argsLog = useMemo(
+    () =>
+      expanded ? formatToolArgsForLog(props.toolName, props.arguments) : null,
+    [expanded, props.toolName, props.arguments],
+  );
+  const outputLog = useMemo(
+    () => (expanded ? formatToolOutputForLog(props.output) : null),
+    [expanded, props.output],
+  );
   const statusClass =
     props.status === "running"
       ? "tool-row-running"
@@ -261,6 +301,109 @@ function ToolLogCard(props: {
     </div>
   );
 }
+
+type TranscriptTurnProps = { turn: Turn; primaryThinking: boolean };
+
+/**
+ * Every state push arrives from the main process as a fresh structured clone, so
+ * turn objects never keep their identity and a shallow prop check would always
+ * miss. A finished turn is immutable in practice, so comparing the fields the
+ * row actually renders is both cheap and enough.
+ */
+function sameTranscriptTurn(
+  prev: TranscriptTurnProps,
+  next: TranscriptTurnProps,
+): boolean {
+  return (
+    prev.turn.id === next.turn.id &&
+    prev.primaryThinking === next.primaryThinking &&
+    prev.turn.content === next.turn.content &&
+    prev.turn.reasoning === next.turn.reasoning &&
+    (prev.turn.toolResults?.length ?? 0) ===
+      (next.turn.toolResults?.length ?? 0) &&
+    (prev.turn.attachments?.length ?? 0) ===
+      (next.turn.attachments?.length ?? 0)
+  );
+}
+
+/**
+ * One turn of the transcript.
+ *
+ * The assistant side deliberately renders tool rows *before* the chain of
+ * thought and the answer. A turn can fire a dozen tools, and with thinking on
+ * top each new row pushed it further off the viewport while the pane followed
+ * the tail — the reader was left staring at a list of file paths. Keeping
+ * thinking and the answer last means the things worth reading stay next to the
+ * bottom edge, where the transcript is pinned.
+ *
+ * Memoised because a running turn repaints the pane many times a second and a
+ * finished turn never changes: without this, every stream tick re-renders every
+ * markdown body and every tool row in the whole history.
+ */
+const TranscriptTurn = memo(function TranscriptTurn(props: TranscriptTurnProps) {
+  const { turn, primaryThinking } = props;
+
+  if (turn.role === "user") {
+    return (
+      <div className="transcript-block">
+        <div className="transcript-user">
+          <TranscriptLabel tone="user">You</TranscriptLabel>
+          {turn.attachments?.length ? (
+            <div className="transcript-attachments" aria-label="Attachments">
+              {turn.attachments.map((att) =>
+                att.kind === "image" && att.previewDataUrl ? (
+                  <TranscriptImageAttachment
+                    key={att.id}
+                    src={att.previewDataUrl}
+                    name={att.name}
+                  />
+                ) : (
+                  <span
+                    key={att.id}
+                    className="transcript-file-chip"
+                    title={att.path ?? att.name}
+                  >
+                    {att.name}
+                  </span>
+                ),
+              )}
+            </div>
+          ) : null}
+          <CollapsibleUserText content={turn.content} />
+        </div>
+      </div>
+    );
+  }
+
+  if (turn.role !== "assistant") return null;
+
+  return (
+    <div className="transcript-block">
+      <div className="transcript-assistant">
+        <TranscriptLabel tone="agent">Agent</TranscriptLabel>
+        {(turn.toolResults ?? []).map((result) => {
+          const toolCall = turn.toolCalls?.find((c) => c.id === result.callId);
+          const toolName = toolCall?.name ?? "tool";
+          return (
+            <ToolLogCard
+              key={result.callId}
+              toolName={toolName}
+              status={result.success ? "done" : "failed"}
+              {...(result.summary ? { summary: result.summary } : {})}
+              {...(result.error ? { error: result.error } : {})}
+              {...(toolCall?.arguments ? { arguments: toolCall.arguments } : {})}
+              {...(result.output !== undefined ? { output: result.output } : {})}
+            />
+          );
+        })}
+        {turn.reasoning ? (
+          <ThinkingBlock text={turn.reasoning} primary={primaryThinking} />
+        ) : null}
+        {turn.content ? <MarkdownMessage content={turn.content} /> : null}
+      </div>
+    </div>
+  );
+}, sameTranscriptTurn);
 
 function roleHeading(role: Turn["role"]): string {
   if (role === "user") return "You";
@@ -605,16 +748,52 @@ export function ConversationPane(props: {
   activeSessionId: string | null;
   onBuildStarted?: (() => void) | undefined;
   onBuildCommitted?: (() => void) | undefined;
+  gitConflict?: GitConflictNotice | null;
+  gitConflictDialogOpen?: boolean;
+  onOpenGitConflict?: (notice: GitConflictNotice) => void;
+  onToggleModel?: (() => void) | undefined;
 }) {
-  const { state, sessions, activeSessionId, onBuildStarted, onBuildCommitted } =
-    props;
+  const {
+    state,
+    sessions,
+    activeSessionId,
+    onBuildStarted,
+    onBuildCommitted,
+    gitConflict,
+    gitConflictDialogOpen,
+    onOpenGitConflict,
+    onToggleModel,
+  } = props;
   const bridge = getBridge();
   const busy = isBusy(state?.status);
   const canCancel = typeof bridge?.session.cancel === "function";
   const scrollRef = useRef<HTMLDivElement>(null);
-  const stickToBottomRef = useRef(true);
+  const [following, setFollowing] = useState(true);
+  const followingRef = useRef(true);
+  const ownScrollRef = useRef(false);
+  const lastUserTurnIdRef = useRef<string | null>(null);
 
   const turns = state?.turns ?? [];
+  // A failed turn already ends the transcript with a notice carrying this text;
+  // repeating it in a banner two rows below reads like two separate failures.
+  const errorToShow = useMemo(() => {
+    const error = state?.error?.trim();
+    if (!error) return null;
+    const last = turns[turns.length - 1];
+    if (last?.role === "assistant" && last.content.includes(error)) return null;
+    return error;
+  }, [state?.error, turns]);
+  // `T` belongs to the newest chain of thought on screen. While a turn runs the
+  // live block claims it, so no finished turn should answer to the key.
+  const lastReasoningTurnId = useMemo(() => {
+    for (let i = turns.length - 1; i >= 0; i -= 1) {
+      if (turns[i]?.reasoning) return turns[i]!.id;
+    }
+    return null;
+  }, [turns]);
+  const primaryThinkingTurnId = state?.partialReasoningText
+    ? null
+    : lastReasoningTurnId;
   const showThinking =
     busy &&
     (state?.status === "thinking" ||
@@ -669,6 +848,11 @@ export function ConversationPane(props: {
     function onKey(e: KeyboardEvent) {
       if (!(e.metaKey || e.ctrlKey) || !e.shiftKey) return;
       const key = e.key.toLowerCase();
+      if (key === "j") {
+        e.preventDefault();
+        jumpToLatest();
+        return;
+      }
       if (key !== "c" && key !== "d") return;
       if (turns.length === 0) return;
       e.preventDefault();
@@ -697,37 +881,78 @@ export function ConversationPane(props: {
     };
   }, []);
 
+  /**
+   * The transcript follows the tail while the agent works, but a reader who
+   * scrolls up has asked for the opposite, and everything arriving underneath
+   * must stay out of their way until they say otherwise. Following resumes when
+   * they scroll back to the bottom edge, send a message, or press the button
+   * that only exists while following is off.
+   */
+  function setFollowTail(next: boolean) {
+    followingRef.current = next;
+    setFollowing(next);
+  }
+
   function handleTranscriptScroll(event: UIEvent<HTMLDivElement>) {
     const el = event.currentTarget;
     const distanceFromBottom =
       el.scrollHeight - el.scrollTop - el.clientHeight;
-    stickToBottomRef.current = distanceFromBottom <= SCROLL_STICK_THRESHOLD_PX;
+    // Our own jump to the bottom must never be read as a reader gesture: the
+    // stream can grow the content between the assignment and this event, which
+    // would otherwise look like someone scrolling away.
+    const ours = ownScrollRef.current;
+    ownScrollRef.current = false;
+    if (distanceFromBottom <= SCROLL_STICK_THRESHOLD_PX) {
+      setFollowTail(true);
+      return;
+    }
+    if (!ours) setFollowTail(false);
+  }
+
+  function handleTranscriptWheel(event: WheelEvent<HTMLDivElement>) {
+    if (event.deltaY < 0) setFollowTail(false);
   }
 
   function scrollTranscriptToBottom() {
     const el = scrollRef.current;
     if (!el) return;
-    el.scrollTop = el.scrollHeight;
+    const bottom = el.scrollHeight - el.clientHeight;
+    // Already there: writing anyway would arm the "this scroll is ours" flag
+    // without a scroll event to consume it, and the next real gesture would be
+    // mistaken for our own.
+    if (Math.abs(el.scrollTop - bottom) < 1) return;
+    ownScrollRef.current = true;
+    el.scrollTop = bottom;
+  }
+
+  function jumpToLatest() {
+    setFollowTail(true);
+    scrollTranscriptToBottom();
   }
 
   // New session or freshly sent user message: pin to bottom again.
   useEffect(() => {
-    stickToBottomRef.current = true;
+    setFollowTail(true);
   }, [activeSessionId]);
 
   useEffect(() => {
     const last = turns[turns.length - 1];
-    if (last?.role === "user") {
-      stickToBottomRef.current = true;
-    }
+    if (last?.role !== "user") return;
+    // Every state push arrives as a fresh clone, so this fires on each tick of
+    // the running turn. Only a user message we have not seen before may take
+    // the reader back to the bottom.
+    if (lastUserTurnIdRef.current === last.id) return;
+    lastUserTurnIdRef.current = last.id;
+    setFollowTail(true);
   }, [turns]);
 
   useLayoutEffect(() => {
-    if (!stickToBottomRef.current) return;
+    if (!followingRef.current) return;
     scrollTranscriptToBottom();
   }, [
     turns,
     state?.partialAssistantText,
+    state?.partialReasoningText,
     state?.liveTools,
     state?.activityLabel,
     state?.error,
@@ -741,11 +966,12 @@ export function ConversationPane(props: {
   void copyDeepState;
 
   return (
-    <>
+    <div className="transcript-shell">
       <div
         ref={scrollRef}
         className="pane-body transcript-body"
         onScroll={handleTranscriptScroll}
+        onWheel={handleTranscriptWheel}
       >
         {!state?.workspace && (
           <div className="empty-state">
@@ -759,72 +985,13 @@ export function ConversationPane(props: {
           </div>
         ) : null}
 
-        {state?.error ? (
-          <div className="error-banner" role="alert">
-            <strong>Error</strong>
-            <span className="error-banner-detail">{state.error}</span>
-          </div>
-        ) : null}
-
         <div className="transcript" aria-live="polite">
           {turns.map((turn) => (
-            <div key={turn.id} className="transcript-block">
-              {turn.role === "user" ? (
-                <div className="transcript-user">
-                  <TranscriptLabel tone="user">You</TranscriptLabel>
-                  {turn.attachments?.length ? (
-                    <div className="transcript-attachments" aria-label="Attachments">
-                      {turn.attachments.map((att) =>
-                        att.kind === "image" && att.previewDataUrl ? (
-                          <img
-                            key={att.id}
-                            className="transcript-thumb"
-                            src={att.previewDataUrl}
-                            alt={att.name}
-                            title={att.name}
-                          />
-                        ) : (
-                          <span
-                            key={att.id}
-                            className="transcript-file-chip"
-                            title={att.path ?? att.name}
-                          >
-                            {att.name}
-                          </span>
-                        ),
-                      )}
-                    </div>
-                  ) : null}
-                  <CollapsibleUserText content={turn.content} />
-                </div>
-              ) : null}
-
-              {turn.role === "assistant" ? (
-                <div className="transcript-assistant">
-                  <TranscriptLabel tone="agent">Agent</TranscriptLabel>
-                  {(turn.toolResults ?? []).map((result) => {
-                    const toolCall = turn.toolCalls?.find((c) => c.id === result.callId);
-                    const toolName = toolCall?.name ?? "tool";
-                    return (
-                      <ToolLogCard
-                        key={result.callId}
-                        toolName={toolName}
-                        status={result.success ? "done" : "failed"}
-                        {...(result.summary ? { summary: result.summary } : {})}
-                        {...(result.error ? { error: result.error } : {})}
-                        {...(toolCall?.arguments
-                          ? { arguments: toolCall.arguments }
-                          : {})}
-                        {...(result.output !== undefined
-                          ? { output: result.output }
-                          : {})}
-                      />
-                    );
-                  })}
-                  {turn.content ? <MarkdownMessage content={turn.content} /> : null}
-                </div>
-              ) : null}
-            </div>
+            <TranscriptTurn
+              key={turn.id}
+              turn={turn}
+              primaryThinking={turn.id === primaryThinkingTurnId}
+            />
           ))}
 
           {busy || (state?.liveTools?.length ?? 0) > 0 ? (
@@ -841,6 +1008,14 @@ export function ConversationPane(props: {
                   {...(tool.error ? { error: tool.error } : {})}
                 />
               ))}
+
+              {state?.partialReasoningText ? (
+                <ThinkingBlock
+                  text={state.partialReasoningText}
+                  live
+                  primary
+                />
+              ) : null}
 
               {showThinking ? (
                 <div className="thinking-row" role="status">
@@ -877,7 +1052,21 @@ export function ConversationPane(props: {
           ) : null}
         </div>
 
+        {errorToShow ? (
+          <div className="error-banner" role="alert">
+            <strong>Error</strong>
+            <span className="error-banner-detail">{errorToShow}</span>
+          </div>
+        ) : null}
+
+        <GitConflictBanner
+          notice={gitConflict ?? null}
+          dialogOpen={Boolean(gitConflictDialogOpen)}
+          onResolve={(notice) => onOpenGitConflict?.(notice)}
+        />
         <StartBuildBanner state={state} onConfirmed={onBuildStarted} />
+        <SessionNoticeBanner state={state} onToggleModel={onToggleModel} />
+        <HumanSetupBanner state={state} />
         <BuildContinueBanner state={state} />
         <CommitBuildBanner state={state} onCommitted={onBuildCommitted} />
         <IntegrateBuildBanner state={state} onDone={onBuildCommitted} />
@@ -887,7 +1076,18 @@ export function ConversationPane(props: {
           <ApprovalCard key={approval.id} approval={approval} />
         ))}
       </div>
-    </>
+
+      {following ? null : (
+        <button
+          type="button"
+          className="transcript-jump"
+          onClick={jumpToLatest}
+          title={`Jump to latest and resume auto-scroll (${modShiftHint("J")})`}
+        >
+          <span aria-hidden>↓</span> Latest · {modShiftHint("J")}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -921,12 +1121,6 @@ function formatApprovalArgs(toolCall: ToolCall): string | null {
   }
 }
 
-const TERMINAL_AUTO_APPROVE_MS = 3000;
-
-function isTerminalCommandApproval(toolName: string): boolean {
-  return toolName === "run_command";
-}
-
 function ApprovalCard(props: {
   approval: {
     id: string;
@@ -937,8 +1131,6 @@ function ApprovalCard(props: {
 }) {
   const { approval } = props;
   const argsPreview = formatApprovalArgs(approval.toolCall);
-  const autoApprove = isTerminalCommandApproval(approval.toolCall.name);
-  const [progress, setProgress] = useState(0);
   const settledRef = useRef(false);
   const approvalIdRef = useRef(approval.id);
   approvalIdRef.current = approval.id;
@@ -956,23 +1148,7 @@ function ApprovalCard(props: {
 
   useEffect(() => {
     settledRef.current = false;
-    setProgress(0);
-    if (!autoApprove) return;
-
-    const startedAt = Date.now();
-    const tick = () => {
-      if (settledRef.current) return;
-      const p = Math.min(1, (Date.now() - startedAt) / TERMINAL_AUTO_APPROVE_MS);
-      setProgress(p);
-      if (p >= 1) {
-        settledRef.current = true;
-        void getBridge()?.session.approve(approvalIdRef.current);
-      }
-    };
-    tick();
-    const id = window.setInterval(tick, 32);
-    return () => window.clearInterval(id);
-  }, [approval.id, autoApprove]);
+  }, [approval.id]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1014,20 +1190,8 @@ function ApprovalCard(props: {
 
   return (
     <div className="approval-card" role="dialog" aria-label="Approval required">
-      {autoApprove ? (
-        <div className="approval-progress" aria-hidden>
-          <div
-            className="approval-progress-fill"
-            style={{ width: `${progress * 100}%` }}
-          />
-        </div>
-      ) : null}
       <div className="approval-card-body">
-        <strong>
-          {autoApprove
-            ? "Command — auto-approves in 3s"
-            : "Approval required"}
-        </strong>
+        <strong>Approval required</strong>
         <p>{approval.description}</p>
         <p className="approval-meta">
           Tool: {approval.toolCall.name} · Risk: {approval.riskLevel}
@@ -1094,35 +1258,60 @@ function BuildCockpit(props: {
   const phase = props.state ? deriveProductPhase(props.state) : "building";
   const showTestingReport = phase === "testing" || phase === "checking";
 
+  const plan = (
+    <section
+      className="build-cockpit-plan"
+      aria-label={
+        phase === "checking"
+          ? "Check report"
+          : showTestingReport
+            ? "Testing report"
+            : "Plan"
+      }
+    >
+      {showTestingReport ? (
+        <TestingReportBoard state={props.state} />
+      ) : (
+        <PlanBoard state={props.state} onOpenQa={props.onOpenQa} planning={false} />
+      )}
+    </section>
+  );
+  const diff = (
+    <section className="build-cockpit-side" aria-label="Branch diff">
+      <DiffNavigator
+        workspaceRoot={props.state?.workspace?.resolvedRootPath}
+        refreshToken={refreshToken}
+      />
+    </section>
+  );
+  const columns = (
+    <SplitGroup
+      storageKey="build-cockpit-cols"
+      autoWeights={[0.52, 0.48]}
+      mins={[180, 180]}
+    >
+      {plan}
+      {diff}
+    </SplitGroup>
+  );
+
   return (
     <div className={`build-cockpit ${showTerminal ? "build-cockpit-with-terminal" : ""}`}>
-      <section
-        className="build-cockpit-plan"
-        aria-label={
-          phase === "checking"
-            ? "Check report"
-            : showTestingReport
-              ? "Testing report"
-              : "Plan"
-        }
-      >
-        {showTestingReport ? (
-          <TestingReportBoard state={props.state} />
-        ) : (
-          <PlanBoard state={props.state} onOpenQa={props.onOpenQa} planning={false} />
-        )}
-      </section>
-      <section className="build-cockpit-side" aria-label="Branch diff">
-        <DiffNavigator
-          workspaceRoot={props.state?.workspace?.resolvedRootPath}
-          refreshToken={refreshToken}
-        />
-      </section>
       {showTerminal ? (
-        <section className="build-cockpit-terminal" aria-label="Terminal">
-          <LiveTerminalPane state={props.state} commandHistory={commandHistory} />
-        </section>
-      ) : null}
+        <SplitGroup
+          storageKey="build-cockpit-stack"
+          orientation="vertical"
+          autoWeights={[0.72, 0.28]}
+          mins={[160, 120]}
+        >
+          {columns}
+          <section className="build-cockpit-terminal" aria-label="Terminal">
+            <LiveTerminalPane state={props.state} commandHistory={commandHistory} />
+          </section>
+        </SplitGroup>
+      ) : (
+        columns
+      )}
     </div>
   );
 }
@@ -1131,18 +1320,34 @@ export function VerifyPane(props: {
   state: SessionState | null;
   onOpenQa?: (() => void) | undefined;
   onOpenArchitecture?: (() => void) | undefined;
+  onHide?: (() => void) | undefined;
   planning?: boolean;
 }) {
   const {
     state,
     onOpenQa,
     onOpenArchitecture,
+    onHide,
     planning = false,
   } = props;
+
+  const hideButton = onHide ? (
+    <div className="side-pane-tools">
+      <button
+        type="button"
+        className="btn btn-secondary btn-sm"
+        title={`Hide the plan and give the space back (${modShiftHint("L")})`}
+        onClick={onHide}
+      >
+        Hide · {modShiftHint("L")}
+      </button>
+    </div>
+  ) : null;
 
   if (planning) {
     return (
       <div className="pane-body plan-side-pane" role="region" aria-label="Plan">
+        {hideButton}
         <ArchitectureSummary
           workspaceRoot={state?.workspace?.resolvedRootPath}
           planning
@@ -1155,6 +1360,7 @@ export function VerifyPane(props: {
 
   return (
     <div className="pane-body build-side-pane" role="region" aria-label="Build">
+      {hideButton}
       <BuildCockpit state={state} onOpenQa={onOpenQa} />
     </div>
   );

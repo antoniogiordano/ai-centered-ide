@@ -5,9 +5,13 @@ import {
   buildProviderHud,
   emptyProviderRegistry,
   emptyProviderUsage,
+  inferProviderKind,
+  mergeProviderModels,
   migrateLegacyProviderConfig,
   providerKeychainAccount,
   type ProviderHud,
+  type ProviderKind,
+  type ProviderModelCatalogEntry,
   type ProviderRegistry,
   type ProviderUsage,
   type SavedProvider,
@@ -108,8 +112,10 @@ export class ProviderRegistryStore {
     name: string;
     baseUrl: string;
     defaultModel: string;
+    kind?: ProviderKind;
     paid: boolean;
     pricing?: SavedProvider["pricing"];
+    models?: ProviderModelCatalogEntry[];
     thinking?: boolean;
     reasoningEffort?: SavedProvider["reasoningEffort"];
     contextWindowTokens?: number | null;
@@ -129,11 +135,17 @@ export class ProviderRegistryStore {
       input.contextWindowTokens !== undefined
         ? input.contextWindowTokens
         : prior?.contextWindowTokens;
+    const nextModels =
+      input.models !== undefined
+        ? mergeProviderModels(prior?.models, input.models)
+        : prior?.models;
+    const baseUrl = input.baseUrl.trim();
     const next: SavedProvider = {
       id,
       name: input.name.trim() || "Provider",
-      baseUrl: input.baseUrl.trim(),
+      baseUrl,
       defaultModel: input.defaultModel.trim(),
+      kind: input.kind ?? prior?.kind ?? inferProviderKind(baseUrl),
       paid: Boolean(input.paid),
       thinking: input.thinking ?? prior?.thinking ?? false,
       reasoningEffort:
@@ -144,6 +156,7 @@ export class ProviderRegistryStore {
       ...(nextPricing && Object.keys(nextPricing).length
         ? { pricing: nextPricing }
         : {}),
+      ...(nextModels?.length ? { models: nextModels } : {}),
       createdAt: prior?.createdAt ?? now,
       updatedAt: now,
     };
@@ -159,6 +172,52 @@ export class ProviderRegistryStore {
     if (input.apiKey?.trim()) {
       void this.setApiKey(id, input.apiKey);
     }
+    return next;
+  }
+
+  setDefaultModel(
+    providerId: string,
+    model: string,
+  ): SavedProvider | null {
+    const registry = this.loadRegistry();
+    const idx = registry.providers.findIndex((p) => p.id === providerId);
+    if (idx < 0) return null;
+    const prior = registry.providers[idx]!;
+    const nextModel = model.trim();
+    if (!nextModel) return null;
+    const entry = prior.models?.find((item) => item.id === nextModel);
+    const next: SavedProvider = {
+      ...prior,
+      defaultModel: nextModel,
+      updatedAt: new Date().toISOString(),
+      ...(entry?.contextWindowTokens
+        ? { contextWindowTokens: entry.contextWindowTokens }
+        : {}),
+    };
+    registry.providers[idx] = next;
+    this.saveRegistry(registry);
+    return next;
+  }
+
+  patchModelCapabilities(
+    providerId: string,
+    modelId: string,
+    patch: Partial<Omit<ProviderModelCatalogEntry, "id">>,
+  ): SavedProvider | null {
+    const registry = this.loadRegistry();
+    const idx = registry.providers.findIndex((p) => p.id === providerId);
+    if (idx < 0) return null;
+    const prior = registry.providers[idx]!;
+    const models = mergeProviderModels(prior.models, [
+      { id: modelId, ...patch },
+    ]);
+    const next: SavedProvider = {
+      ...prior,
+      models,
+      updatedAt: new Date().toISOString(),
+    };
+    registry.providers[idx] = next;
+    this.saveRegistry(registry);
     return next;
   }
 

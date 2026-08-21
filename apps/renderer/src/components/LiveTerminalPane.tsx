@@ -2,8 +2,29 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { LiveTerminal, SessionState } from "@ai-ide/shared";
 import { getBridge } from "../bridge";
 
+/**
+ * Mirror of the main-process cap (terminals.ts MAX_BUFFER_CHARS): a build or a
+ * test run emits megabytes, and holding all of it in renderer state means every
+ * repaint of the pane re-scans and re-lays out the whole thing until the process
+ * runs out of memory. Only the tail is ever readable anyway.
+ */
+const MAX_BUFFER_CHARS = 200_000;
+
+function appendCapped(previous: string, data: string): string {
+  const next = previous + data;
+  return next.length > MAX_BUFFER_CHARS
+    ? next.slice(-MAX_BUFFER_CHARS)
+    : next;
+}
+
+/** Built from a char code because a literal ESC in a regex is a lint error. */
+const ANSI_ESCAPE = new RegExp(
+  `${String.fromCharCode(27)}\\[[0-9;?]*[a-zA-Z]`,
+  "g",
+);
+
 function stripAnsi(input: string): string {
-  return input.replace(/\u001b\[[0-9;?]*[a-zA-Z]/g, "").replace(/\r/g, "");
+  return input.replace(ANSI_ESCAPE, "").replace(/\r/g, "");
 }
 
 export function LiveTerminalPane(props: {
@@ -35,12 +56,13 @@ export function LiveTerminalPane(props: {
 
   useEffect(() => {
     setBuffers((prev) => {
+      const missing = terminals.filter((t) => prev[t.id] === undefined);
+      // `terminals` is a fresh clone on every state push, so this effect runs
+      // constantly; seeding a new object each time would re-render the pane and
+      // re-scan the output for nothing.
+      if (missing.length === 0) return prev;
       const next = { ...prev };
-      for (const t of terminals) {
-        if (next[t.id] === undefined) {
-          next[t.id] = t.lastOutput ?? "";
-        }
-      }
+      for (const t of missing) next[t.id] = t.lastOutput ?? "";
       return next;
     });
   }, [terminals]);
@@ -51,15 +73,24 @@ export function LiveTerminalPane(props: {
     return bridge.terminal.subscribe((event) => {
       setBuffers((prev) => ({
         ...prev,
-        [event.terminalId]: (prev[event.terminalId] ?? "") + event.data,
+        [event.terminalId]: appendCapped(prev[event.terminalId] ?? "", event.data),
       }));
     });
   }, []);
 
+  // Depend on the strings, not on `active`: the terminal object is a new clone on
+  // every push, while its output usually is not new at all.
+  const activeBuffer = active ? buffers[active.id] : undefined;
+  const activeFallback = active?.lastOutput ?? "";
+  const activeOutput = useMemo(
+    () => stripAnsi(activeBuffer ?? activeFallback),
+    [activeBuffer, activeFallback],
+  );
+
   useEffect(() => {
     if (!stickRef.current || !preRef.current) return;
     preRef.current.scrollTop = preRef.current.scrollHeight;
-  }, [active?.id, buffers]);
+  }, [active?.id, activeOutput]);
 
   const sendUser = () => {
     if (!active || !userInput) return;
@@ -115,8 +146,7 @@ export function LiveTerminalPane(props: {
                     el.scrollHeight - el.scrollTop - el.clientHeight < 48;
                 }}
               >
-                {stripAnsi(buffers[active.id] ?? active.lastOutput ?? "") ||
-                  "Waiting for output…"}
+                {activeOutput || "Waiting for output…"}
               </pre>
               <div className="live-terminal-input-row">
                 <input

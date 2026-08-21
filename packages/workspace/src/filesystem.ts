@@ -252,6 +252,8 @@ export type SearchMatch = {
   path: string;
   line: number;
   text: string;
+  /** True when `text` was clipped because the source line is very long. */
+  textTruncated?: boolean;
 };
 
 const DEFAULT_IGNORE = new Set([
@@ -260,34 +262,79 @@ const DEFAULT_IGNORE = new Set([
   "dist",
   "out",
   "release",
+  "build",
+  "coverage",
+  ".next",
+  ".turbo",
+  ".cache",
+  ".venv",
+  "venv",
+  "__pycache__",
 ]);
 
-function loadGitignore(workspaceRoot: string): Set<string> {
-  const ignore = new Set(DEFAULT_IGNORE);
+/**
+ * Matched lines are a recap, not a payload. Minified bundles and sourcemaps
+ * hold single lines in the hundreds of KB, and without this cap one search over
+ * build output could return megabytes — enough to bloat the session state and
+ * leave the model with a truncated, useless slice of JSON.
+ */
+export const DEFAULT_MATCH_TEXT_CHARS = 300;
+
+/** Max matches a single search returns before the caller must narrow it down. */
+export const DEFAULT_SEARCH_MAX_RESULTS = 100;
+
+type IgnoreRules = {
+  names: Set<string>;
+  patterns: RegExp[];
+};
+
+function globToRegExp(pattern: string): RegExp | null {
+  if (!/[*?]/.test(pattern)) return null;
+  const source = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^${source.replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+}
+
+/**
+ * Name-based approximation of .gitignore. Anchored entries such as `/.next/`
+ * must lose both slashes, otherwise they never match the bare directory name
+ * and build output gets walked. Nested path patterns (`cypress/videos/`) and
+ * negations are skipped rather than approximated.
+ */
+function loadGitignore(workspaceRoot: string): IgnoreRules {
+  const names = new Set(DEFAULT_IGNORE);
+  const patterns: RegExp[] = [];
   try {
     const content = readFileSync(join(workspaceRoot, ".gitignore"), "utf8");
     for (const line of content.split("\n")) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      ignore.add(trimmed.replace(/\/$/, ""));
+      if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith("!")) {
+        continue;
+      }
+      const entry = trimmed.replace(/^\/+/, "").replace(/\/+$/, "");
+      if (!entry || entry.includes("/")) continue;
+      const glob = globToRegExp(entry);
+      if (glob) patterns.push(glob);
+      else names.add(entry);
     }
   } catch {
     /* no gitignore */
   }
-  return ignore;
+  return { names, patterns };
 }
 
-function shouldIgnore(name: string, ignore: Set<string>): boolean {
-  return ignore.has(name) || name.startsWith(".env");
+function shouldIgnore(name: string, ignore: IgnoreRules): boolean {
+  if (ignore.names.has(name) || name.startsWith(".env")) return true;
+  return ignore.patterns.some((pattern) => pattern.test(name));
 }
 
 export function searchText(
   workspaceRoot: string,
   query: string,
-  options?: { maxResults?: number },
+  options?: { maxResults?: number; maxTextChars?: number },
 ): SearchMatch[] {
   const ignore = loadGitignore(workspaceRoot);
-  const max = options?.maxResults ?? 100;
+  const max = options?.maxResults ?? DEFAULT_SEARCH_MAX_RESULTS;
+  const maxTextChars = options?.maxTextChars ?? DEFAULT_MATCH_TEXT_CHARS;
   const matches: SearchMatch[] = [];
 
   function walk(dir: string): void {
@@ -321,10 +368,13 @@ export function searchText(
       const lines = content.split("\n");
       for (let i = 0; i < lines.length; i++) {
         if (lines[i]!.includes(query)) {
+          const text = lines[i]!.trim();
+          const clipped = text.length > maxTextChars;
           matches.push({
             path: relative(workspaceRoot, full),
             line: i + 1,
-            text: lines[i]!.trim(),
+            text: clipped ? `${text.slice(0, maxTextChars)}…` : text,
+            ...(clipped ? { textTruncated: true } : {}),
           });
           if (matches.length >= max) return;
         }

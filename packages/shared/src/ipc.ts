@@ -12,9 +12,17 @@ import {
   ArchitectureProfileSchema,
 } from "./architecture.js";
 import {
+  ProviderKindSchema,
+  ProviderModelCatalogEntrySchema,
   ProviderPricingSchema,
   ReasoningEffortSchema,
 } from "./providers.js";
+import {
+  PreviewRectSchema,
+  PreviewStatusSchema,
+  PreviewViewportIdSchema,
+} from "./preview.js";
+import { SessionLogSchema, SessionOutcomeSchema } from "./session-log.js";
 
 export const IPC_CHANNELS = {
   SESSION_GET: "session:get",
@@ -29,10 +37,15 @@ export const IPC_CHANNELS = {
   SESSION_CREATE: "session:create",
   SESSION_SWITCH: "session:switch",
   SESSION_CLOSE: "session:close",
+  SESSION_DISCARD: "session:discard",
+  SESSION_LIST_LOGS: "session:list-logs",
+  SESSION_GET_LOG: "session:get-log",
   SESSION_TERMINAL_CONFIRM: "session:terminal-confirm",
   SESSION_TERMINAL_CONFIRM_EDIT: "session:terminal-confirm-edit",
   SESSION_TERMINAL_ASK: "session:terminal-ask",
   SESSION_AGENT_ASK: "session:agent-ask",
+  SESSION_HUMAN_SETUP: "session:human-setup",
+  SESSION_DISMISS_NOTICE: "session:dismiss-notice",
   TERMINAL_SUBSCRIBE: "terminal:subscribe",
   TERMINAL_LIST: "terminal:list",
   TERMINAL_WRITE_USER: "terminal:write-user",
@@ -49,6 +62,14 @@ export const IPC_CHANNELS = {
   WORKSPACE_CREATE_PROJECT: "workspace:create-project",
   WORKSPACE_LIST_RECENT: "workspace:list-recent",
   WORKSPACE_GIT_STATUS: "workspace:git-status",
+  WORKSPACE_GIT_CHECKOUT: "workspace:git-checkout",
+  WORKSPACE_GIT_PULL: "workspace:git-pull",
+  WORKSPACE_GIT_PUSH: "workspace:git-push",
+  WORKSPACE_GIT_SET_REMOTE: "workspace:git-set-remote",
+  WORKSPACE_GIT_STASH: "workspace:git-stash",
+  WORKSPACE_GIT_STASH_LIST: "workspace:git-stash-list",
+  WORKSPACE_GIT_STASH_POP: "workspace:git-stash-pop",
+  WORKSPACE_GIT_COMMIT: "workspace:git-commit",
   WORKSPACE_LIST_BRANCHES: "workspace:list-branches",
   WORKSPACE_ARCHITECTURE_GET: "workspace:architecture-get",
   WORKSPACE_ARCHITECTURE_SAVE: "workspace:architecture-save",
@@ -60,6 +81,7 @@ export const IPC_CHANNELS = {
   SESSION_CONFIRM_PLAN: "session:confirm-plan",
   SESSION_REJECT_PLAN_READY: "session:reject-plan-ready",
   SESSION_DRAFT_BUILD_COMMIT: "session:draft-build-commit",
+  SESSION_DRAFT_GIT_MESSAGE: "session:draft-git-message",
   SESSION_COMMIT_BUILD: "session:commit-build",
   SESSION_DISMISS_BUILD_COMMIT: "session:dismiss-build-commit",
   SESSION_INTEGRATE_BUILD: "session:integrate-build",
@@ -70,11 +92,35 @@ export const IPC_CHANNELS = {
   PROVIDER_GET_CONFIG: "provider:get-config",
   PROVIDER_LIST: "provider:list",
   PROVIDER_SET_ACTIVE: "provider:set-active",
+  /** Switch the active provider's default model without reopening settings. */
+  PROVIDER_SET_MODEL: "provider:set-model",
   PROVIDER_DELETE: "provider:delete",
   PROVIDER_FETCH_PRICING: "provider:fetch-pricing",
   PROVIDER_CANCEL_FETCH_PRICING: "provider:cancel-fetch-pricing",
   /** Push channel: main → renderer progress lines while fetch pricing runs. */
   PROVIDER_FETCH_PRICING_PROGRESS: "provider:fetch-pricing-progress",
+  PREVIEW_STATUS: "preview:status",
+  PREVIEW_SUBSCRIBE: "preview:subscribe",
+  PREVIEW_START: "preview:start",
+  PREVIEW_STOP: "preview:stop",
+  /** Fire-and-forget: the renderer reports the hole it reserved for the view. */
+  PREVIEW_SET_BOUNDS: "preview:set-bounds",
+  /** Fire-and-forget: hide the native view while a renderer overlay is up. */
+  PREVIEW_SET_VISIBLE: "preview:set-visible",
+  PREVIEW_SET_VIEWPORT: "preview:set-viewport",
+  PREVIEW_NAVIGATE: "preview:navigate",
+  PREVIEW_ACT: "preview:act",
+  PREVIEW_CLEAR_DATA: "preview:clear-data",
+  PREVIEW_TOGGLE_DEVTOOLS: "preview:toggle-devtools",
+  PREVIEW_CAPTURE: "preview:capture",
+  /** Re-read the dev command from ARCHITECTURE.md after an agent turn. */
+  PREVIEW_REFRESH_SETUP: "preview:refresh-setup",
+  /** Human signs off on the proposed dev command, which then starts. */
+  PREVIEW_CONFIRM_SETUP: "preview:confirm-setup",
+  /** Arms the DOM element picker; the hit arrives on the element channel. */
+  PREVIEW_PICK_ELEMENT: "preview:pick-element",
+  PREVIEW_CANCEL_PICK: "preview:cancel-pick",
+  PREVIEW_ELEMENT_SUBSCRIBE: "preview:element:subscribe",
   GITHUB_STATUS: "github:status",
   GITHUB_LOGOUT: "github:logout",
   GITHUB_LOGIN_WEB: "github:login-web",
@@ -236,6 +282,28 @@ export type SessionAgentAskRequest = z.infer<
   typeof SessionAgentAskRequestSchema
 >;
 
+/**
+ * Human working through the blocking setup checklist (see HumanSetupRequest).
+ * `recheck` re-reads the env files, `toggle` ticks a manual item, `resume` closes
+ * the checklist and hands the agent back the key status, `skip` does the same
+ * while telling it the human gave up on the rest.
+ */
+export const SessionHumanSetupRequestSchema = z.object({
+  action: z.enum(["recheck", "toggle", "resume", "skip"]),
+  itemId: z.string().min(1).optional(),
+  done: z.boolean().optional(),
+});
+export type SessionHumanSetupRequest = z.infer<
+  typeof SessionHumanSetupRequestSchema
+>;
+
+export const SessionDismissNoticeRequestSchema = z.object({
+  noticeId: z.string().min(1),
+});
+export type SessionDismissNoticeRequest = z.infer<
+  typeof SessionDismissNoticeRequestSchema
+>;
+
 export const TerminalDataEventSchema = z.object({
   terminalId: z.string().min(1),
   data: z.string(),
@@ -343,13 +411,19 @@ export const SessionListResponseSchema = z.object({
 });
 export type SessionListResponse = z.infer<typeof SessionListResponseSchema>;
 
-export const SessionCreateRequestSchema = z.object({});
+export const SessionCreateRequestSchema = z.object({
+  /** Checkout this branch before opening the new chat (workspace worktree). */
+  branch: z.string().min(1).optional(),
+  dirtyStrategy: z.enum(["stash", "force"]).optional(),
+});
 export type SessionCreateRequest = z.infer<typeof SessionCreateRequestSchema>;
 
 export const SessionCreateResponseSchema = z.object({
-  state: SessionStateSchema,
-  sessions: z.array(SessionSummarySchema),
-  activeSessionId: z.string(),
+  ok: z.boolean().default(true),
+  state: SessionStateSchema.optional(),
+  sessions: z.array(SessionSummarySchema).optional(),
+  activeSessionId: z.string().optional(),
+  error: AppErrorPayloadSchema.optional(),
 });
 export type SessionCreateResponse = z.infer<typeof SessionCreateResponseSchema>;
 
@@ -367,8 +441,49 @@ export type SessionSwitchResponse = z.infer<typeof SessionSwitchResponseSchema>;
 
 export const SessionCloseRequestSchema = z.object({
   sessionId: z.string().min(1),
+  outcome: SessionOutcomeSchema.optional(),
 });
 export type SessionCloseRequest = z.infer<typeof SessionCloseRequestSchema>;
+
+export const SessionDiscardRequestSchema = z.object({
+  sessionId: z.string().min(1),
+  deleteBranch: z.boolean(),
+});
+export type SessionDiscardRequest = z.infer<typeof SessionDiscardRequestSchema>;
+
+export const SessionDiscardResponseSchema = z.object({
+  ok: z.boolean(),
+  state: SessionStateSchema,
+  sessions: z.array(SessionSummarySchema),
+  activeSessionId: z.string(),
+  branchDeleted: z.string().nullable().optional(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type SessionDiscardResponse = z.infer<
+  typeof SessionDiscardResponseSchema
+>;
+
+export const SessionListLogsRequestSchema = z.object({});
+export type SessionListLogsRequest = z.infer<
+  typeof SessionListLogsRequestSchema
+>;
+
+export const SessionListLogsResponseSchema = z.object({
+  logs: z.array(SessionLogSchema),
+});
+export type SessionListLogsResponse = z.infer<
+  typeof SessionListLogsResponseSchema
+>;
+
+export const SessionGetLogRequestSchema = z.object({
+  sessionId: z.string().min(1).optional(),
+});
+export type SessionGetLogRequest = z.infer<typeof SessionGetLogRequestSchema>;
+
+export const SessionGetLogResponseSchema = z.object({
+  log: SessionLogSchema.nullable(),
+});
+export type SessionGetLogResponse = z.infer<typeof SessionGetLogResponseSchema>;
 
 export const SessionCloseResponseSchema = z.object({
   state: SessionStateSchema,
@@ -524,9 +639,134 @@ export const WorkspaceGitStatusResponseSchema = z.object({
   localBranch: z.string().nullable(),
   remoteBranch: z.string().nullable(),
   hasRemote: z.boolean(),
+  remotes: z.array(z.string()).default([]),
+  compareRemote: z.string().nullable().default(null),
+  compareRef: z.string().nullable().default(null),
+  ahead: z.number().int().nullable().default(null),
+  behind: z.number().int().nullable().default(null),
+  dirty: z.boolean().default(false),
+  dirtyFileCount: z.number().int().nonnegative().default(0),
+  stashCount: z.number().int().nonnegative().default(0),
+  conflicted: z.array(z.string()).default([]),
 });
 export type WorkspaceGitStatusResponse = z.infer<
   typeof WorkspaceGitStatusResponseSchema
+>;
+
+export function emptyWorkspaceGitStatus(): WorkspaceGitStatusResponse {
+  return {
+    isRepo: false,
+    localBranch: null,
+    remoteBranch: null,
+    hasRemote: false,
+    remotes: [],
+    compareRemote: null,
+    compareRef: null,
+    ahead: null,
+    behind: null,
+    dirty: false,
+    dirtyFileCount: 0,
+    stashCount: 0,
+    conflicted: [],
+  };
+}
+
+export const WorkspaceGitCheckoutRequestSchema = z.object({
+  branch: z.string().min(1),
+  dirtyStrategy: z.enum(["stash", "force"]).optional(),
+});
+export type WorkspaceGitCheckoutRequest = z.infer<
+  typeof WorkspaceGitCheckoutRequestSchema
+>;
+
+export const WorkspaceGitPullRequestSchema = z.object({
+  remote: z.string().min(1).optional(),
+});
+export type WorkspaceGitPullRequest = z.infer<
+  typeof WorkspaceGitPullRequestSchema
+>;
+
+export const WorkspaceGitPushRequestSchema = z.object({
+  remote: z.string().min(1).optional(),
+});
+export type WorkspaceGitPushRequest = z.infer<
+  typeof WorkspaceGitPushRequestSchema
+>;
+
+export const WorkspaceGitSetRemoteRequestSchema = z.object({
+  remote: z.string().min(1),
+});
+export type WorkspaceGitSetRemoteRequest = z.infer<
+  typeof WorkspaceGitSetRemoteRequestSchema
+>;
+
+export const WorkspaceGitStashRequestSchema = z.object({
+  message: z.string().min(1).max(200),
+});
+export type WorkspaceGitStashRequest = z.infer<
+  typeof WorkspaceGitStashRequestSchema
+>;
+
+export const WorkspaceGitStashListRequestSchema = z.object({});
+export type WorkspaceGitStashListRequest = z.infer<
+  typeof WorkspaceGitStashListRequestSchema
+>;
+
+export const GitStashEntrySchema = z.object({
+  index: z.number().int().nonnegative(),
+  ref: z.string().min(1),
+  message: z.string(),
+});
+export type GitStashEntry = z.infer<typeof GitStashEntrySchema>;
+
+export const WorkspaceGitStashListResponseSchema = z.object({
+  ok: z.boolean(),
+  stashes: z.array(GitStashEntrySchema).default([]),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type WorkspaceGitStashListResponse = z.infer<
+  typeof WorkspaceGitStashListResponseSchema
+>;
+
+export const WorkspaceGitStashPopRequestSchema = z.object({
+  index: z.number().int().nonnegative().optional(),
+});
+export type WorkspaceGitStashPopRequest = z.infer<
+  typeof WorkspaceGitStashPopRequestSchema
+>;
+
+export const WorkspaceGitCommitRequestSchema = z.object({
+  message: z.string().min(1).max(4000),
+});
+export type WorkspaceGitCommitRequest = z.infer<
+  typeof WorkspaceGitCommitRequestSchema
+>;
+
+export const SessionDraftGitMessageRequestSchema = z.object({
+  kind: z.enum(["commit", "stash"]),
+});
+export type SessionDraftGitMessageRequest = z.infer<
+  typeof SessionDraftGitMessageRequestSchema
+>;
+
+export const SessionDraftGitMessageResponseSchema = z.object({
+  ok: z.boolean(),
+  message: z.string().optional(),
+  files: z.array(z.string()).optional(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type SessionDraftGitMessageResponse = z.infer<
+  typeof SessionDraftGitMessageResponseSchema
+>;
+
+export const WorkspaceGitCommandResponseSchema = z.object({
+  ok: z.boolean(),
+  conflicted: z.array(z.string()).default([]),
+  error: AppErrorPayloadSchema.optional(),
+  status: WorkspaceGitStatusResponseSchema.optional(),
+});
+export type WorkspaceGitCommandResponse = z.infer<
+  typeof WorkspaceGitCommandResponseSchema
 >;
 
 export const WorkspaceListBranchesRequestSchema = z.object({});
@@ -551,6 +791,17 @@ export const WorkspaceListBranchesResponseSchema = z.object({
   /** Working tree has uncommitted changes. */
   dirty: z.boolean().default(false),
   dirtyFileCount: z.number().int().nonnegative().default(0),
+  remotes: z.array(z.string()).default([]),
+  /** Remote-tracking heads (origin/feat/x → { remote: origin, name: feat/x }). */
+  remoteHeads: z
+    .array(
+      z.object({
+        remote: z.string().min(1),
+        name: z.string().min(1),
+        lastCommitAt: z.string().min(1),
+      }),
+    )
+    .default([]),
 });
 export type WorkspaceListBranchesResponse = z.infer<
   typeof WorkspaceListBranchesResponseSchema
@@ -840,6 +1091,8 @@ export const ProviderVerifyRequestSchema = z.object({
   /** Optional for local OpenAI-compatible servers (e.g. Ollama). */
   apiKey: z.string().default(""),
   model: z.string().min(1).optional(),
+  /** Wire protocol; inferred from the base URL when the form omits it. */
+  kind: ProviderKindSchema.optional(),
 });
 export type ProviderVerifyRequest = z.infer<typeof ProviderVerifyRequestSchema>;
 
@@ -865,6 +1118,8 @@ export type ProviderVerifyResponse = z.infer<
 export const ProviderListModelsRequestSchema = z.object({
   baseUrl: z.string().url(),
   apiKey: z.string().default(""),
+  /** Wire protocol; inferred from the base URL when the caller omits it. */
+  kind: ProviderKindSchema.optional(),
 });
 export type ProviderListModelsRequest = z.infer<
   typeof ProviderListModelsRequestSchema
@@ -891,8 +1146,11 @@ export const ProviderSaveConfigRequestSchema = z.object({
   baseUrl: z.string().url(),
   apiKey: z.string().default(""),
   defaultModel: z.string().min(1),
+  /** Wire protocol; inferred from the base URL when the form omits it. */
+  kind: ProviderKindSchema.optional(),
   paid: z.boolean().optional(),
   pricing: ProviderPricingSchema.optional(),
+  models: z.array(ProviderModelCatalogEntrySchema).optional(),
   thinking: z.boolean().optional(),
   reasoningEffort: ReasoningEffortSchema.optional(),
   /** Model context window in tokens (for compaction). null clears. */
@@ -928,8 +1186,10 @@ export const ProviderGetConfigResponseSchema = z.object({
   baseUrl: z.string().nullable(),
   defaultModel: z.string().nullable(),
   apiKey: z.string().nullable(),
+  kind: ProviderKindSchema.optional(),
   paid: z.boolean().optional(),
   pricing: ProviderPricingSchema.nullable().optional(),
+  models: z.array(ProviderModelCatalogEntrySchema).optional(),
   thinking: z.boolean().optional(),
   reasoningEffort: ReasoningEffortSchema.optional(),
   contextWindowTokens: z.number().int().positive().nullable().optional(),
@@ -954,6 +1214,8 @@ export const ProviderListResponseSchema = z.object({
       reasoningEffort: ReasoningEffortSchema.optional(),
       contextWindowTokens: z.number().int().positive().optional(),
       pricing: ProviderPricingSchema.optional(),
+      kind: ProviderKindSchema.optional(),
+      models: z.array(ProviderModelCatalogEntrySchema).optional(),
     }),
   ),
 });
@@ -974,6 +1236,24 @@ export type ProviderSetActiveResponse = z.infer<
   typeof ProviderSetActiveResponseSchema
 >;
 
+export const ProviderSetModelRequestSchema = z.object({
+  model: z.string().min(1),
+  /** Defaults to the active provider. */
+  providerId: z.string().min(1).optional(),
+});
+export type ProviderSetModelRequest = z.infer<
+  typeof ProviderSetModelRequestSchema
+>;
+
+export const ProviderSetModelResponseSchema = z.object({
+  ok: z.boolean(),
+  model: z.string().optional(),
+  error: AppErrorPayloadSchema.optional(),
+});
+export type ProviderSetModelResponse = z.infer<
+  typeof ProviderSetModelResponseSchema
+>;
+
 export const ProviderDeleteRequestSchema = z.object({
   id: z.string().min(1),
 });
@@ -991,6 +1271,8 @@ const ProviderLookupDraftSchema = z.object({
   baseUrl: z.string().url(),
   apiKey: z.string().default(""),
   model: z.string().min(1),
+  /** Wire protocol; inferred from the base URL when the form omits it. */
+  kind: ProviderKindSchema.optional(),
 });
 
 /**
@@ -1003,10 +1285,14 @@ export const ProviderFetchPricingRequestSchema = z
     lookupProviderId: z.string().min(1).optional(),
     /** Unsaved / in-form credentials (e.g. the provider being edited). */
     lookupDraft: ProviderLookupDraftSchema.optional(),
+    /** Model id on the lookup provider. Falls back to that provider's default. */
+    lookupModel: z.string().min(1).optional(),
     target: z.object({
       name: z.string().max(80).optional(),
       baseUrl: z.string().url(),
       defaultModel: z.string().optional(),
+      /** Model ids already listed from the endpoint — fill capabilities for all of them. */
+      modelIds: z.array(z.string().min(1)).optional(),
     }),
     /** Official pricing docs URL; guessed from host when omitted. */
     docsUrl: z.string().url().optional(),
@@ -1023,6 +1309,8 @@ export const ProviderFetchPricingResponseSchema = z.object({
   pricing: ProviderPricingSchema.optional(),
   /** Context window for the target default model, when extracted from docs. */
   contextWindowTokens: z.number().int().positive().max(10_000_000).optional(),
+  /** Per-model vision / tools / context extracted (or left unknown). */
+  models: z.array(ProviderModelCatalogEntrySchema).optional(),
   docsUrl: z.string().url().nullable().optional(),
   pageFetched: z.boolean().optional(),
   cancelled: z.boolean().optional(),
@@ -1035,6 +1323,14 @@ export type ProviderFetchPricingResponse = z.infer<
 export const ProviderFetchPricingProgressSchema = z.object({
   message: z.string().min(1).max(2000),
   at: z.string().datetime(),
+  /** Delta to merge into the form catalog as each model lands. */
+  models: z.array(ProviderModelCatalogEntrySchema).optional(),
+  /** Partial pricing (usually a single byModel entry). */
+  pricing: ProviderPricingSchema.optional(),
+  contextWindowTokens: z.number().int().positive().max(10_000_000).optional(),
+  modelId: z.string().min(1).optional(),
+  index: z.number().int().positive().optional(),
+  total: z.number().int().positive().optional(),
 });
 export type ProviderFetchPricingProgress = z.infer<
   typeof ProviderFetchPricingProgressSchema
@@ -1052,6 +1348,120 @@ export type ProviderCancelFetchPricingResponse = z.infer<
   typeof ProviderCancelFetchPricingResponseSchema
 >;
 
+export const PreviewStatusRequestSchema = z.object({});
+export type PreviewStatusRequest = z.infer<typeof PreviewStatusRequestSchema>;
+
+export const PreviewSubscribeRequestSchema = z.object({});
+export type PreviewSubscribeRequest = z.infer<
+  typeof PreviewSubscribeRequestSchema
+>;
+
+export const PreviewStartRequestSchema = z.object({});
+export type PreviewStartRequest = z.infer<typeof PreviewStartRequestSchema>;
+
+export const PreviewStopRequestSchema = z.object({});
+export type PreviewStopRequest = z.infer<typeof PreviewStopRequestSchema>;
+
+export const PreviewSetBoundsRequestSchema = z.object({
+  rect: PreviewRectSchema.nullable(),
+});
+export type PreviewSetBoundsRequest = z.infer<
+  typeof PreviewSetBoundsRequestSchema
+>;
+
+export const PreviewSetVisibleRequestSchema = z.object({
+  visible: z.boolean(),
+});
+export type PreviewSetVisibleRequest = z.infer<
+  typeof PreviewSetVisibleRequestSchema
+>;
+
+export const PreviewSetViewportRequestSchema = z.object({
+  viewport: PreviewViewportIdSchema,
+});
+export type PreviewSetViewportRequest = z.infer<
+  typeof PreviewSetViewportRequestSchema
+>;
+
+export const PreviewNavigateRequestSchema = z.object({
+  url: z.string().min(1).max(4_000),
+});
+export type PreviewNavigateRequest = z.infer<
+  typeof PreviewNavigateRequestSchema
+>;
+
+export const PreviewActRequestSchema = z.object({
+  action: z.enum(["back", "forward", "reload", "stop"]),
+});
+export type PreviewActRequest = z.infer<typeof PreviewActRequestSchema>;
+
+export const PreviewClearDataRequestSchema = z.object({});
+export type PreviewClearDataRequest = z.infer<
+  typeof PreviewClearDataRequestSchema
+>;
+
+export const PreviewToggleDevtoolsRequestSchema = z.object({});
+export type PreviewToggleDevtoolsRequest = z.infer<
+  typeof PreviewToggleDevtoolsRequestSchema
+>;
+
+export const PreviewCaptureRequestSchema = z.object({});
+export type PreviewCaptureRequest = z.infer<typeof PreviewCaptureRequestSchema>;
+
+export const PreviewRefreshSetupRequestSchema = z.object({});
+export type PreviewRefreshSetupRequest = z.infer<
+  typeof PreviewRefreshSetupRequestSchema
+>;
+
+export const PreviewConfirmSetupRequestSchema = z.object({});
+export type PreviewConfirmSetupRequest = z.infer<
+  typeof PreviewConfirmSetupRequestSchema
+>;
+
+export const PreviewPickElementRequestSchema = z.object({});
+export type PreviewPickElementRequest = z.infer<
+  typeof PreviewPickElementRequestSchema
+>;
+
+export const PreviewCancelPickRequestSchema = z.object({});
+export type PreviewCancelPickRequest = z.infer<
+  typeof PreviewCancelPickRequestSchema
+>;
+
+export const PreviewElementSubscribeRequestSchema = z.object({});
+export type PreviewElementSubscribeRequest = z.infer<
+  typeof PreviewElementSubscribeRequestSchema
+>;
+
+/** Every preview mutation answers with the resulting status, like the engine. */
+export const PreviewCommandResponseSchema = z.object({
+  ok: z.boolean(),
+  status: PreviewStatusSchema,
+  error: z.string().optional(),
+});
+export type PreviewCommandResponse = z.infer<
+  typeof PreviewCommandResponseSchema
+>;
+
+export const PreviewCaptureResponseSchema = z.object({
+  ok: z.boolean(),
+  status: PreviewStatusSchema,
+  image: z
+    .object({
+      dataBase64: z.string().min(1),
+      mime: z.literal("image/png"),
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+      url: z.string().nullable(),
+      viewRect: PreviewRectSchema.nullable(),
+    })
+    .optional(),
+  error: z.string().optional(),
+});
+export type PreviewCaptureResponse = z.infer<
+  typeof PreviewCaptureResponseSchema
+>;
+
 export const IpcRequestSchemas = {
   [IPC_CHANNELS.SESSION_GET]: SessionGetRequestSchema,
   [IPC_CHANNELS.SESSION_SUBSCRIBE]: SessionSubscribeRequestSchema,
@@ -1064,6 +1474,8 @@ export const IpcRequestSchemas = {
     SessionTerminalConfirmEditRequestSchema,
   [IPC_CHANNELS.SESSION_TERMINAL_ASK]: SessionTerminalAskRequestSchema,
   [IPC_CHANNELS.SESSION_AGENT_ASK]: SessionAgentAskRequestSchema,
+  [IPC_CHANNELS.SESSION_HUMAN_SETUP]: SessionHumanSetupRequestSchema,
+  [IPC_CHANNELS.SESSION_DISMISS_NOTICE]: SessionDismissNoticeRequestSchema,
   [IPC_CHANNELS.TERMINAL_SUBSCRIBE]: TerminalSubscribeRequestSchema,
   [IPC_CHANNELS.TERMINAL_LIST]: TerminalListRequestSchema,
   [IPC_CHANNELS.TERMINAL_WRITE_USER]: TerminalWriteUserRequestSchema,
@@ -1081,10 +1493,21 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.SESSION_CREATE]: SessionCreateRequestSchema,
   [IPC_CHANNELS.SESSION_SWITCH]: SessionSwitchRequestSchema,
   [IPC_CHANNELS.SESSION_CLOSE]: SessionCloseRequestSchema,
+  [IPC_CHANNELS.SESSION_DISCARD]: SessionDiscardRequestSchema,
+  [IPC_CHANNELS.SESSION_LIST_LOGS]: SessionListLogsRequestSchema,
+  [IPC_CHANNELS.SESSION_GET_LOG]: SessionGetLogRequestSchema,
   [IPC_CHANNELS.WORKSPACE_OPEN]: WorkspaceOpenRequestSchema,
   [IPC_CHANNELS.WORKSPACE_PICK_DIRECTORY]: WorkspacePickDirectoryRequestSchema,
   [IPC_CHANNELS.WORKSPACE_CREATE_PROJECT]: WorkspaceCreateProjectRequestSchema,
   [IPC_CHANNELS.WORKSPACE_GIT_STATUS]: WorkspaceGitStatusRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_CHECKOUT]: WorkspaceGitCheckoutRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_PULL]: WorkspaceGitPullRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_PUSH]: WorkspaceGitPushRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_SET_REMOTE]: WorkspaceGitSetRemoteRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_STASH]: WorkspaceGitStashRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_STASH_LIST]: WorkspaceGitStashListRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_STASH_POP]: WorkspaceGitStashPopRequestSchema,
+  [IPC_CHANNELS.WORKSPACE_GIT_COMMIT]: WorkspaceGitCommitRequestSchema,
   [IPC_CHANNELS.WORKSPACE_LIST_BRANCHES]: WorkspaceListBranchesRequestSchema,
   [IPC_CHANNELS.WORKSPACE_LIST_DIR]: WorkspaceListDirRequestSchema,
   [IPC_CHANNELS.WORKSPACE_READ_FILE]: WorkspaceReadFileRequestSchema,
@@ -1098,6 +1521,7 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.SESSION_CONFIRM_PLAN]: SessionConfirmPlanRequestSchema,
   [IPC_CHANNELS.SESSION_REJECT_PLAN_READY]: SessionRejectPlanReadyRequestSchema,
   [IPC_CHANNELS.SESSION_DRAFT_BUILD_COMMIT]: SessionDraftBuildCommitRequestSchema,
+  [IPC_CHANNELS.SESSION_DRAFT_GIT_MESSAGE]: SessionDraftGitMessageRequestSchema,
   [IPC_CHANNELS.SESSION_COMMIT_BUILD]: SessionCommitBuildRequestSchema,
   [IPC_CHANNELS.SESSION_DISMISS_BUILD_COMMIT]:
     SessionDismissBuildCommitRequestSchema,
@@ -1110,10 +1534,29 @@ export const IpcRequestSchemas = {
   [IPC_CHANNELS.PROVIDER_GET_CONFIG]: ProviderGetConfigRequestSchema,
   [IPC_CHANNELS.PROVIDER_LIST]: ProviderListRequestSchema,
   [IPC_CHANNELS.PROVIDER_SET_ACTIVE]: ProviderSetActiveRequestSchema,
+  [IPC_CHANNELS.PROVIDER_SET_MODEL]: ProviderSetModelRequestSchema,
   [IPC_CHANNELS.PROVIDER_DELETE]: ProviderDeleteRequestSchema,
   [IPC_CHANNELS.PROVIDER_FETCH_PRICING]: ProviderFetchPricingRequestSchema,
   [IPC_CHANNELS.PROVIDER_CANCEL_FETCH_PRICING]:
     ProviderCancelFetchPricingRequestSchema,
+  [IPC_CHANNELS.PREVIEW_STATUS]: PreviewStatusRequestSchema,
+  [IPC_CHANNELS.PREVIEW_SUBSCRIBE]: PreviewSubscribeRequestSchema,
+  [IPC_CHANNELS.PREVIEW_START]: PreviewStartRequestSchema,
+  [IPC_CHANNELS.PREVIEW_STOP]: PreviewStopRequestSchema,
+  [IPC_CHANNELS.PREVIEW_SET_BOUNDS]: PreviewSetBoundsRequestSchema,
+  [IPC_CHANNELS.PREVIEW_SET_VISIBLE]: PreviewSetVisibleRequestSchema,
+  [IPC_CHANNELS.PREVIEW_SET_VIEWPORT]: PreviewSetViewportRequestSchema,
+  [IPC_CHANNELS.PREVIEW_NAVIGATE]: PreviewNavigateRequestSchema,
+  [IPC_CHANNELS.PREVIEW_ACT]: PreviewActRequestSchema,
+  [IPC_CHANNELS.PREVIEW_CLEAR_DATA]: PreviewClearDataRequestSchema,
+  [IPC_CHANNELS.PREVIEW_TOGGLE_DEVTOOLS]: PreviewToggleDevtoolsRequestSchema,
+  [IPC_CHANNELS.PREVIEW_CAPTURE]: PreviewCaptureRequestSchema,
+  [IPC_CHANNELS.PREVIEW_REFRESH_SETUP]: PreviewRefreshSetupRequestSchema,
+  [IPC_CHANNELS.PREVIEW_CONFIRM_SETUP]: PreviewConfirmSetupRequestSchema,
+  [IPC_CHANNELS.PREVIEW_PICK_ELEMENT]: PreviewPickElementRequestSchema,
+  [IPC_CHANNELS.PREVIEW_CANCEL_PICK]: PreviewCancelPickRequestSchema,
+  [IPC_CHANNELS.PREVIEW_ELEMENT_SUBSCRIBE]:
+    PreviewElementSubscribeRequestSchema,
   [IPC_CHANNELS.GITHUB_STATUS]: GithubStatusRequestSchema,
   [IPC_CHANNELS.GITHUB_LOGOUT]: GithubLogoutRequestSchema,
   [IPC_CHANNELS.GITHUB_LOGIN_WEB]: GithubLoginWebRequestSchema,

@@ -138,5 +138,6 @@ export function mergeOverridePatches(
   if (patch.quality !== undefined) sources.quality = source;
   if (patch.data !== undefined) sources.data = source;
   if (patch.api !== undefined) sources.api = source;
+  if (patch.dev !== undefined) sources.dev = source;
   return { overrides, sources };
 }

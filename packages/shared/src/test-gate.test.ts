@@ -168,10 +168,10 @@ Tests:       1 failed, 12 passed, 13 total
 });
 
 describe("decideTestGateAutoContinue", () => {
-  it("always auto-continues for unpaid providers", () => {
+  it("always auto-continues when the tokens are free", () => {
     for (let prev = 0; prev < 20; prev++) {
       const d = decideTestGateAutoContinue({
-        paidProvider: false,
+        meteredModel: false,
         previousAttempts: prev,
       });
       expect(d.autoContinue).toBe(true);
@@ -182,7 +182,7 @@ describe("decideTestGateAutoContinue", () => {
 
   it("opens the circuit after the paid limit", () => {
     const under = decideTestGateAutoContinue({
-      paidProvider: true,
+      meteredModel: true,
       previousAttempts: TEST_GATE_PAID_AUTO_FIX_LIMIT - 1,
     });
     expect(under).toEqual({
@@ -192,7 +192,7 @@ describe("decideTestGateAutoContinue", () => {
     });
 
     const over = decideTestGateAutoContinue({
-      paidProvider: true,
+      meteredModel: true,
       previousAttempts: TEST_GATE_PAID_AUTO_FIX_LIMIT,
     });
     expect(over).toEqual({

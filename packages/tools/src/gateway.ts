@@ -5,6 +5,7 @@ import type {
   ToolCall,
   ToolResult,
   ToolResultImage,
+  TestRunReport,
 } from "@ai-ide/shared";
 import type {
   CheckpointService,
@@ -22,6 +23,8 @@ import type { ToolRegistry } from "./registry.js";
 import type { AskHost } from "./ask-host.js";
 import type { TerminalHost } from "./terminal-host.js";
 import type { CbmHost } from "./cbm-host.js";
+import type { HumanSetupHost } from "./human-setup.js";
+import type { NoticeHost } from "./notice.js";
 
 export type ToolExecutionContext = {
   workspaceRoot: string;
@@ -45,13 +48,17 @@ export type ToolExecutionContext = {
   ask?: AskHost;
   /** Codebase-memory-mcp host (desktop). Optional until indexed. */
   cbm?: CbmHost;
+  /** Blocking manual-setup checklist host for request_human_setup (desktop). */
+  humanSetup?: HumanSetupHost;
+  /** Chrome warning/error banners (harness + post_notice). */
+  notice?: NoticeHost;
   /** Full suite logs from the last IDE test gate (for read_test_log). */
   testLogs?: {
     get: (suiteId: string) => string | undefined;
   };
   /** Last IDE test-gate report + escalation (for get_test_report). */
   testGate?: {
-    getReport: () => import("@ai-ide/shared").TestRunReport | null;
+    getReport: () => TestRunReport | null;
     getMeta: () => {
       escalationLevel: number;
       circuitOpen: boolean;
@@ -132,7 +139,7 @@ export class ToolGateway {
       };
     }
 
-    const riskLevel = tool.riskLevel ?? getToolRisk(call.name);
+    let riskLevel = tool.riskLevel ?? getToolRisk(call.name);
     let category: ApprovalCategory = "command";
     if (call.name === "git_commit") category = "git_commit";
     if (
@@ -197,23 +204,13 @@ export class ToolGateway {
           },
         };
       }
-      if (analysis.needsApproval && !oneShot) {
-        const decision = evaluatePolicy({
-          mode: ctx.mode,
-          toolName: call.name,
-          riskLevel: "sensitive",
-          grants: ctx.grants,
-          category: "command",
-        });
-        if ("requiresApproval" in decision && decision.requiresApproval) {
-          return {
-            status: "approval_required",
-            approvalId: randomUUID(),
-            description: describeApproval(decision.description),
-            call: { ...call, riskLevel },
-          };
-        }
-      }
+      // A command that survived the denylist is ordinary build work — npm i,
+      // a test run, a codegen script — and the checkpoint system already makes
+      // it undoable. Classifying it `sensitive` used to park the whole turn on
+      // an approval the UI then granted for the user, which bought no safety
+      // and cost a round trip per command. The denylist is the real gate; the
+      // mode matrix still decides whether shell access is available at all.
+      riskLevel = "reversible";
     }
 
     if (call.name === "git_commit") {

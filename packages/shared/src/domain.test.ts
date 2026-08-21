@@ -4,8 +4,10 @@ import {
   canStartCheckGate,
   canStartTestGate,
   deriveProductPhase,
+  formatAppErrorDisplay,
   isAwaitingIdeGate,
   planBuildComplete,
+  stringifyUnknownError,
 } from "./domain.js";
 
 const completePhases = [
@@ -180,5 +182,20 @@ describe("deriveProductPhase / testing gate helpers", () => {
     };
     expect(awaitsTestingConfirm(incomplete)).toBe(false);
     expect(canStartTestGate(incomplete)).toBe(false);
+  });
+});
+
+describe("stringifyUnknownError", () => {
+  it("reads nested provider objects instead of [object Object]", () => {
+    expect(
+      stringifyUnknownError({
+        error: { message: "Failed to deserialize image_url" },
+      }),
+    ).toBe("Failed to deserialize image_url");
+    expect(stringifyUnknownError({ foo: 1 })).toBe('{"foo":1}');
+    expect(formatAppErrorDisplay({
+      userMessage: "The AI provider request failed.",
+      technicalDetail: "[object Object]",
+    })).toBe("The AI provider request failed.");
   });
 });

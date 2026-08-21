@@ -178,7 +178,6 @@ function formatPlanForPrompt(state: SessionState): string {
 export function buildSystemPrompt(state: SessionState): string {
   const root = state.workspace?.resolvedRootPath ?? state.workspace?.rootPath;
   const phase = productPhaseForState(state);
-  const planning = phase === "planning";
 
   const identity = [
     "You are the product manager of this AI-Centered IDE.",
@@ -238,6 +237,25 @@ export function buildSystemPrompt(state: SessionState): string {
     state.testGateEscalationLevel ?? 0,
   );
 
+  const humanSetupRules = [
+    "Blocking human setup (secrets, accounts, hosted services):",
+    "- Some failures no code change can fix: a missing DATABASE_URL, an OAuth client nobody created, a database branch that does not exist. NEVER invent a secret, never commit a placeholder value to get a suite green, never weaken or delete a test to hide it, and never ask for a secret in chat.",
+    "- Once you have SEEN such a failure (ran the command, read the log), call request_human_setup ONCE with every blocking item — env items with envFile + envKeys so the IDE verifies them itself. Say what you are waiting for in that same message: the IDE pauses the gate, ends your turn on that call, and brings you back when the human is done.",
+    "- Fix everything you can on your own first; declare only what is genuinely blocking.",
+    "- When the harness already intercepted something (images not sent, a tool blocked) or the human would otherwise miss a failure, call post_notice once (kind warning|error, blocking=true if they must act). Do not keep working as if the pixels or the blocked action were there.",
+    ...(state.humanSetup
+      ? [
+          `- A checklist is already open: ${state.humanSetup.items
+            .map((item) =>
+              item.envKeys.length
+                ? `${item.title} [${item.envKeys.join(", ")}${item.envFile ? ` in ${item.envFile}` : ""}]`
+                : item.title,
+            )
+            .join("; ")}. Do NOT declare these again — the IDE is waiting on the human.`,
+        ]
+      : []),
+  ];
+
   const planningRules = [
     "PHASE: PLANNING — the plan is being created (not executed).",
     "Available tools: when indexed — search_graph / search_code / get_architecture / get_code_snippet / trace_path (primary), plus list_dir/read_file/search_text (fallback), web_search / web_fetch (library docs), plus read_architecture, upsert_architecture, import_attachment (copy chat attachments into the workspace), read_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, upsert_plan (full rewrite), propose_plan_ready.",
@@ -286,6 +304,7 @@ export function buildSystemPrompt(state: SessionState): string {
     architectureBlock,
     testGateBlock,
     ...(escalationBlock ? [escalationBlock] : []),
+    ...humanSetupRules,
     "Plan is READ-ONLY: use read_plan if you need context. Do NOT call upsert_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, propose_plan_ready, propose_testing_ready, or checkpoint_restore.",
     "Do NOT start implementing the feature plan yet — only fix baseline failures so Check can pass.",
     "Start with get_test_report (and list_failed_tests). Use read_test_log only when you need raw log chunks.",
@@ -304,6 +323,7 @@ export function buildSystemPrompt(state: SessionState): string {
     architectureBlock,
     testGateBlock,
     ...(escalationBlock ? [escalationBlock] : []),
+    ...humanSetupRules,
     "The plan structure was agreed in planning. Implement it phase by phase using tools (including write/git/commands/terminals).",
     "On the first build turn after Start Build: take action immediately — run tools for the first incomplete checklist item. Do not only acknowledge Build mode.",
     "File edits (critical — prefer surgical changes):",
@@ -353,6 +373,7 @@ export function buildSystemPrompt(state: SessionState): string {
     architectureBlock,
     testGateBlock,
     ...(escalationBlock ? [escalationBlock] : []),
+    ...humanSetupRules,
     "Plan is READ-ONLY: use read_plan if you need context. Do NOT call upsert_plan, add_phase, replace_phase, delete_phase, add_check, replace_check, delete_check, set_questions, or checkpoint_restore.",
     "If testing is not confirmed yet: call propose_testing_ready (do not only narrate). Then stop — the IDE starts the gate.",
     "Start with get_test_report (and list_failed_tests). Use read_test_log only when you need raw log chunks.",
@@ -587,7 +608,62 @@ export function takeSafeMessageTail(
       start -= 1;
     }
   }
-  return messages.slice(start);
+  return sanitizeProviderMessages(messages.slice(start));
+}
+
+/**
+ * Drop or trim assistant tool_calls that no longer have matching tool results.
+ * The Vercel AI SDK rejects the prompt otherwise (`MissingToolResultsError`),
+ * which can happen after tail compaction slices through the middle of a batch.
+ */
+export function sanitizeProviderMessages(
+  messages: ChatMessage[],
+): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i]!;
+    if (m.role !== "assistant" || !m.tool_calls?.length) {
+      if (m.role === "tool") {
+        i += 1;
+        continue;
+      }
+      out.push(m);
+      i += 1;
+      continue;
+    }
+
+    const calls = m.tool_calls;
+    const resultById = new Map<string, ChatMessage>();
+    let j = i + 1;
+    while (j < messages.length && messages[j]?.role === "tool") {
+      const tm = messages[j]!;
+      if (tm.role === "tool") resultById.set(tm.tool_call_id, tm);
+      j += 1;
+    }
+
+    const fulfilled = calls.filter((c) => resultById.has(c.id));
+    if (fulfilled.length === calls.length) {
+      out.push(m);
+      for (const c of calls) out.push(resultById.get(c.id)!);
+    } else if (fulfilled.length > 0) {
+      out.push({ ...m, tool_calls: fulfilled });
+      for (const c of fulfilled) out.push(resultById.get(c.id)!);
+    } else if (m.content?.trim() || m.reasoning_content?.trim()) {
+      const { tool_calls: _drop, ...rest } = m;
+      out.push(rest);
+    }
+
+    i = j;
+  }
+  return out;
+}
+
+/** Replace `messages` contents with a sanitized copy in place. */
+export function sanitizeProviderMessagesInPlace(messages: ChatMessage[]): void {
+  const clean = sanitizeProviderMessages(messages);
+  messages.length = 0;
+  messages.push(...clean);
 }
 
 /** Max transcript turns kept after the goal in building context. */
@@ -1573,6 +1649,8 @@ export function applyStartBuilding(
       testGatePassedAt: null,
       testGateAutoFixAttempts: 0,
       testGateCircuitOpen: false,
+      testGateCircuitReason: null,
+      humanSetup: null,
       testGateFailureFingerprint: null,
       testGateSameFailureStreak: 0,
       testGateEscalationLevel: 0,

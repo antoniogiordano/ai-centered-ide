@@ -91,6 +91,68 @@ function shouldIgnore(message: string, source?: string): boolean {
   return false;
 }
 
+/**
+ * Errors that leave React unable to render again: an exhausted heap, or one of
+ * the scheduler invariants it throws asynchronously from a task no error
+ * boundary sits under. The tree stops updating and the window is simply dark
+ * from then on.
+ */
+const FATAL_PATTERNS = [
+  "out of memory",
+  "should not already be working",
+  "maximum call stack size exceeded",
+];
+
+function isFatalRendererError(message: string): boolean {
+  const m = message.toLowerCase();
+  return FATAL_PATTERNS.some((pattern) => m.includes(pattern));
+}
+
+/**
+ * Deliberately plain DOM: the whole point is that React is no longer running, so
+ * the escape hatch cannot be a component. Says what happened, that nothing was
+ * lost, and offers the one action that helps.
+ */
+function showFatalOverlay(message: string): void {
+  if (typeof document === "undefined") return;
+  if (document.getElementById("fatal-overlay")) return;
+
+  const reload = () => window.location.reload();
+
+  const overlay = document.createElement("div");
+  overlay.id = "fatal-overlay";
+  overlay.className = "fatal-overlay";
+  overlay.setAttribute("role", "alert");
+
+  const title = document.createElement("strong");
+  title.textContent = "The interface stopped rendering";
+
+  const detail = document.createElement("p");
+  detail.className = "fatal-overlay-detail";
+  detail.textContent = message;
+
+  const hint = document.createElement("p");
+  hint.textContent =
+    "This chat is saved on disk. Reload the window to pick it up where it stopped.";
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "btn btn-primary";
+  button.textContent = "Reload · Enter";
+  button.addEventListener("click", reload);
+
+  const onKey = (event: KeyboardEvent) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    reload();
+  };
+  window.addEventListener("keydown", onKey, true);
+
+  overlay.append(title, detail, hint, button);
+  document.body.appendChild(overlay);
+  button.focus();
+}
+
 let installed = false;
 
 /** Install window-level handlers once (renderer). */
@@ -102,6 +164,9 @@ export function installUiErrorHandlers(): void {
     const message = event.message || event.error?.message || "Unknown error";
     if (shouldIgnore(message, event.filename)) return;
     const formatted = formatUnknown(event.error ?? message);
+    if (isFatalRendererError(formatted.message)) {
+      showFatalOverlay(formatted.message);
+    }
     reportUiError({
       title: "Renderer error",
       message: formatted.message,

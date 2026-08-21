@@ -2,10 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "./index.js";
 import {
   chatContentText,
-  expandMessagesForOpenAi,
   flattenVisionToText,
   messagesHaveVision,
-  toOpenAiMessage,
+  toPrompt,
 } from "./index.js";
 
 describe("multimodal chat messages", () => {
@@ -19,18 +18,35 @@ describe("multimodal chat messages", () => {
     ).toBe("hello\nworld");
   });
 
-  it("toOpenAiMessage passes image_url content parts through", () => {
-    const content = [
-      { type: "text" as const, text: "look" },
+  it("converts user image parts into file parts", () => {
+    const prompt = toPrompt(
+      [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "look" },
+            {
+              type: "image_url",
+              image_url: { url: "data:image/png;base64,abc" },
+            },
+          ],
+        },
+      ],
+      { nativeToolImages: true },
+    );
+    expect(prompt.messages).toEqual([
       {
-        type: "image_url" as const,
-        image_url: { url: "data:image/png;base64,abc" },
+        role: "user",
+        content: [
+          { type: "text", text: "look" },
+          {
+            type: "file",
+            mediaType: "image/png",
+            data: { type: "data", data: "abc" },
+          },
+        ],
       },
-    ];
-    expect(toOpenAiMessage({ role: "user", content })).toEqual({
-      role: "user",
-      content,
-    });
+    ]);
   });
 });
 
@@ -40,31 +56,59 @@ describe("tool result images", () => {
     {
       role: "assistant",
       content: null,
-      tool_calls: [
-        { id: "call_1", name: "read_image", arguments: "{}" },
-      ],
+      tool_calls: [{ id: "call_1", name: "read_image", arguments: "{}" }],
     },
     {
       role: "tool",
       tool_call_id: "call_1",
       content: '{"summary":"Viewing shot.png"}',
-      images: [
-        { mime: "image/png", dataBase64: "abc", label: "shot.png" },
-      ],
+      images: [{ mime: "image/png", dataBase64: "abc", label: "shot.png" }],
     },
   ];
 
+  it("keeps the pixels inside the tool result when the endpoint allows it", () => {
+    const { messages } = toPrompt(withToolImage, { nativeToolImages: true });
+    expect(messages).toHaveLength(3);
+    expect(messages[2]).toEqual({
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call_1",
+          toolName: "read_image",
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: '{"summary":"Viewing shot.png"}' },
+              {
+                type: "file",
+                mediaType: "image/png",
+                data: { type: "data", data: "abc" },
+              },
+            ],
+          },
+        },
+      ],
+    });
+  });
+
   it("hoists tool images into a synthetic user message after the tool result", () => {
-    const wire = expandMessagesForOpenAi(withToolImage);
+    const { messages } = toPrompt(withToolImage, { nativeToolImages: false });
     // 3 internal messages become 4 on the wire: the tool result keeps its own
     // slot, the pixels get a user message of their own.
-    expect(wire).toHaveLength(4);
-    expect(wire[2]).toEqual({
+    expect(messages).toHaveLength(4);
+    expect(messages[2]).toEqual({
       role: "tool",
-      tool_call_id: "call_1",
-      content: '{"summary":"Viewing shot.png"}',
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call_1",
+          toolName: "read_image",
+          output: { type: "text", value: '{"summary":"Viewing shot.png"}' },
+        },
+      ],
     });
-    const hoisted = wire[3] as { role: string; content: unknown[] };
+    const hoisted = messages[3] as { role: string; content: unknown[] };
     expect(hoisted.role).toBe("user");
     expect(hoisted.content).toEqual([
       {
@@ -72,25 +116,62 @@ describe("tool result images", () => {
         text: expect.stringContaining("shot.png") as unknown as string,
       },
       {
-        type: "image_url",
-        image_url: { url: "data:image/png;base64,abc" },
+        type: "file",
+        mediaType: "image/png",
+        data: { type: "data", data: "abc" },
       },
     ]);
   });
 
-  it("never puts image_url on a tool message", () => {
-    for (const message of expandMessagesForOpenAi(withToolImage)) {
+  it("keeps a tool batch contiguous when only the first result has images", () => {
+    // The SDK throws MissingToolResultsError if a user message shows up before
+    // every tool call of the batch has been answered, so the hoisted pixels
+    // have to wait for the last tool result.
+    const batch: ChatMessage[] = [
+      { role: "user", content: "why did the e2e run fail?" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "call_1", name: "read_image", arguments: "{}" },
+          { id: "call_2", name: "read_file", arguments: "{}" },
+        ],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_1",
+        content: '{"summary":"Viewing shot.png"}',
+        images: [{ mime: "image/png", dataBase64: "abc", label: "shot.png" }],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_2",
+        content: '{"summary":"read spec.ts"}',
+      },
+    ];
+    const { messages } = toPrompt(batch, { nativeToolImages: false });
+    expect(messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "tool",
+      "user",
+    ]);
+    expect(JSON.stringify(messages[4])).toContain("shot.png");
+  });
+
+  it("never puts a file part on a tool message without native support", () => {
+    const { messages } = toPrompt(withToolImage, { nativeToolImages: false });
+    for (const message of messages) {
       if (message.role !== "tool") continue;
-      expect(JSON.stringify(message)).not.toContain("image_url");
+      expect(JSON.stringify(message)).not.toContain('"file"');
     }
   });
 
   it("detects vision carried by tool results", () => {
     expect(messagesHaveVision(withToolImage)).toBe(true);
     expect(
-      messagesHaveVision([
-        { role: "tool", tool_call_id: "c", content: "{}" },
-      ]),
+      messagesHaveVision([{ role: "tool", tool_call_id: "c", content: "{}" }]),
     ).toBe(false);
   });
 
@@ -100,6 +181,8 @@ describe("tool result images", () => {
     expect(toolMessage?.role).toBe("tool");
     expect("images" in (toolMessage ?? {})).toBe(false);
     expect(toolMessage?.content).toContain("cannot view images");
-    expect(expandMessagesForOpenAi(flat)).toHaveLength(3);
+    expect(
+      toPrompt(flat, { nativeToolImages: false }).messages,
+    ).toHaveLength(3);
   });
 });

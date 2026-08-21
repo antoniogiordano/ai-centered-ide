@@ -13,5 +13,7 @@ export * from "./cbm-builtins.js";
 export * from "./web.js";
 export * from "./vision.js";
 export * from "./ask.js";
+export * from "./human-setup.js";
+export * from "./notice.js";
 export * from "./test-runner.js";
 export * from "./test-artifacts.js";

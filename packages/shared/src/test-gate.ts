@@ -1,5 +1,8 @@
 import type { ArchitectureProfile } from "./architecture.js";
+import { humanSetupItemSatisfied } from "./domain.js";
 import type {
+  HumanSetupItem,
+  HumanSetupRequest,
   TestRunReport,
   TestRunSpec,
   TestSuiteCounts,
@@ -29,10 +32,25 @@ export const TEST_GATE_ESCALATION_AFTER = 2;
 export const TEST_GATE_STRONG_ESCALATION_AFTER = 3;
 
 /**
- * Max automatic agent fix turns after a failed test gate when the active
- * provider is paid. Local/unpaid providers are uncapped.
+ * Max automatic agent fix turns after a failed test gate when the turn costs
+ * money. Local, unpaid, and free-tier models are uncapped: the cap exists to
+ * stop a metered account from burning credit on a loop nobody is watching, and
+ * there is nothing to protect when the tokens are free.
  */
 export const TEST_GATE_PAID_AUTO_FIX_LIMIT = 5;
+
+/**
+ * Rounds the fix loop may run without editing a file before it is treated as
+ * thrash and the circuit opens.
+ */
+export const MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT = 6;
+
+/**
+ * Of those rounds, how many may be spent fetching gate evidence (report,
+ * failed tests, log chunks, screenshots) without counting as thrash. Bounded so
+ * paging logs forever cannot keep the loop alive.
+ */
+export const MAX_GATE_EVIDENCE_ROUNDS = 4;
 
 /** Resolve a human platform label for a gate suite (vitest, jest, eslint…). */
 export function platformForTestKind(
@@ -506,17 +524,22 @@ export type TestGateCircuitDecision = {
 
 /**
  * Decide whether to auto-continue after a failed gate.
- * Unpaid providers always auto-continue; paid providers open the circuit
- * after {@link TEST_GATE_PAID_AUTO_FIX_LIMIT} auto-fix attempts.
+ *
+ * A metered model opens the circuit after
+ * {@link TEST_GATE_PAID_AUTO_FIX_LIMIT} auto-fix attempts. Everything that
+ * bills nothing — a local endpoint, an unpaid provider, a `:free` or zero-rated
+ * model on a paid account — keeps the fix loop running, because the only reason
+ * to interrupt it is the bill.
  */
 export function decideTestGateAutoContinue(input: {
-  paidProvider: boolean;
+  /** The active model actually bills tokens (see `isMeteredModel`). */
+  meteredModel: boolean;
   previousAttempts: number;
   limit?: number;
 }): TestGateCircuitDecision {
   const limit = input.limit ?? TEST_GATE_PAID_AUTO_FIX_LIMIT;
   const attempts = Math.max(0, input.previousAttempts) + 1;
-  if (!input.paidProvider) {
+  if (!input.meteredModel) {
     return { attempts, circuitOpen: false, autoContinue: true };
   }
   const circuitOpen = attempts > limit;
@@ -533,7 +556,52 @@ export function isTestGateSyntheticPrompt(content: string): boolean {
   if (text === TEST_FAILURE_CONTINUE_USER_MESSAGE) return true;
   if (text.startsWith("[IDE · TEST GATE]")) return true;
   if (text.startsWith("[IDE · CHECK GATE]")) return true;
+  if (text.startsWith(HUMAN_SETUP_PROMPT_TAG)) return true;
   return false;
+}
+
+export const HUMAN_SETUP_PROMPT_TAG = "[IDE · HUMAN SETUP]";
+
+/**
+ * Report back what the human did with the blocking checklist.
+ *
+ * Sent as a user turn when the human resumes or skips, so the agent knows which
+ * env keys are filled now (key names only — the IDE never forwards a value) and
+ * whether it should retry the gate or work around what is still missing.
+ */
+export function formatHumanSetupResumeMessage(
+  request: HumanSetupRequest,
+  options?: { skipped?: boolean },
+): string {
+  const satisfied = request.items.filter(humanSetupItemSatisfied);
+  const pending = request.items.filter((item) => !humanSetupItemSatisfied(item));
+  const describe = (item: HumanSetupItem): string => {
+    const keys = item.envKeys.length
+      ? ` (${item.envKeys.join(", ")}${item.envFile ? ` in ${item.envFile}` : ""})`
+      : "";
+    return `- ${item.title}${keys}`;
+  };
+  const lines = [
+    HUMAN_SETUP_PROMPT_TAG,
+    options?.skipped
+      ? "The human skipped the manual setup checklist."
+      : "The human worked through the manual setup checklist.",
+    "",
+  ];
+  if (satisfied.length) {
+    lines.push("Done:", ...satisfied.map(describe), "");
+  }
+  if (pending.length) {
+    lines.push("Still missing:", ...pending.map(describe), "");
+    lines.push(
+      "Do not ask for the same items again. Either work around what is missing (skip or guard the affected suite and say so), or explain in one message what breaks without it.",
+    );
+  } else {
+    lines.push(
+      "Everything you asked for is in place. Retry the failing work; the IDE will re-run the gate.",
+    );
+  }
+  return lines.join("\n").trim();
 }
 
 export function summarizeSuiteLog(

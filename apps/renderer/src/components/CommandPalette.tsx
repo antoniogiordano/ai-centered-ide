@@ -23,6 +23,11 @@ export function CommandPalette(props: {
   onFocusComposer: () => void;
   onOpenProviderSettings?: () => void;
   onOpenArchitecture?: () => void;
+  onTogglePreview?: () => void;
+  onTogglePlan?: () => void;
+  onToggleModel?: () => void;
+  onResetLayout?: () => void;
+  onNewSession?: () => void;
 }) {
   const {
     open,
@@ -32,6 +37,11 @@ export function CommandPalette(props: {
     onFocusComposer,
     onOpenProviderSettings,
     onOpenArchitecture,
+    onTogglePreview,
+    onTogglePlan,
+    onToggleModel,
+    onResetLayout,
+    onNewSession,
   } = props;
 
   const inputRef = useRef<HTMLInputElement>(null);
@@ -86,7 +96,8 @@ export function CommandPalette(props: {
       label: "New chat",
       hint: modHint("N"),
       run: () => {
-        void getBridge()?.session.create();
+        if (onNewSession) onNewSession();
+        else void getBridge()?.session.create();
         onClose();
       },
     },
@@ -138,6 +149,58 @@ export function CommandPalette(props: {
             hint: modShiftHint("A"),
             run: () => {
               onOpenArchitecture();
+              onClose();
+            },
+          },
+        ]
+      : []),
+    ...(onTogglePreview
+      ? [
+          {
+            id: "preview",
+            label: "Toggle live preview",
+            hint: modShiftHint("P"),
+            run: () => {
+              onTogglePreview();
+              onClose();
+            },
+          },
+        ]
+      : []),
+    ...(onTogglePlan
+      ? [
+          {
+            id: "plan",
+            label: "Toggle plan",
+            hint: modShiftHint("L"),
+            run: () => {
+              onTogglePlan();
+              onClose();
+            },
+          },
+        ]
+      : []),
+    ...(onToggleModel
+      ? [
+          {
+            id: "model",
+            label: "Switch model",
+            hint: modShiftHint("M"),
+            run: () => {
+              onToggleModel();
+              onClose();
+            },
+          },
+        ]
+      : []),
+    ...(onResetLayout
+      ? [
+          {
+            id: "layout",
+            label: "Reset column layout",
+            hint: modHint("\\"),
+            run: () => {
+              onResetLayout();
               onClose();
             },
           },

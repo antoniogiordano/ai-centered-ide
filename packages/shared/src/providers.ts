@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { catalogBaseModelId, catalogFamilyId } from "./model-catalog-hints.js";
 
 const hhmm = z
   .string()
@@ -77,14 +78,63 @@ export const ReasoningEffortSchema = z.enum([
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 export const REASONING_EFFORT_VALUES = ReasoningEffortSchema.options;
 
+/**
+ * Wire protocol used to talk to a provider.
+ *
+ * Not cosmetic: it selects which AI SDK provider is instantiated, and with it
+ * the auth header, the tool schema shape, and whether reasoning and prompt
+ * caching survive the round trip. `openai-compatible` is the safe default for
+ * anything unknown, including local servers.
+ */
+export const ProviderKindSchema = z.enum([
+  "openai-compatible",
+  "anthropic",
+  "deepseek",
+]);
+export type ProviderKind = z.infer<typeof ProviderKindSchema>;
+export const PROVIDER_KINDS = ProviderKindSchema.options;
+
+/**
+ * What we know about one model on a saved provider.
+ *
+ * `vision` and `tools` are optional on purpose: missing means "nobody has
+ * answered yet", which is the state the form must show so the human can fill
+ * it in. `false` is a confirmed no, not an unknown — the runtime uses that to
+ * skip sending pixels instead of burning a round trip.
+ */
+export const ProviderModelCatalogEntrySchema = z.object({
+  id: z.string().min(1),
+  contextWindowTokens: z.number().int().positive().max(10_000_000).optional(),
+  vision: z.boolean().optional(),
+  tools: z.boolean().optional(),
+  source: z.enum(["listed", "fetched", "user"]).optional(),
+});
+export type ProviderModelCatalogEntry = z.infer<
+  typeof ProviderModelCatalogEntrySchema
+>;
+
+export const ProviderModelCapabilityGapSchema = z.enum([
+  "vision",
+  "tools",
+  "pricing",
+  "context",
+]);
+export type ProviderModelCapabilityGap = z.infer<
+  typeof ProviderModelCapabilityGapSchema
+>;
+
 export const SavedProviderSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1).max(80),
   baseUrl: z.string().url(),
   defaultModel: z.string().min(1),
+  /** Defaults to openai-compatible so providers saved before this existed keep working. */
+  kind: ProviderKindSchema.default("openai-compatible"),
   /** Paid / metered endpoint — show $ in the HUD. */
   paid: z.boolean().default(false),
   pricing: ProviderPricingSchema.optional(),
+  /** Catalog of models listed from the endpoint, plus what we know about each. */
+  models: z.array(ProviderModelCatalogEntrySchema).optional(),
   /**
    * DeepSeek-style thinking / chain-of-thought.
    * When true, requests send `thinking: { type: "enabled" }` + `reasoning_effort`.
@@ -116,6 +166,11 @@ export const ProviderHudSchema = z.object({
   id: z.string().nullable(),
   name: z.string(),
   model: z.string().nullable(),
+  /** Models the human can switch to without reopening settings. */
+  models: z.array(z.string()).default([]),
+  /** Confirmed vision for the active model; null when nobody has answered. */
+  vision: z.boolean().nullable().default(null),
+  tools: z.boolean().nullable().default(null),
   paid: z.boolean(),
   /** Active provider context window (tokens), if configured. */
   contextWindowTokens: z.number().int().positive().nullable().default(null),
@@ -187,6 +242,17 @@ function bandHasRates(band: PricingRateBand | undefined | null): boolean {
   );
 }
 
+/** Compact HUD string: input / output USD per 1M. */
+export function formatRateBand(
+  band: PricingRateBand | null | undefined,
+): string | null {
+  if (!bandHasRates(band)) return null;
+  const input = band?.inputCacheMissPer1M ?? band?.inputPer1M;
+  const output = band?.outputPer1M;
+  if (input == null && output == null) return null;
+  return `$${input ?? "—"} / $${output ?? "—"}`;
+}
+
 /**
  * Resolve the effective rate band for a provider at a point in time,
  * applying byModel + peak/off-peak when configured.
@@ -197,8 +263,9 @@ export function resolvePricingBand(
 ): PricingRateBand | null {
   if (!pricing) return null;
   const model = opts?.model?.trim();
-  const modelEntry =
-    model && pricing.byModel?.[model] ? pricing.byModel[model] : undefined;
+  const modelEntry = model
+    ? pricingEntryForModel(pricing.byModel, model)
+    : undefined;
 
   const schedule = modelEntry?.schedule ?? pricing.schedule;
   const flat: PricingRateBand = {
@@ -241,6 +308,19 @@ export function resolvePricingBand(
   }
 
   return bandHasRates(band) ? band : null;
+}
+
+function pricingEntryForModel(
+  byModel: ProviderPricing["byModel"],
+  model: string,
+): ProviderModelPricing | undefined {
+  if (!byModel) return undefined;
+  if (byModel[model]) return byModel[model];
+  const base = catalogBaseModelId(model);
+  if (base !== model && byModel[base]) return byModel[base];
+  const family = catalogFamilyId(model);
+  if (family !== model && byModel[family]) return byModel[family];
+  return undefined;
 }
 
 export function estimateCostUsd(
@@ -288,6 +368,135 @@ export function estimateCostUsd(
 
   if (!hasInputRate && outRate == null) return null;
   return inputCost + outputCost;
+}
+
+/**
+ * OpenRouter (and the gateways that copy it) express a zero-cost variant of a
+ * model as a `:free` suffix on the id, so the same paid endpoint serves billed
+ * and unbilled models side by side.
+ */
+export function isFreeModelId(model: string | null | undefined): boolean {
+  const id = model?.trim().toLowerCase() ?? "";
+  if (!id) return false;
+  return id.endsWith(":free");
+}
+
+/** Every rate the band declares is 0 — the model is served at no cost. */
+export function isZeroRatedBand(
+  band: PricingRateBand | null | undefined,
+): boolean {
+  if (!bandHasRates(band)) return false;
+  const rates = [
+    band?.inputPer1M,
+    band?.inputCacheHitPer1M,
+    band?.inputCacheMissPer1M,
+    band?.outputPer1M,
+  ].filter((rate): rate is number => rate != null);
+  return rates.every((rate) => rate === 0);
+}
+
+/**
+ * Whether the model in use costs nothing, either by naming convention or
+ * because its resolved rates are all zero. A missing price list says nothing
+ * about cost, so it does not make a model free.
+ */
+export function isFreeModel(input: {
+  model?: string | null;
+  pricing?: ProviderPricing | null;
+  at?: Date;
+}): boolean {
+  if (isFreeModelId(input.model)) return true;
+  return isZeroRatedBand(
+    resolvePricingBand(input.pricing, {
+      model: input.model ?? null,
+      ...(input.at ? { at: input.at } : {}),
+    }),
+  );
+}
+
+/**
+ * True when a turn spends real money: the endpoint is metered *and* the active
+ * model is not one of its free variants. Cost-driven safety valves (the test
+ * gate auto-fix cap above all) key off this rather than the provider flag, so a
+ * free model on a paid account is left to loop as long as it needs.
+ */
+export function isMeteredModel(input: {
+  paid: boolean;
+  model?: string | null;
+  pricing?: ProviderPricing | null;
+  at?: Date;
+}): boolean {
+  if (!input.paid) return false;
+  return !isFreeModel(input);
+}
+
+export function findProviderModel(
+  provider: Pick<SavedProvider, "models"> | null | undefined,
+  modelId: string | null | undefined,
+): ProviderModelCatalogEntry | undefined {
+  const id = modelId?.trim();
+  if (!id || !provider?.models?.length) return undefined;
+  return provider.models.find((entry) => entry.id === id);
+}
+
+/**
+ * Incoming wins on fields it actually sets; a missing flag never erases a
+ * confirmed yes/no the human already typed.
+ */
+export function mergeProviderModels(
+  existing: ProviderModelCatalogEntry[] | undefined,
+  incoming: ProviderModelCatalogEntry[],
+): ProviderModelCatalogEntry[] {
+  const byId = new Map<string, ProviderModelCatalogEntry>();
+  for (const entry of existing ?? []) {
+    byId.set(entry.id, { ...entry });
+  }
+  for (const next of incoming) {
+    const id = next.id.trim();
+    if (!id) continue;
+    const prev = byId.get(id);
+    const merged: ProviderModelCatalogEntry = { id };
+    const contextWindowTokens =
+      next.contextWindowTokens ?? prev?.contextWindowTokens;
+    const vision = "vision" in next ? next.vision : prev?.vision;
+    const tools = "tools" in next ? next.tools : prev?.tools;
+    const source = next.source ?? prev?.source;
+    if (contextWindowTokens != null) merged.contextWindowTokens = contextWindowTokens;
+    if (vision !== undefined) merged.vision = vision;
+    if (tools !== undefined) merged.tools = tools;
+    if (source) merged.source = source;
+    byId.set(id, merged);
+  }
+  return [...byId.values()];
+}
+
+export function modelCapabilityGaps(
+  entry: ProviderModelCatalogEntry | undefined,
+  opts: { paid: boolean; pricing?: ProviderPricing | null | undefined },
+): ProviderModelCapabilityGap[] {
+  const gaps: ProviderModelCapabilityGap[] = [];
+  if (entry?.vision === undefined) gaps.push("vision");
+  if (entry?.tools === undefined) gaps.push("tools");
+  if (entry?.contextWindowTokens == null) gaps.push("context");
+  if (opts.paid && entry?.id) {
+    const band = resolvePricingBand(opts.pricing, { model: entry.id });
+    if (!band) gaps.push("pricing");
+  }
+  return gaps;
+}
+
+export function catalogNeedsHuman(input: {
+  models: ProviderModelCatalogEntry[] | undefined;
+  paid: boolean;
+  pricing?: ProviderPricing | null | undefined;
+}): number {
+  return (input.models ?? []).filter(
+    (entry) =>
+      modelCapabilityGaps(entry, {
+        paid: input.paid,
+        pricing: input.pricing,
+      }).length > 0,
+  ).length;
 }
 
 export function formatUsd(amount: number | null | undefined): string {
@@ -359,6 +568,22 @@ export function formatTokenCount(n: number): string {
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
+/**
+ * Share of prompt tokens the provider served from its cache, as a 0–100 integer,
+ * or null when there is nothing meaningful to report yet.
+ *
+ * Endpoints that do not report cache reads leave `cachedInputTokens` unset, and
+ * a handful of tokens on the first turn says nothing about how the session is
+ * doing, so both cases collapse to null rather than a misleading 0%.
+ */
+export function cacheHitPercent(usage: ProviderUsage): number | null {
+  const total = Math.max(0, usage.inputTokens);
+  if (total < 1000) return null;
+  const cached = usage.cachedInputTokens;
+  if (cached === undefined) return null;
+  return Math.round((Math.min(Math.max(0, cached), total) / total) * 100);
+}
+
 export function addUsage(
   a: ProviderUsage,
   b: Partial<ProviderUsage>,
@@ -424,12 +649,21 @@ export function buildProviderHud(input: {
     ? (input.registry.usageByProviderId[active.id] ?? emptyProviderUsage())
     : emptyProviderUsage();
   const model = active?.defaultModel ?? null;
+  const entry = findProviderModel(active ?? undefined, model);
+  const models = (active?.models ?? [])
+    .map((item) => item.id)
+    .filter(Boolean);
+  if (model && !models.includes(model)) models.unshift(model);
   return {
     id: active?.id ?? null,
     name: active?.name ?? "Mock / unset",
     model,
+    models,
+    vision: entry?.vision ?? null,
+    tools: entry?.tools ?? null,
     paid: Boolean(active?.paid),
-    contextWindowTokens: active?.contextWindowTokens ?? null,
+    contextWindowTokens:
+      entry?.contextWindowTokens ?? active?.contextWindowTokens ?? null,
     session: input.sessionUsage,
     lifetime,
     sessionCostUsd: active?.paid
@@ -441,37 +675,96 @@ export function buildProviderHud(input: {
   };
 }
 
+function hostnameOf(baseUrl: string): string | null {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Exact host or subdomain match only. A substring test would hand the API key
+ * to `anthropic.com.example.test` in the provider's own header shape.
+ */
+function hostMatches(baseUrl: string, domain: string): boolean {
+  const host = hostnameOf(baseUrl);
+  if (!host) return false;
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+export function isAnthropicHost(baseUrl: string): boolean {
+  return hostMatches(baseUrl, "anthropic.com");
+}
+
+export function isDeepSeekHost(baseUrl: string): boolean {
+  return hostMatches(baseUrl, "deepseek.com");
+}
+
+/** Proposed protocol for a base URL; the user can always override it. */
+export function inferProviderKind(baseUrl: string): ProviderKind {
+  if (isAnthropicHost(baseUrl)) return "anthropic";
+  if (isDeepSeekHost(baseUrl)) return "deepseek";
+  return "openai-compatible";
+}
+
+export function providerKindLabel(kind: ProviderKind): string {
+  switch (kind) {
+    case "anthropic":
+      return "Anthropic Messages";
+    case "deepseek":
+      return "DeepSeek";
+    default:
+      return "OpenAI-compatible";
+  }
+}
+
 /** Best-effort docs URL for known OpenAI-compatible hosts. */
 export function guessPricingDocsUrl(baseUrl: string): string | null {
+  return guessPricingDocsUrls(baseUrl)[0] ?? null;
+}
+
+/**
+ * Fallback docs URLs in preference order. Marketing / SPA pages often
+ * return a JS shell (~3k chars of nav), so the fetch tries the next one.
+ */
+export function guessPricingDocsUrls(baseUrl: string): string[] {
   try {
     const host = new URL(baseUrl).hostname.toLowerCase();
     if (host.includes("deepseek")) {
-      return "https://api-docs.deepseek.com/quick_start/pricing/";
+      return ["https://api-docs.deepseek.com/quick_start/pricing/"];
     }
     if (host.includes("openai") || host === "api.openai.com") {
-      return "https://openai.com/api/pricing/";
+      return [
+        "https://platform.openai.com/docs/pricing",
+        "https://platform.openai.com/docs/models",
+        "https://openai.com/api/pricing/",
+      ];
     }
     if (host.includes("anthropic")) {
-      return "https://docs.anthropic.com/en/docs/about-claude/pricing";
+      return ["https://docs.anthropic.com/en/docs/about-claude/pricing"];
     }
     if (host.includes("groq")) {
-      return "https://groq.com/pricing/";
+      return ["https://groq.com/pricing/"];
     }
     if (host.includes("together")) {
-      return "https://www.together.ai/pricing";
+      return ["https://www.together.ai/pricing"];
     }
     if (host.includes("fireworks")) {
-      return "https://fireworks.ai/pricing";
+      return ["https://fireworks.ai/pricing"];
     }
     if (host.includes("mistral")) {
-      return "https://mistral.ai/products/la-plateforme#pricing";
+      return ["https://mistral.ai/products/la-plateforme#pricing"];
     }
     if (host.includes("openrouter")) {
-      return "https://openrouter.ai/docs/guides/routing/model-routing";
+      return ["https://openrouter.ai/docs/guides/routing/model-routing"];
     }
-    return null;
+    if (host.includes("lmstudio") || host === "localhost" || host === "127.0.0.1") {
+      return ["https://lmstudio.ai/docs/app/basics/models"];
+    }
+    return [];
   } catch {
-    return null;
+    return [];
   }
 }
 
@@ -495,6 +788,7 @@ export function migrateLegacyProviderConfig(
     name: paid ? "Default (paid)" : "Local",
     baseUrl,
     defaultModel: model,
+    kind: inferProviderKind(baseUrl),
     paid,
     thinking: false,
     reasoningEffort: "high",
@@ -506,17 +800,14 @@ export function migrateLegacyProviderConfig(
 }
 
 export function isLikelyLocalProvider(baseUrl: string): boolean {
-  try {
-    const host = new URL(baseUrl).hostname;
-    return (
-      host === "localhost" ||
-      host === "127.0.0.1" ||
-      host === "::1" ||
-      host.endsWith(".local")
-    );
-  } catch {
-    return false;
-  }
+  const host = hostnameOf(baseUrl);
+  if (!host) return false;
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host.endsWith(".local")
+  );
 }
 
 export function providerKeychainAccount(providerId: string): string {

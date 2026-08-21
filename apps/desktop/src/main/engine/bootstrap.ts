@@ -1,17 +1,11 @@
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import {
-  chmod,
-  mkdir,
-  rename,
-  rm,
-  stat,
-  copyFile,
-} from "node:fs/promises";
+import { chmod, mkdir, rm, stat, copyFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
+import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { app } from "electron";
@@ -157,7 +151,7 @@ export async function ensureBinary(onProgress?: ProgressFn): Promise<string> {
 
     const total = Number(res.headers.get("content-length")) || null;
     let received = 0;
-    const src = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream);
+    const src = Readable.fromWeb(res.body as WebReadableStream);
     src.on("data", (chunk: Buffer) => {
       received += chunk.length;
       onProgress?.(received, total);

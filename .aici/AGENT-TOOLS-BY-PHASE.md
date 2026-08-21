@@ -62,6 +62,7 @@ Explore + draft the delivery plan. No file writes, git, shell, terminals, or tes
 | Tool | Risk | Role |
 | --- | --- | --- |
 | `import_attachment` | safe | Copy a chat attachment into the workspace |
+| `post_notice` | safe | Warning/error banner in the IDE chrome (optional TTL, optional blocking) |
 
 ### Codebase graph (when indexed)
 
@@ -75,7 +76,7 @@ Explore + draft the delivery plan. No file writes, git, shell, terminals, or tes
 | `get_graph_schema` | safe | Labels / relationship schema |
 | `detect_changes` | safe | Git diff → impacted symbols |
 
-**Not exposed in Plan:** `write_file`, `replace_in_file`, git_*, `run_command`, `terminal_*`, `checkpoint_restore`, `propose_testing_ready`, `get_test_report`, `list_failed_tests`, `read_test_log`, `ask_user` (Plan asks via `set_questions` + the Plan Q&A dialog instead).
+**Not exposed in Plan:** `write_file`, `replace_in_file`, git_*, `run_command`, `terminal_*`, `checkpoint_restore`, `propose_testing_ready`, `get_test_report`, `list_failed_tests`, `read_test_log`, `ask_user`, `request_human_setup` (Plan asks via `set_questions` + the Plan Q&A dialog instead; credentials are a plan item, not a blocker, until something actually runs).
 
 ---
 
@@ -98,8 +99,16 @@ When an **e2e** suite fails, the IDE also attaches the screenshots that run just
 | Tool | Risk | Role |
 | --- | --- | --- |
 | `ask_user` | safe | **Blocking** A/B/C… question for a structural decision; the answer returns in the same tool result |
+| `request_human_setup` | safe | Checklist of setup only the human can do (secrets, accounts, hosted services); pauses the gate |
+| `post_notice` | safe | Warning/error chrome banner; `blocking=true` pauses auto-continue until Dismiss |
 
-Use it only after investigating — when the diagnosis is settled but several fixes are legitimate and the choice belongs to the user. `terminal_ask` remains the variant bound to a PTY.
+Use `ask_user` only after investigating — when the diagnosis is settled but several fixes are legitimate and the choice belongs to the user. `terminal_ask` remains the variant bound to a PTY.
+
+`request_human_setup` is for the other kind of dead end: the failure is real and no code change fixes it, because a value is missing (`DATABASE_URL`, `AUTH_SECRET`, OAuth client id) or a service was never provisioned. One call with every blocking item; env items carry `envFile` + `envKeys` so the IDE verifies them itself by reading the key names of that file — values never enter the model's context. While the checklist is open the IDE opens the gate circuit (reason `human_setup`): no gate re-runs, no digest re-injection, no tank re-kick. When the human hits Resume (or Skip), the agent gets one `[IDE · HUMAN SETUP]` message listing which keys are filled now and which are still missing.
+
+`post_notice` is the other chrome surface: a warning or error the human must see (optional `ttlSeconds`, optional `blocking`). The harness uses the same banners when it intercepts a blocked case — for example images dropped because the model rejected `image_url`. Do not keep working as if the pixels or the blocked action were there. Do not use this for secrets; that is `request_human_setup`.
+
+The agent must never invent a secret, commit a placeholder value, or weaken a suite to get green instead of asking.
 
 ### Bug-fix still available
 
@@ -184,6 +193,8 @@ Do **not** re-launch full lint/test suites via `run_command` / `terminal_*` — 
 | `web_fetch` / `web_search` | ✓ | ✓ | ✓ | ✓ |
 | `read_image` | ✓ | ✓ | ✓ | ✓ |
 | `ask_user` | — | ✓ | ✓ | ✓ |
+| `request_human_setup` | — | ✓ | ✓ | ✓ |
+| `post_notice` | ✓ | ✓ | ✓ | ✓ |
 | CBM graph tools (if indexed) | ✓ | ✓ | ✓ | ✓ |
 | `read_architecture` / `upsert_architecture` | ✓ | ✓ | ✓ | ✓ |
 | `read_plan` | ✓ | ✓ (read-only) | ✓ | ✓ (read-only) |
@@ -206,7 +217,8 @@ Do **not** re-launch full lint/test suites via `run_command` / `terminal_*` — 
 - CBM tools: `packages/tools/src/cbm-builtins.ts`
 - Vision tool: `packages/tools/src/vision.ts`; e2e screenshot pickup: `packages/tools/src/test-artifacts.ts`
 - Ask tool: `packages/tools/src/ask.ts` (+ `ask-host.ts`, `apps/renderer/src/components/AgentAskDialog.tsx`)
-- Image transport: `ToolResultImage` (`packages/shared/src/domain.ts`) → `GatewayResult.images` → tool message `images` → `expandMessagesForOpenAi` (`packages/provider/src/openai.ts`)
+- Notice tool: `packages/tools/src/notice.ts` (+ `apps/renderer/src/components/SessionNoticeBanner.tsx`)
+- Image transport: `ToolResultImage` (`packages/shared/src/domain.ts`) → `GatewayResult.images` → tool message `images` → `toPrompt` (`packages/provider/src/ai-sdk.ts`)
 - End-to-end scenario: `packages/agent/src/harness.test.ts`
 - Model exposure: `packages/agent/src/loop.ts` (`buildModelToolDefs`)
 - Product phase: `packages/shared/src/domain.ts` (`deriveProductPhase`), `packages/agent/src/state.ts` (`productPhaseForState`)

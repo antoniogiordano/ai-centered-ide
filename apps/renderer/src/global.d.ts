@@ -5,10 +5,24 @@ import type {
   GithubLoginTokenResponse,
   GithubLoginCancelResponse,
   ProviderGetConfigResponse,
+  ProviderListModelsRequest,
   ProviderListModelsResponse,
+  ProviderSaveConfigRequest,
   ProviderSaveConfigResponse,
+  ProviderVerifyRequest,
   ProviderVerifyResponse,
+  ProviderDeleteResponse,
+  ProviderFetchPricingRequest,
+  ProviderFetchPricingProgress,
+  ProviderFetchPricingResponse,
+  ProviderListResponse,
+  ProviderSetActiveResponse,
+  ProviderSetModelResponse,
+  SessionState,
   SessionCloseResponse,
+  SessionDiscardResponse,
+  SessionGetLogResponse,
+  SessionListLogsResponse,
   SessionConfirmPlanResponse,
   SessionCreateResponse,
   SessionGetResponse,
@@ -20,11 +34,18 @@ import type {
   TerminalDataEvent,
   TerminalListResponse,
   EngineStatus,
+  PreviewCaptureResponse,
+  PreviewCommandResponse,
+  PreviewElementSelection,
+  PreviewRect,
+  PreviewStatus,
+  PreviewViewportId,
   WorkspaceArchitectureDetectResponse,
   WorkspaceArchitectureGetResponse,
   WorkspaceArchitectureSaveResponse,
   WorkspaceCreateProjectRequest,
   WorkspaceCreateProjectResponse,
+  WorkspaceGitCommandResponse,
   WorkspaceGitStatusResponse,
   WorkspaceListBranchesResponse,
   WorkspaceListDirResponse,
@@ -40,9 +61,21 @@ export type DesktopBridge = {
   session: {
     get: () => Promise<SessionGetResponse>;
     list: () => Promise<SessionListResponse>;
-    create: () => Promise<SessionCreateResponse>;
+    create: (input?: {
+      branch?: string;
+      dirtyStrategy?: "stash" | "force";
+    }) => Promise<SessionCreateResponse>;
     switch: (sessionId: string) => Promise<SessionSwitchResponse>;
-    close: (sessionId: string) => Promise<SessionCloseResponse>;
+    close: (
+      sessionId: string,
+      outcome?: "archived" | "discarded",
+    ) => Promise<SessionCloseResponse>;
+    discard: (
+      sessionId: string,
+      deleteBranch: boolean,
+    ) => Promise<SessionDiscardResponse>;
+    listLogs: () => Promise<SessionListLogsResponse>;
+    getLog: (sessionId?: string) => Promise<SessionGetLogResponse>;
     subscribe: (cb: (event: SessionUpdateEvent) => void) => () => void;
     sendMessage: (
       content: string,
@@ -74,12 +107,18 @@ export type DesktopBridge = {
     }) => Promise<SessionConfirmPlanResponse>;
     rejectPlanReady: () => Promise<{
       ok: boolean;
-      state?: import("@ai-ide/shared").SessionState;
+      state?: SessionState;
     }>;
     draftBuildCommit: () => Promise<{
       ok: boolean;
       message?: string;
       branch?: string | null;
+      files?: string[];
+      error?: { code: string; userMessage: string; technicalDetail: string };
+    }>;
+    draftGitMessage?: (kind: "commit" | "stash") => Promise<{
+      ok: boolean;
+      message?: string;
       files?: string[];
       error?: { code: string; userMessage: string; technicalDetail: string };
     }>;
@@ -115,6 +154,12 @@ export type DesktopBridge = {
       text: string;
       cancelled?: boolean;
     }) => Promise<void>;
+    humanSetup?: (input: {
+      action: "recheck" | "toggle" | "resume" | "skip";
+      itemId?: string;
+      done?: boolean;
+    }) => Promise<void>;
+    dismissNotice?: (input: { noticeId: string }) => Promise<void>;
     cancel?: () => Promise<void>;
     exportDiagnostics?: () => Promise<unknown>;
   };
@@ -133,6 +178,30 @@ export type DesktopBridge = {
     indexRefresh: () => Promise<{ ok: boolean; status: EngineStatus }>;
     stderr: () => Promise<{ stderr: string }>;
   };
+  /** Optional: an outdated preload has no preview surface at all. */
+  preview?: {
+    status: () => Promise<PreviewCommandResponse>;
+    subscribe: (cb: (status: PreviewStatus) => void) => () => void;
+    start: () => Promise<PreviewCommandResponse>;
+    stop: () => Promise<PreviewCommandResponse>;
+    setBounds: (rect: PreviewRect | null) => void;
+    setVisible: (visible: boolean) => void;
+    setViewport: (
+      viewport: PreviewViewportId,
+    ) => Promise<PreviewCommandResponse>;
+    navigate: (url: string) => Promise<PreviewCommandResponse>;
+    act: (
+      action: "back" | "forward" | "reload" | "stop",
+    ) => Promise<PreviewCommandResponse>;
+    clearData: () => Promise<PreviewCommandResponse>;
+    toggleDevTools: () => Promise<PreviewCommandResponse>;
+    capture: () => Promise<PreviewCaptureResponse>;
+    refreshSetup: () => Promise<PreviewCommandResponse>;
+    confirmSetup: () => Promise<PreviewCommandResponse>;
+    pickElement: () => Promise<PreviewCommandResponse>;
+    cancelPick: () => Promise<PreviewCommandResponse>;
+    onElement: (cb: (hit: PreviewElementSelection) => void) => () => void;
+  };
   workspace: {
     open: (path?: string) => Promise<WorkspaceOpenResponse>;
     pickDirectory: () => Promise<WorkspacePickDirectoryResponse>;
@@ -141,6 +210,21 @@ export type DesktopBridge = {
     ) => Promise<WorkspaceCreateProjectResponse>;
     listRecent: () => Promise<WorkspaceListRecentResponse>;
     gitStatus: () => Promise<WorkspaceGitStatusResponse>;
+    gitCheckout: (input: {
+      branch: string;
+      dirtyStrategy?: "stash" | "force";
+    }) => Promise<WorkspaceGitCommandResponse>;
+    gitPull: (remote?: string) => Promise<WorkspaceGitCommandResponse>;
+    gitPush: (remote?: string) => Promise<WorkspaceGitCommandResponse>;
+    gitSetRemote: (remote: string) => Promise<WorkspaceGitCommandResponse>;
+    gitStash?: (message: string) => Promise<WorkspaceGitCommandResponse>;
+    gitStashList?: () => Promise<{
+      ok: boolean;
+      stashes: Array<{ index: number; ref: string; message: string }>;
+      error?: { code: string; userMessage: string; technicalDetail: string };
+    }>;
+    gitStashPop?: (index?: number) => Promise<WorkspaceGitCommandResponse>;
+    gitCommit?: (message: string) => Promise<WorkspaceGitCommandResponse>;
     listBranches: () => Promise<WorkspaceListBranchesResponse>;
     listDir: (path?: string) => Promise<WorkspaceListDirResponse>;
     readFile: (path: string) => Promise<WorkspaceReadFileResponse>;
@@ -163,51 +247,31 @@ export type DesktopBridge = {
     loginCancel: () => Promise<GithubLoginCancelResponse>;
   };
   provider: {
-    getConfig: () => Promise<
-      import("@ai-ide/shared").ProviderGetConfigResponse
-    >;
-    list: () => Promise<import("@ai-ide/shared").ProviderListResponse>;
+    getConfig: () => Promise<ProviderGetConfigResponse>;
+    list: () => Promise<ProviderListResponse>;
     setActive: (
       id: string,
-    ) => Promise<import("@ai-ide/shared").ProviderSetActiveResponse>;
+    ) => Promise<ProviderSetActiveResponse>;
+    setModel: (
+      model: string,
+      providerId?: string,
+    ) => Promise<ProviderSetModelResponse>;
     delete: (
       id: string,
-    ) => Promise<import("@ai-ide/shared").ProviderDeleteResponse>;
-    verify: (input: {
-      baseUrl: string;
-      apiKey: string;
-      model?: string;
-    }) => Promise<ProviderVerifyResponse>;
-    listModels: (input: {
-      baseUrl: string;
-      apiKey: string;
-    }) => Promise<ProviderListModelsResponse>;
-    saveConfig: (input: {
-      id?: string;
-      name?: string;
-      baseUrl: string;
-      apiKey: string;
-      defaultModel: string;
-      paid?: boolean;
-      pricing?: import("@ai-ide/shared").ProviderPricing;
-      thinking?: boolean;
-      reasoningEffort?:
-        | "none"
-        | "minimal"
-        | "low"
-        | "medium"
-        | "high"
-        | "xhigh"
-        | "max";
-      contextWindowTokens?: number | null;
-      makeActive?: boolean;
-    }) => Promise<ProviderSaveConfigResponse>;
+    ) => Promise<ProviderDeleteResponse>;
+    verify: (input: ProviderVerifyRequest) => Promise<ProviderVerifyResponse>;
+    listModels: (
+      input: ProviderListModelsRequest,
+    ) => Promise<ProviderListModelsResponse>;
+    saveConfig: (
+      input: ProviderSaveConfigRequest,
+    ) => Promise<ProviderSaveConfigResponse>;
     fetchPricing: (
-      input: import("@ai-ide/shared").ProviderFetchPricingRequest,
-    ) => Promise<import("@ai-ide/shared").ProviderFetchPricingResponse>;
+      input: ProviderFetchPricingRequest,
+    ) => Promise<ProviderFetchPricingResponse>;
     cancelFetchPricing: () => Promise<{ ok: boolean }>;
     onFetchPricingProgress: (
-      cb: (event: { message: string; at: string }) => void,
+      cb: (event: ProviderFetchPricingProgress) => void,
     ) => () => void;
   };
   ui?: {
@@ -218,6 +282,9 @@ export type DesktopBridge = {
     onNewSession: (cb: () => void) => () => void;
     onOpenProvider: (cb: () => void) => () => void;
     onToggleArchitecture: (cb: () => void) => () => void;
+    onTogglePreview?: (cb: () => void) => () => void;
+    onTogglePlan?: (cb: () => void) => () => void;
+    onToggleModel?: (cb: () => void) => () => void;
   };
 };
 

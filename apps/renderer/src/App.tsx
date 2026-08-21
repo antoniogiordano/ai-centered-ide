@@ -1,12 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { deriveProductPhase, formatTokenCount, formatUsd } from "@ai-ide/shared";
+import {
+  cacheHitPercent,
+  deriveProductPhase,
+  emptyWorkspaceGitStatus,
+  formatTokenCount,
+  formatUsd,
+  type WorkspaceGitStatusResponse,
+} from "@ai-ide/shared";
 import { getBridge } from "./bridge";
 import { useBridgeReady, useSessionState } from "./hooks/useSessionState";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { ConversationPane, VerifyPane } from "./components/Cockpit";
+import { SplitGroup } from "./components/SplitGroup";
 import { ComposerBar } from "./components/ComposerBar";
 import { SessionBar } from "./components/SessionBar";
+import { GitBar, type GitConflictNotice } from "./components/GitBar";
+import { GitBranchDialog } from "./components/GitBranchDialog";
+import { GitConflictDialog } from "./components/GitConflictDialog";
 import { CommandPalette } from "./components/CommandPalette";
+import { conflictResolvePrompt } from "./lib/gitBranches";
 import {
   formatPlanAnswersMessage,
   PlanQaDialog,
@@ -21,6 +33,14 @@ import { TerminalConfirmBar } from "./components/TerminalConfirmBar";
 import { TerminalAskDialog } from "./components/TerminalAskDialog";
 import { AgentAskDialog } from "./components/AgentAskDialog";
 import { EngineBanner } from "./components/EngineBanner";
+import { PreviewPane } from "./components/PreviewPane";
+import { HeaderSelect } from "./components/HeaderSelect";
+import { SessionStatsDialog } from "./components/SessionStatsDialog";
+import { useNativeOverlay } from "./hooks/useNativeOverlay";
+import {
+  autoCockpitWeights,
+  resetAllSplitLayouts,
+} from "./hooks/useSplitLayout";
 
 const ONBOARDING_KEY = "ai-ide-onboarding-complete";
 
@@ -59,12 +79,16 @@ export function App() {
   const [qaDismissedKey, setQaDismissedKey] = useState<string | null>(null);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [architecturePaneOpen, setArchitecturePaneOpen] = useState(false);
-  const [gitStatus, setGitStatus] = useState<{
-    isRepo: boolean;
-    localBranch: string | null;
-    remoteBranch: string | null;
-    hasRemote: boolean;
-  } | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  /** The plan stays up next to the preview; the human can fold it away. */
+  const [planOpen, setPlanOpen] = useState(true);
+  const [gitStatus, setGitStatus] = useState<WorkspaceGitStatusResponse | null>(
+    null,
+  );
+  const [newSessionOpen, setNewSessionOpen] = useState(false);
+  const [conflictNotice, setConflictNotice] = useState<GitConflictNotice | null>(
+    null,
+  );
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
   const openPlanQuestions = useMemo(
@@ -90,6 +114,8 @@ export function App() {
   }, []);
 
   const openProviderSettings = useCallback(() => {
+    setProviderSelectOpen(false);
+    setModelSelectOpen(false);
     setProviderOpen(true);
   }, []);
 
@@ -104,16 +130,124 @@ export function App() {
   const toggleArchitecturePane = useCallback(() => {
     setArchitecturePaneOpen((open) => !open);
   }, []);
+
+  const togglePreview = useCallback(() => {
+    setPreviewOpen((open) => !open);
+  }, []);
+
+  const togglePlan = useCallback(() => {
+    setPlanOpen((open) => !open);
+  }, []);
+
+  const [layoutWidth, setLayoutWidth] = useState(() =>
+    typeof window === "undefined" ? 1440 : window.innerWidth,
+  );
+  const [modelSelectOpen, setModelSelectOpen] = useState(false);
+  const [providerSelectOpen, setProviderSelectOpen] = useState(false);
+  const [statsOpen, setStatsOpen] = useState(false);
+  const [providers, setProviders] = useState<
+    Array<{ id: string; name: string; defaultModel: string }>
+  >([]);
+  const toggleModelSwitcher = useCallback(() => {
+    setProviderSelectOpen(false);
+    setModelSelectOpen((open) => !open);
+  }, []);
+  const toggleProviderSelect = useCallback(() => {
+    setModelSelectOpen(false);
+    setProviderSelectOpen((open) => !open);
+  }, []);
+  const refreshProviders = useCallback(() => {
+    void getBridge()
+      ?.provider.list()
+      .then((res) => {
+        setProviders(
+          (res?.providers ?? []).map((p) => ({
+            id: p.id,
+            name: p.name,
+            defaultModel: p.defaultModel,
+          })),
+        );
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    function onResize() {
+      setLayoutWidth(window.innerWidth);
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "\\" && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        resetAllSplitLayouts();
+        return;
+      }
+      if (e.key === "[" && (e.metaKey || e.ctrlKey) && e.shiftKey) {
+        e.preventDefault();
+        toggleProviderSelect();
+        return;
+      }
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      const typing =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        Boolean((e.target as HTMLElement | null)?.isContentEditable);
+      if (
+        !typing &&
+        (e.key === "s" || e.key === "S") &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !providerOpen &&
+        !paletteOpen &&
+        !statsOpen
+      ) {
+        e.preventDefault();
+        setStatsOpen(true);
+      }
+    }
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [paletteOpen, providerOpen, statsOpen, toggleProviderSelect]);
+
+  const pickModel = useCallback(async (model: string) => {
+    setModelSelectOpen(false);
+    await getBridge()?.provider.setModel?.(model);
+    refreshProviders();
+  }, [refreshProviders]);
+
+  const pickProvider = useCallback(async (id: string) => {
+    setProviderSelectOpen(false);
+    await getBridge()?.provider.setActive?.(id);
+    refreshProviders();
+  }, [refreshProviders]);
+
+  useEffect(() => {
+    refreshProviders();
+  }, [refreshProviders, state?.providerHud?.id, state?.providerHud?.model]);
+
   useEffect(() => {
     setQaDismissedKey(null);
     setQaOpen(false);
   }, [activeSessionId]);
 
-  const refreshGitStatus = useCallback(() => {
-    void getBridge()?.workspace.gitStatus().then((info) => {
-      if (info) setGitStatus(info);
-    });
-  }, []);
+  const refreshGitStatus = useCallback(
+    (status?: WorkspaceGitStatusResponse) => {
+      if (status) {
+        setGitStatus(status);
+        return;
+      }
+      void getBridge()?.workspace.gitStatus().then((info) => {
+        if (info) setGitStatus(info);
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!qaEligible) {
@@ -142,8 +276,7 @@ export function App() {
     }
   }, []);
 
-  const createSession = useCallback(async () => {
-    await getBridge()?.session.create();
+  const focusComposer = useCallback(() => {
     requestAnimationFrame(() => {
       const el = composerRef.current;
       if (!el) return;
@@ -152,6 +285,36 @@ export function App() {
       el.setSelectionRange(len, len);
     });
   }, []);
+
+  const createSession = useCallback(
+    async (input?: { branch?: string; dirtyStrategy?: "stash" | "force" }) => {
+      const res = await getBridge()?.session.create(input);
+      if (res && res.ok === false) {
+        throw new Error(
+          res.error?.userMessage ?? "Could not create the session.",
+        );
+      }
+      focusComposer();
+    },
+    [focusComposer],
+  );
+
+  const requestNewSession = useCallback(() => {
+    if (state?.workspace) {
+      setNewSessionOpen(true);
+      return;
+    }
+    void createSession();
+  }, [createSession, state?.workspace]);
+
+  const startConflictSession = useCallback(
+    async (notice: GitConflictNotice) => {
+      await createSession();
+      await getBridge()?.session.sendMessage(conflictResolvePrompt(notice));
+      focusComposer();
+    },
+    [createSession, focusComposer],
+  );
 
   // Focus composer whenever the active chat changes (new / switch).
   useEffect(() => {
@@ -186,9 +349,12 @@ export function App() {
       ui?.onTogglePalette(() => setPaletteOpen((open) => !open)),
       ui?.onOpenWorkspace(() => void openWorkspace()),
       ui?.onNewProject(() => setNewProjectOpen(true)),
-      ui?.onNewSession(() => void createSession()),
+      ui?.onNewSession(() => requestNewSession()),
       ui?.onOpenProvider(openProviderSettings),
       ui?.onToggleArchitecture(toggleArchitecturePane),
+      ui?.onTogglePreview?.(togglePreview),
+      ui?.onTogglePlan?.(togglePlan),
+      ui?.onToggleModel?.(toggleModelSwitcher),
     ];
 
     return () => {
@@ -198,8 +364,12 @@ export function App() {
     qaOpen,
     openWorkspace,
     createSession,
+    requestNewSession,
     openProviderSettings,
     toggleArchitecturePane,
+    togglePreview,
+    togglePlan,
+    toggleModelSwitcher,
   ]);
 
   async function submitPlanAnswers(answers: PlanQaAnswer[]) {
@@ -230,12 +400,7 @@ export function App() {
       } catch (err) {
         console.warn("workspace.gitStatus failed", err);
         if (!cancelled) {
-          setGitStatus({
-            isRepo: false,
-            localBranch: null,
-            remoteBranch: null,
-            hasRemote: false,
-          });
+          setGitStatus(emptyWorkspaceGitStatus());
         }
       }
     }
@@ -247,6 +412,34 @@ export function App() {
       window.clearInterval(timer);
     };
   }, [workspaceRoot]);
+
+  useEffect(() => {
+    if (!workspaceRoot) setPreviewOpen(false);
+  }, [workspaceRoot]);
+
+  const previewWasOpen = useRef(false);
+  useEffect(() => {
+    if (previewOpen) {
+      previewWasOpen.current = true;
+      return;
+    }
+    if (!previewWasOpen.current) return;
+    void getBridge()?.preview?.stop();
+  }, [previewOpen]);
+
+  // Everything modal has to hide the native preview view, which is painted on
+  // top of the renderer and would otherwise cover the dialog.
+  useNativeOverlay(
+    providerOpen ||
+      !onboarded ||
+      newProjectOpen ||
+      paletteOpen ||
+      (qaOpen && qaEligible) ||
+      Boolean(state?.pendingTerminalConfirm) ||
+      Boolean(state?.pendingTerminalAsk) ||
+      Boolean(state?.pendingAgentAsk) ||
+      statsOpen,
+  );
 
   if (!bridgeReady) {
     return (
@@ -260,6 +453,11 @@ export function App() {
     ? deriveProductPhase(state)
     : ("planning" as const);
   const showArchitecturePane = architecturePaneOpen;
+  /** Settings always win the side column; otherwise it holds the plan. */
+  const sidePaneOpen = architecturePaneOpen || planOpen;
+  const cacheHit = state?.providerHud
+    ? cacheHitPercent(state.providerHud.session)
+    : null;
 
   return (
     <div
@@ -283,25 +481,14 @@ export function App() {
             <span className="status-pill">{state?.status ?? "idle"}</span>
           </div>
           <div className="topbar-right">
-            <button
-              type="button"
+            <div
               className={`provider-hud ${
                 state?.providerHud?.paid ? "provider-hud-paid" : ""
               } ${!state?.providerHud?.id ? "provider-hud-empty" : ""}`}
-              onClick={openProviderSettings}
-              title={`Active provider (${modShortcutHint("P")})`}
             >
               {state?.providerHud?.paid ? (
                 <span className="provider-paid-sign" aria-label="Paid">
                   $
-                </span>
-              ) : null}
-              <span className="provider-hud-name">
-                {state?.providerHud?.name ?? "No provider"}
-              </span>
-              {state?.providerHud?.model ? (
-                <span className="provider-hud-model">
-                  {state.providerHud.model}
                 </span>
               ) : null}
               <span className="provider-hud-usage">
@@ -313,11 +500,53 @@ export function App() {
                 {formatTokenCount(
                   state?.providerHud?.session.outputTokens ?? 0,
                 )}
+                {cacheHit !== null ? (
+                  <span
+                    className="provider-hud-cache"
+                    title={`${formatTokenCount(
+                      state?.providerHud?.session.cachedInputTokens ?? 0,
+                    )} prompt tokens served from the provider cache this session`}
+                  >
+                    {" "}
+                    · cache {cacheHit}%
+                  </span>
+                ) : null}
                 {state?.providerHud?.paid
                   ? ` · ${formatUsd(state.providerHud.sessionCostUsd)}`
                   : ""}
               </span>
-            </button>
+            </div>
+            <HeaderSelect
+              value={state?.providerHud?.name ?? "No provider"}
+              hint={modShiftHint("[")}
+              open={providerSelectOpen}
+              disabled={providers.length === 0}
+              title={`Switch provider (${modShiftHint("[")})`}
+              empty="Add a provider in Providers · ⌘P"
+              options={providers.map((p) => ({
+                id: p.id,
+                label: p.name,
+                hint: p.defaultModel,
+              }))}
+              onToggle={toggleProviderSelect}
+              onClose={() => setProviderSelectOpen(false)}
+              onPick={(id) => void pickProvider(id)}
+            />
+            <HeaderSelect
+              value={state?.providerHud?.model ?? "No model"}
+              hint={modShiftHint("M")}
+              open={modelSelectOpen}
+              disabled={!state?.providerHud?.id}
+              title={`Switch model on this provider (${modShiftHint("M")})`}
+              empty="Open Providers · ⌘P and list the models"
+              options={(state?.providerHud?.models ?? []).map((id) => ({
+                id,
+                label: id,
+              }))}
+              onToggle={toggleModelSwitcher}
+              onClose={() => setModelSelectOpen(false)}
+              onPick={(id) => void pickModel(id)}
+            />
             <button
               type="button"
               className="btn btn-secondary btn-sm"
@@ -325,14 +554,6 @@ export function App() {
               title={`Provider settings (${modShortcutHint("P")})`}
             >
               Providers · {modShortcutHint("P")}
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary btn-sm palette-trigger"
-              onClick={() => setPaletteOpen(true)}
-              title={`Command palette (${modShortcutHint("K")})`}
-            >
-              Palette · {modShortcutHint("K")}
             </button>
           </div>
         </div>
@@ -361,12 +582,30 @@ export function App() {
           <div className="workspace-bar-actions">
             <button
               type="button"
+              className={`btn btn-secondary btn-sm workspace-bar-action ${
+                statsOpen ? "workspace-bar-action-active" : ""
+              }`}
+              title="Session stats · S"
+              onClick={() => setStatsOpen(true)}
+            >
+              Stats · S
+            </button>
+            <button
+              type="button"
               className={`btn btn-secondary btn-sm workspace-bar-action ${showArchitecturePane ? "workspace-bar-action-active" : ""}`}
               title={`Architecture settings (${modShiftHint("A")})`}
               aria-pressed={showArchitecturePane}
               onClick={toggleArchitecturePane}
             >
               Settings · {modShiftHint("A")}
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm workspace-bar-action"
+              title={`Reset column layout (${modShortcutHint("\\")})`}
+              onClick={() => resetAllSplitLayouts()}
+            >
+              Layout · {modShortcutHint("\\")}
             </button>
             <button
               type="button"
@@ -391,86 +630,102 @@ export function App() {
           state={state}
           sessions={sessions}
           activeSessionId={activeSessionId}
+          onAddSession={requestNewSession}
+          workspaceReady={Boolean(state?.workspace)}
+          previewOpen={previewOpen}
+          planOpen={planOpen}
+          onTogglePreview={togglePreview}
+          onTogglePlan={togglePlan}
+          onOpenStats={() => setStatsOpen(true)}
         />
 
-        <div
-          className="git-bar"
-          role="status"
-          aria-label="Git branch"
-        >
-          <div className="git-bar-label">Git</div>
-          {!state?.workspace ? (
-            <div className="git-bar-main muted">No workspace</div>
-          ) : gitStatus == null ? (
-            <div className="git-bar-main muted">Checking repository…</div>
-          ) : !gitStatus.isRepo ? (
-            <div className="git-bar-main muted">Not a git repository</div>
-          ) : (
-            <div className="git-bar-main">
-              <span className="git-bar-item">
-                <span className="git-bar-key">local</span>
-                <span className="git-bar-value">
-                  {gitStatus.localBranch ?? "—"}
-                </span>
-              </span>
-              <span className="git-bar-sep" aria-hidden>
-                →
-              </span>
-              <span className="git-bar-item">
-                <span className="git-bar-key">remote</span>
-                <span
-                  className={`git-bar-value ${gitStatus.remoteBranch ? "" : "muted"}`}
-                  title={
-                    gitStatus.remoteBranch
-                      ? undefined
-                      : gitStatus.hasRemote
-                        ? "origin is set; upstream tracking appears after the first push"
-                        : "No git remote configured"
-                  }
-                >
-                  {gitStatus.remoteBranch ??
-                    (gitStatus.hasRemote
-                      ? "push after first commit"
-                      : "no remote")}
-                </span>
-              </span>
-            </div>
-          )}
-        </div>
+        <GitBar
+          workspaceReady={Boolean(state?.workspace)}
+          status={gitStatus}
+          onRefresh={refreshGitStatus}
+          onConflict={setConflictNotice}
+        />
 
         <ComposerBar state={state} inputRef={composerRef} />
       </header>
 
       <EngineBanner hasWorkspace={Boolean(state?.workspace)} />
 
-      <main className="cockpit">
-        <section className="pane">
-          <ConversationPane
-            state={state}
-            sessions={sessions}
-            activeSessionId={activeSessionId}
-            onBuildStarted={refreshGitStatus}
-            onBuildCommitted={refreshGitStatus}
-          />
-        </section>
-        <section className="pane">
-          {showArchitecturePane ? (
-            <ArchitecturePane
-              workspaceRoot={state?.workspace?.resolvedRootPath}
-              onClose={closeArchitecturePane}
-            />
-          ) : (
-            <VerifyPane
+      <main
+        className={`cockpit ${previewOpen ? "cockpit-preview" : ""} ${
+          sidePaneOpen ? "" : "cockpit-no-side"
+        }`}
+      >
+        <SplitGroup
+          storageKey={`cockpit:${sidePaneOpen ? "side" : "noside"}:${
+            previewOpen ? "preview" : "nopreview"
+          }`}
+          autoWeights={autoCockpitWeights({
+            width: layoutWidth,
+            side: sidePaneOpen,
+            preview: previewOpen,
+          })}
+          mins={
+            sidePaneOpen && previewOpen
+              ? [260, 220, 320]
+              : previewOpen
+                ? [280, 360]
+                : sidePaneOpen
+                  ? [280, 240]
+                  : [320]
+          }
+        >
+          <section className="pane">
+            <ConversationPane
               state={state}
-              planning={phase === "planning"}
-              onOpenQa={() => {
-                setQaDismissedKey(null);
-                setQaOpen(true);
-              }}
-              onOpenArchitecture={openArchitecturePane}
+              sessions={sessions}
+              activeSessionId={activeSessionId}
+              onBuildStarted={refreshGitStatus}
+              onBuildCommitted={refreshGitStatus}
+              gitConflict={
+                gitStatus?.conflicted?.length
+                  ? {
+                      files: gitStatus.conflicted,
+                      branch: gitStatus.localBranch,
+                      remote: gitStatus.compareRemote,
+                      operation: "merge",
+                    }
+                  : null
+              }
+              gitConflictDialogOpen={Boolean(conflictNotice)}
+              onOpenGitConflict={setConflictNotice}
+              onToggleModel={toggleModelSwitcher}
             />
-          )}
-        </section>
+          </section>
+          {sidePaneOpen ? (
+            <section className="pane">
+              {showArchitecturePane ? (
+                <ArchitecturePane
+                  workspaceRoot={state?.workspace?.resolvedRootPath}
+                  onClose={closeArchitecturePane}
+                />
+              ) : (
+                <VerifyPane
+                  state={state}
+                  planning={phase === "planning"}
+                  onOpenQa={() => {
+                    setQaDismissedKey(null);
+                    setQaOpen(true);
+                  }}
+                  onOpenArchitecture={openArchitecturePane}
+                  onHide={togglePlan}
+                />
+              )}
+            </section>
+          ) : null}
+          {previewOpen ? (
+            <PreviewPane
+              onClose={() => setPreviewOpen(false)}
+              onFocusComposer={() => composerRef.current?.focus()}
+              busy={isBusyStatus(state?.status)}
+            />
+          ) : null}
+        </SplitGroup>
       </main>
 
       <CommandPalette
@@ -484,6 +739,36 @@ export function App() {
         }}
         onOpenProviderSettings={openProviderSettings}
         onOpenArchitecture={openArchitecturePane}
+        {...(state?.workspace
+          ? { onTogglePreview: togglePreview, onTogglePlan: togglePlan }
+          : {})}
+        onToggleModel={toggleModelSwitcher}
+        onResetLayout={() => resetAllSplitLayouts()}
+        onNewSession={requestNewSession}
+      />
+
+      <GitBranchDialog
+        open={newSessionOpen}
+        mode="new-session"
+        onClose={() => setNewSessionOpen(false)}
+        onPicked={async ({ branch, dirtyStrategy }) => {
+          await createSession({
+            branch,
+            ...(dirtyStrategy ? { dirtyStrategy } : {}),
+          });
+          refreshGitStatus();
+        }}
+      />
+
+      <GitConflictDialog
+        notice={conflictNotice}
+        onClose={() => setConflictNotice(null)}
+        onResolve={startConflictSession}
+      />
+
+      <SessionStatsDialog
+        open={statsOpen}
+        onClose={() => setStatsOpen(false)}
       />
 
       <PlanQaDialog

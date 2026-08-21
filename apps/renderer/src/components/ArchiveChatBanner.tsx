@@ -34,7 +34,7 @@ export function ArchiveChatBanner(props: { state: SessionState | null }) {
       const bridge = getBridge();
       // New chat first (becomes active, Plan mode), then drop the old one.
       await bridge?.session.create();
-      await bridge?.session.close(sessionId);
+      await bridge?.session.close(sessionId, "archived");
     } finally {
       setBusy(false);
     }

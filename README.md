@@ -26,7 +26,7 @@ pnpm typecheck
 pnpm --filter @ai-ide/desktop dev
 ```
 
-Runs Electron main + Vite renderer. Onboarding configures an OpenAI-compatible Base URL; without a live endpoint the agent uses the mock provider.
+Runs Electron main + Vite renderer. Onboarding configures a Base URL and a protocol (OpenAI-compatible, Anthropic Messages or DeepSeek); without a live endpoint the agent uses the mock provider.
 
 ## Demo fixture
 
@@ -46,7 +46,7 @@ pnpm dev:web   # :5173
 | `apps/renderer` | React cockpit |
 | `packages/shared` | Domain + Zod IPC contracts |
 | `packages/storage` | SQLite + config + credentials interface |
-| `packages/provider` | OpenAI-compatible + mock |
+| `packages/provider` | Vercel AI SDK transport (OpenAI-compatible / Anthropic / DeepSeek) + mock |
 | `packages/workspace` | Perimeter, FS, Git, checkpoints |
 | `packages/tools` | Tool gateway, policy, PTY runner |
 | `packages/agent` | Turn loop / FSM |

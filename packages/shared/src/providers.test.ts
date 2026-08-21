@@ -1,17 +1,26 @@
 import { describe, expect, it } from "vitest";
 import {
+  cacheHitPercent,
   estimateCostUsd,
   formatPeakWindowsUtc,
+  formatRateBand,
   formatUsd,
   migrateLegacyProviderConfig,
   formatTokenCount,
   guessPricingDocsUrl,
+  isFreeModel,
+  isMeteredModel,
   isUtcInPeakWindow,
   parsePeakWindowsUtc,
   parseUsdRate,
   resolvePricingBand,
   SavedProviderSchema,
   accumulateSessionModelUsage,
+  buildProviderHud,
+  catalogNeedsHuman,
+  emptyProviderUsage,
+  mergeProviderModels,
+  modelCapabilityGaps,
 } from "./providers.js";
 
 describe("provider cost helpers", () => {
@@ -120,6 +129,19 @@ describe("provider cost helpers", () => {
     ).toBe(0.22);
   });
 
+  it("inherits byModel rates from a fine-tune's base family", () => {
+    const band = resolvePricingBand(
+      {
+        byModel: {
+          "gpt-4o": { inputPer1M: 2.5, outputPer1M: 10 },
+        },
+      },
+      { model: "ft:gpt-4o:getapper::abc" },
+    );
+    expect(band?.inputPer1M).toBe(2.5);
+    expect(band?.outputPer1M).toBe(10);
+  });
+
   it("prefers byModel rates for the active model", () => {
     const band = resolvePricingBand(
       {
@@ -132,6 +154,47 @@ describe("provider cost helpers", () => {
     );
     expect(band?.inputCacheMissPer1M).toBe(1.32);
     expect(band?.outputPer1M).toBe(3.96);
+  });
+
+  it("formats a model's rate band for the catalog", () => {
+    expect(
+      formatRateBand({ inputCacheMissPer1M: 0.14, outputPer1M: 0.28 }),
+    ).toBe("$0.14 / $0.28");
+    expect(formatRateBand({})).toBeNull();
+  });
+
+  it("treats :free variants and zero-rated models as free", () => {
+    expect(isFreeModel({ model: "minimax/minimax-m2:free" })).toBe(true);
+    expect(
+      isFreeModel({
+        model: "glm-4.6-air",
+        pricing: { inputPer1M: 0, outputPer1M: 0 },
+      }),
+    ).toBe(true);
+    expect(
+      isFreeModel({
+        model: "glm-4.6-air",
+        pricing: {
+          inputPer1M: 0.4,
+          outputPer1M: 1.2,
+          byModel: { "glm-4.6-air": { inputPer1M: 0, outputPer1M: 0 } },
+        },
+      }),
+    ).toBe(true);
+    // An unknown price list is not a free one.
+    expect(isFreeModel({ model: "gpt-5.2" })).toBe(false);
+    expect(
+      isFreeModel({ model: "gpt-5.2", pricing: { inputPer1M: 2 } }),
+    ).toBe(false);
+  });
+
+  it("only counts a model as metered when the account pays for it", () => {
+    const pricing = { inputPer1M: 2, outputPer1M: 8 };
+    expect(isMeteredModel({ paid: true, model: "gpt-5.2", pricing })).toBe(true);
+    expect(
+      isMeteredModel({ paid: true, model: "minimax/minimax-m2:free", pricing }),
+    ).toBe(false);
+    expect(isMeteredModel({ paid: false, model: "qwen3-coder" })).toBe(false);
   });
 
   it("parses and formats peak windows", () => {
@@ -148,6 +211,15 @@ describe("provider cost helpers", () => {
     expect(guessPricingDocsUrl("https://api.deepseek.com")).toBe(
       "https://api-docs.deepseek.com/quick_start/pricing/",
     );
+    expect(guessPricingDocsUrl("https://api.openai.com/v1")).toBe(
+      "https://platform.openai.com/docs/pricing",
+    );
+  });
+
+  it("guesses LM Studio docs for localhost endpoints", () => {
+    expect(guessPricingDocsUrl("http://localhost:1234/v1")).toBe(
+      "https://lmstudio.ai/docs/app/basics/models",
+    );
   });
 
   it("returns null when rates are missing", () => {
@@ -160,6 +232,26 @@ describe("provider cost helpers", () => {
   it("formats token counts compactly", () => {
     expect(formatTokenCount(42)).toBe("42");
     expect(formatTokenCount(1500)).toBe("1.5k");
+  });
+
+  it("reports cache hit share only once it means something", () => {
+    expect(
+      cacheHitPercent({
+        inputTokens: 10_000,
+        cachedInputTokens: 7_500,
+        outputTokens: 0,
+      }),
+    ).toBe(75);
+    // Endpoints that never report cache reads should show nothing, not 0%.
+    expect(cacheHitPercent({ inputTokens: 10_000, outputTokens: 0 })).toBeNull();
+    // Nor should the first few hundred tokens of a session be extrapolated.
+    expect(
+      cacheHitPercent({
+        inputTokens: 200,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+      }),
+    ).toBeNull();
   });
 
   it("parses rates with comma or dot decimals", () => {
@@ -277,5 +369,111 @@ describe("provider cost helpers", () => {
       parsed.pricing?.byModel?.["deepseek-v4-pro"]?.schedule?.peak
         ?.outputPer1M,
     ).toBe(3.96);
+  });
+
+  it("accepts a model catalog on SavedProvider", () => {
+    const now = new Date().toISOString();
+    const parsed = SavedProviderSchema.parse({
+      id: "p1",
+      name: "Local",
+      baseUrl: "http://localhost:1234/v1",
+      defaultModel: "qwen2-vl",
+      models: [
+        { id: "qwen2-vl", vision: true, tools: true, contextWindowTokens: 32768 },
+        { id: "llama-3" },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    });
+    expect(parsed.models).toHaveLength(2);
+    expect(parsed.models?.[1]?.vision).toBeUndefined();
+  });
+});
+
+describe("model catalog helpers", () => {
+  it("merges listed ids without wiping a human-confirmed flag", () => {
+    const merged = mergeProviderModels(
+      [{ id: "qwen2-vl", vision: true, tools: false, source: "user" }],
+      [
+        { id: "qwen2-vl", contextWindowTokens: 32768, source: "listed" },
+        { id: "llama-3", source: "listed" },
+      ],
+    );
+    expect(merged).toEqual([
+      {
+        id: "qwen2-vl",
+        contextWindowTokens: 32768,
+        vision: true,
+        tools: false,
+        source: "listed",
+      },
+      { id: "llama-3", source: "listed" },
+    ]);
+  });
+
+  it("flags the fields nobody has answered yet", () => {
+    expect(
+      modelCapabilityGaps({ id: "llama-3" }, { paid: false }),
+    ).toEqual(["vision", "tools", "context"]);
+    expect(
+      modelCapabilityGaps(
+        { id: "gpt-4o", vision: true, tools: true, contextWindowTokens: 128000 },
+        { paid: true, pricing: { inputPer1M: 2.5, outputPer1M: 10 } },
+      ),
+    ).toEqual([]);
+  });
+
+  it("lets a user patch clear a flag back to unknown", () => {
+    const merged = mergeProviderModels(
+      [{ id: "local", vision: false, tools: true, source: "user" }],
+      [{ id: "local", vision: undefined, source: "user" }],
+    );
+    expect(merged[0]?.vision).toBeUndefined();
+    expect(merged[0]?.tools).toBe(true);
+  });
+
+  it("counts catalog rows that still need a human", () => {
+    expect(
+      catalogNeedsHuman({
+        models: [
+          { id: "a", vision: true, tools: true, contextWindowTokens: 8000 },
+          { id: "b" },
+        ],
+        paid: false,
+      }),
+    ).toBe(1);
+  });
+
+  it("exposes catalog flags on the HUD for the active model", () => {
+    const now = new Date().toISOString();
+    const hud = buildProviderHud({
+      registry: {
+        activeId: "p1",
+        usageByProviderId: {},
+        providers: [
+          {
+            id: "p1",
+            name: "Local",
+            baseUrl: "http://localhost:1234/v1",
+            defaultModel: "qwen2-vl",
+            kind: "openai-compatible",
+            paid: false,
+            thinking: false,
+            reasoningEffort: "high",
+            models: [
+              { id: "qwen2-vl", vision: true, tools: true },
+              { id: "llama-3" },
+            ],
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      },
+      sessionUsage: emptyProviderUsage(),
+    });
+    expect(hud.model).toBe("qwen2-vl");
+    expect(hud.models).toEqual(["qwen2-vl", "llama-3"]);
+    expect(hud.vision).toBe(true);
+    expect(hud.tools).toBe(true);
   });
 });

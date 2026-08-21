@@ -8,6 +8,7 @@ import {
   COMMAND_DENYLIST,
 } from "./policy.js";
 import { createDefaultRegistry } from "./builtins.js";
+import type { ToolExecutionContext } from "./gateway.js";
 
 describe("policy matrix", () => {
   it("ask allows only safe tools", () => {
@@ -53,8 +54,10 @@ describe("command analysis", () => {
     expect(analyzeCommand("git status").allowlisted).toBe(true);
   });
 
-  it("requires approval for unknown commands", () => {
-    expect(analyzeCommand("curl https://evil.com").needsApproval).toBe(true);
+  it("lets commands outside the allowlist through to the mode matrix", () => {
+    const analysis = analyzeCommand("curl https://evil.com");
+    expect(analysis.blocked).toBe(false);
+    expect(analysis.allowlisted).toBe(false);
   });
 
   it("defines matrix for every mode", () => {
@@ -184,5 +187,187 @@ describe("phase tool gating", () => {
     expect(names).not.toContain("propose_plan_ready");
     expect(names).not.toContain("checkpoint_restore");
     expect(names).toContain("propose_testing_ready");
+  });
+});
+
+describe("request_human_setup", () => {
+  const registry = createDefaultRegistry();
+  const tool = registry.get("request_human_setup");
+
+  function ctx(overrides: Partial<ToolExecutionContext> = {}) {
+    return {
+      workspaceRoot: "/tmp/ws",
+      mode: "agent" as AgentMode,
+      grants: [],
+      audit: () => undefined,
+      redact: (value: unknown) => value,
+      approvedCategories: new Set(),
+      ...overrides,
+    } as unknown as ToolExecutionContext;
+  }
+
+  const args = {
+    reason: "e2e cannot reach the database: getaddrinfo ENOTFOUND",
+    items: [
+      {
+        title: "Create the Neon e2e branch and paste its connection string",
+        envFile: ".env.e2e",
+        envKeys: ["DATABASE_URL"],
+      },
+    ],
+  };
+
+  it("is offered after planning only", () => {
+    expect(registry.listForPhase("planning").map((t) => t.name)).not.toContain(
+      "request_human_setup",
+    );
+    for (const phase of ["checking", "building", "testing"] as const) {
+      expect(registry.listForPhase(phase).map((t) => t.name)).toContain(
+        "request_human_setup",
+      );
+    }
+    expect(getToolRisk("request_human_setup")).toBe("safe");
+  });
+
+  it("declares the checklist through the host", async () => {
+    const calls: unknown[] = [];
+    const result = await tool?.execute(
+      args,
+      ctx({
+        humanSetup: {
+          declare: async (input) => {
+            calls.push(input);
+            return {
+              items: [
+                {
+                  id: "i1",
+                  title: input.items[0]!.title,
+                  envFile: ".env.e2e",
+                  presentKeys: [],
+                  missingKeys: ["DATABASE_URL"],
+                  satisfied: false,
+                },
+              ],
+              allSatisfied: false,
+            };
+          },
+        },
+      }),
+    );
+    expect(calls).toHaveLength(1);
+    const output = result?.output as {
+      declared: boolean;
+      allSatisfied: boolean;
+      hint: string;
+    };
+    expect(output.declared).toBe(true);
+    // declared && !allSatisfied is what makes the agent loop end the turn.
+    expect(output.allSatisfied).toBe(false);
+    expect(output.hint).toContain("ended your turn");
+  });
+
+  it("tells the agent to keep going when the keys are already there", async () => {
+    const result = await tool?.execute(
+      args,
+      ctx({
+        humanSetup: {
+          declare: async () => ({
+            items: [
+              {
+                id: "i1",
+                title: "t",
+                envFile: ".env.e2e",
+                presentKeys: ["DATABASE_URL"],
+                missingKeys: [],
+                satisfied: true,
+              },
+            ],
+            allSatisfied: true,
+          }),
+        },
+      }),
+    );
+    const output = result?.output as { allSatisfied: boolean; hint: string };
+    expect(output.allSatisfied).toBe(true);
+    expect(output.hint).toContain("retry");
+  });
+
+  it("refuses to invent secrets when there is no human", async () => {
+    const result = await tool?.execute(args, ctx());
+    const output = result?.output as { declared: boolean; error: string };
+    expect(output.declared).toBe(false);
+    expect(output.error).toContain("do not invent secrets");
+  });
+});
+
+describe("post_notice", () => {
+  const registry = createDefaultRegistry();
+  const tool = registry.get("post_notice");
+
+  function ctx(overrides: Partial<ToolExecutionContext> = {}) {
+    return {
+      workspaceRoot: "/tmp/ws",
+      mode: "agent" as AgentMode,
+      grants: [],
+      audit: () => undefined,
+      redact: (value: unknown) => value,
+      approvedCategories: new Set(),
+      ...overrides,
+    } as unknown as ToolExecutionContext;
+  }
+
+  it("is offered in every product phase", () => {
+    for (const phase of ["planning", "checking", "building", "testing"] as const) {
+      expect(registry.listForPhase(phase).map((t) => t.name)).toContain(
+        "post_notice",
+      );
+    }
+    expect(getToolRisk("post_notice")).toBe("safe");
+  });
+
+  it("posts a blocking banner through the host", async () => {
+    const calls: unknown[] = [];
+    const result = await tool?.execute(
+      {
+        kind: "error",
+        title: "Images were not sent",
+        detail: "The model refused image_url.",
+        blocking: true,
+      },
+      ctx({
+        notice: {
+          post: async (input) => {
+            calls.push(input);
+            return { id: "n1", expiresAt: null };
+          },
+        },
+      }),
+    );
+    expect(calls).toEqual([
+      {
+        kind: "error",
+        title: "Images were not sent",
+        detail: "The model refused image_url.",
+        blocking: true,
+      },
+    ]);
+    const output = result?.output as {
+      posted: boolean;
+      blocking: boolean;
+      hint: string;
+    };
+    expect(output.posted).toBe(true);
+    expect(output.blocking).toBe(true);
+    expect(output.hint).toContain("ended this turn");
+  });
+
+  it("falls back when there is no chrome host", async () => {
+    const result = await tool?.execute(
+      { kind: "warning", title: "Look at this" },
+      ctx(),
+    );
+    const output = result?.output as { posted: boolean; error: string };
+    expect(output.posted).toBe(false);
+    expect(output.error).toContain("No notice host");
   });
 });

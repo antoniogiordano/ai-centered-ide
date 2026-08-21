@@ -39,6 +39,59 @@ function joinList(value: string[] | undefined): string {
   return (value ?? []).join(", ");
 }
 
+function joinSupport(
+  support: NonNullable<ArchitectureProfile["dev"]>["support"],
+): string {
+  return (support ?? []).map((row) => `${row.name} | ${row.command}`).join("\n");
+}
+
+function parseSupport(
+  value: string,
+): NonNullable<NonNullable<ArchitectureProfile["dev"]>["support"]> {
+  const rows: NonNullable<NonNullable<ArchitectureProfile["dev"]>["support"]> =
+    [];
+  for (const line of value.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const sep = trimmed.includes("|")
+      ? "|"
+      : trimmed.includes("·")
+        ? "·"
+        : null;
+    if (!sep) continue;
+    const at = trimmed.indexOf(sep);
+    const name = trimmed.slice(0, at).trim();
+    const command = trimmed.slice(at + sep.length).trim();
+    if (name && command) rows.push({ name, command });
+  }
+  return rows;
+}
+
+function nextDev(
+  prev: ArchitectureProfile,
+  patch: { command?: string; url?: string; supportText?: string },
+): ArchitectureProfile {
+  const command = (patch.command ?? prev.dev?.command ?? "").trim();
+  const url = (patch.url ?? prev.dev?.url ?? "").trim();
+  const support =
+    patch.supportText !== undefined
+      ? parseSupport(patch.supportText)
+      : prev.dev?.support;
+  if (!command && !url && !support?.length) {
+    const { dev: _drop, ...rest } = prev;
+    void _drop;
+    return rest as ArchitectureProfile;
+  }
+  return {
+    ...prev,
+    dev: {
+      ...(command ? { command } : {}),
+      ...(url ? { url } : {}),
+      ...(support?.length ? { support } : {}),
+    },
+  };
+}
+
 const LANGS = LanguageSchema.options;
 const PMS = PackageManagerSchema.options;
 const SHAPES = RepoShapeSchema.options;
@@ -566,6 +619,53 @@ export function ArchitecturePane(props: Props) {
                       },
                     },
                   }))
+                }
+              />
+            </label>
+          </div>
+        </section>
+
+        <section className="arch-section">
+          <h3 className="arch-section-title">Live preview</h3>
+          <p className="arch-section-note">
+            Preview · {modShiftHint("P")} runs this command in a terminal.
+            Saving confirms it so the pane does not ask again.
+          </p>
+          <div className="arch-grid-2">
+            <label className="arch-field arch-field-span">
+              <span>Dev command</span>
+              <input
+                className="input arch-input"
+                spellCheck={false}
+                placeholder="pnpm dev"
+                value={draft.dev?.command ?? ""}
+                onChange={(e) =>
+                  patch((p) => nextDev(p, { command: e.target.value }))
+                }
+              />
+            </label>
+            <label className="arch-field arch-field-span">
+              <span>URL (only if the server does not print it)</span>
+              <input
+                className="input arch-input"
+                spellCheck={false}
+                placeholder="http://localhost:3000/"
+                value={draft.dev?.url ?? ""}
+                onChange={(e) =>
+                  patch((p) => nextDev(p, { url: e.target.value }))
+                }
+              />
+            </label>
+            <label className="arch-field arch-field-span">
+              <span>Support processes (one per line: name | command)</span>
+              <textarea
+                className="input arch-input"
+                rows={3}
+                spellCheck={false}
+                placeholder="postgres | docker compose up postgres"
+                value={joinSupport(draft.dev?.support)}
+                onChange={(e) =>
+                  patch((p) => nextDev(p, { supportText: e.target.value }))
                 }
               />
             </label>

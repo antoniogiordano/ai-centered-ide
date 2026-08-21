@@ -24,12 +24,35 @@ export function triggerTokensForContextWindow(
     Number.isFinite(contextWindowTokens) &&
     contextWindowTokens >= 4_000
   ) {
-    return Math.max(
-      8_000,
-      Math.floor(contextWindowTokens * CONTEXT_COMPACT_WINDOW_RATIO),
+    const ratio = Math.floor(
+      contextWindowTokens * CONTEXT_COMPACT_WINDOW_RATIO,
     );
+    // Never trigger at or above n_ctx — llama.cpp rejects when
+    // n_keep / the initial prompt is already larger than the loaded window.
+    // The old 8_000 floor sat *above* 4k–8k local models.
+    const headroom = Math.min(
+      4_096,
+      Math.max(512, Math.floor(contextWindowTokens * 0.2)),
+    );
+    const cap = Math.max(1_000, contextWindowTokens - headroom);
+    return Math.min(cap, Math.max(1_000, ratio));
   }
   return CONTEXT_COMPACT_TRIGGER_TOKENS;
+}
+
+/** Skip the 24k-char body floor on small local windows (system prompt alone can overflow). */
+export function minCharsForContextWindow(
+  contextWindowTokens: number | null | undefined,
+): number {
+  if (
+    typeof contextWindowTokens === "number" &&
+    Number.isFinite(contextWindowTokens) &&
+    contextWindowTokens >= 4_000 &&
+    contextWindowTokens < 32_000
+  ) {
+    return 2_000;
+  }
+  return CONTEXT_COMPACT_MIN_CHARS;
 }
 
 export const AGENT_HISTORY_DIR = ".aici/agent-history";
@@ -97,8 +120,14 @@ export function shouldCompactContext(
 ): boolean {
   const trigger = opts?.triggerTokens ?? CONTEXT_COMPACT_TRIGGER_TOKENS;
   const minChars = opts?.minChars ?? CONTEXT_COMPACT_MIN_CHARS;
-  const body = messages.filter((m) => m.role !== "system");
-  const chars = body.reduce((n, m) => {
+  // Default: ignore system so a large prompt + tiny chat does not compact
+  // on 128k cloud models. Small local windows lower minChars and then the
+  // system prompt must count — that is what overflows llama.cpp n_ctx.
+  const counted =
+    minChars < CONTEXT_COMPACT_MIN_CHARS
+      ? messages
+      : messages.filter((m) => m.role !== "system");
+  const chars = counted.reduce((n, m) => {
     if (m.role === "assistant") {
       return (
         n +
@@ -114,7 +143,7 @@ export function shouldCompactContext(
     return n + chatContentText(m.content).length;
   }, 0);
   const imageChars =
-    countMessageImages(body) * ESTIMATED_TOKENS_PER_IMAGE * 4;
+    countMessageImages(counted) * ESTIMATED_TOKENS_PER_IMAGE * 4;
   if (chars + imageChars < minChars) return false;
   if (
     typeof opts?.lastInputTokens === "number" &&
@@ -369,6 +398,7 @@ export async function maybeCompactProviderMessages(opts: {
 }): Promise<CompactContextResult> {
   const { messages, state, provider } = opts;
   const triggerTokens = triggerTokensForContextWindow(opts.contextWindowTokens);
+  const minChars = minCharsForContextWindow(opts.contextWindowTokens);
   const needs =
     opts.force === true ||
     shouldCompactContext(messages, {
@@ -376,6 +406,7 @@ export async function maybeCompactProviderMessages(opts: {
         ? { lastInputTokens: opts.lastInputTokens }
         : {}),
       triggerTokens,
+      minChars,
     });
   if (!needs) {
     refreshSystemMessage(messages, state);

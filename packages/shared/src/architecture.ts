@@ -198,6 +198,41 @@ export type ArchitectureApi = z.infer<typeof ArchitectureApiSchema>;
 
 export const ArchitectureApiPatchSchema = ArchitectureApiSchema.strict();
 
+export const ArchitectureDevProcessSchema = z.object({
+  name: z.string().min(1),
+  command: z.string().min(1),
+});
+export type ArchitectureDevProcess = z.infer<
+  typeof ArchitectureDevProcessSchema
+>;
+
+/**
+ * How to run this project locally, for the live preview.
+ *
+ * Never derived from the repo: the scripts of a real project are ambiguous
+ * (`dev` next to `dev:e2e` pointed at a seeded database, wrappers, one server
+ * per app in a monorepo) and a wrong guess silently shows the human the wrong
+ * world. The agent reads the repo and proposes, the human confirms, and the
+ * answer lives here so it is asked once per project.
+ */
+export const ArchitectureDevSchema = z.object({
+  /** The app to preview. Exactly one, run as-is in a terminal. */
+  command: z.string().min(1).optional(),
+  /** Processes the app needs but that are not the thing being looked at. */
+  support: z.array(ArchitectureDevProcessSchema).optional(),
+  /** Only when the server does not print its URL on startup. */
+  url: z.string().min(1).optional(),
+});
+export type ArchitectureDev = z.infer<typeof ArchitectureDevSchema>;
+
+export const ArchitectureDevPatchSchema = z
+  .object({
+    command: z.string().min(1).optional(),
+    support: z.array(ArchitectureDevProcessSchema.strict()).optional(),
+    url: z.string().min(1).optional(),
+  })
+  .strict();
+
 export const ArchitectureRuntimePatchSchema = ArchitectureRuntimeSchema.strict();
 
 export const ArchitectureMetaSchema = z.object({
@@ -222,6 +257,7 @@ export const ArchitectureProfileSchema = z.object({
   quality: ArchitectureQualitySchema.optional(),
   data: ArchitectureDataSchema.optional(),
   api: ArchitectureApiSchema.optional(),
+  dev: ArchitectureDevSchema.optional(),
   meta: ArchitectureMetaSchema,
 });
 export type ArchitectureProfile = z.infer<typeof ArchitectureProfileSchema>;
@@ -245,6 +281,7 @@ export const ArchitectureProfilePatchSchema = z
     quality: ArchitectureQualityPatchSchema.optional(),
     data: ArchitectureDataPatchSchema.optional(),
     api: ArchitectureApiPatchSchema.optional(),
+    dev: ArchitectureDevPatchSchema.optional(),
     meta: ArchitectureMetaSchema.partial().optional(),
   })
   .strict();
@@ -273,6 +310,7 @@ export const ARCHITECTURE_PATCH_FIELD_GUIDE = [
   "data: { database?: \"postgres\"|\"mysql\"|\"sqlite\"|\"mongodb\"|\"redis\"|\"none\"|\"custom\", orm? }",
   "api: { style?: \"rest\"|\"graphql\"|\"trpc\"|\"grpc\"|\"none\"|\"custom\" }",
   "repo: { shape?: \"app\"|\"monorepo\", packageManager? }",
+  "dev: { command?: string, support?: [{ name, command }], url? } — how to run the app locally for the live preview",
 ].join("\n");
 
 const RUNTIME_ALIASES: Record<string, RuntimeId> = {
@@ -581,6 +619,7 @@ export function mergeArchitectureProfile(
   mark("quality", patch.quality !== undefined);
   mark("data", patch.data !== undefined);
   mark("api", patch.api !== undefined);
+  mark("dev", patch.dev !== undefined);
 
   const mergeLayer = (
     current: ArchitectureProfile["backend"],
@@ -627,6 +666,7 @@ export function mergeArchitectureProfile(
       : base.quality,
     data: patch.data ? { ...base.data, ...patch.data } : base.data,
     api: patch.api ? { ...base.api, ...patch.api } : base.api,
+    dev: patch.dev ? { ...base.dev, ...patch.dev } : base.dev,
     meta: {
       updatedAt: new Date().toISOString(),
       sources: nextSources,
@@ -711,6 +751,8 @@ export function computeArchitectureDrift(
   if (overrides.api !== undefined) {
     push("api", derived.api ?? null, overrides.api);
   }
+  // `dev` is intentionally absent: nothing derives it, so it would always read
+  // as drift against null instead of as the answer to a question we asked.
   return drifts;
 }
 
@@ -813,6 +855,15 @@ export function formatArchitectureForPrompt(
     );
   }
   if (profile.api?.style) lines.push(`API: ${profile.api.style}`);
+  if (profile.dev?.command) {
+    lines.push(
+      `Run locally: ${profile.dev.command}${
+        profile.dev.support?.length
+          ? ` (+ ${profile.dev.support.map((s) => s.name).join(", ")})`
+          : ""
+      }`,
+    );
+  }
   if (opts?.drift?.length) {
     lines.push(
       `Drift (override ≠ detected): ${opts.drift.map((d) => d.path).join(", ")}`,
@@ -821,5 +872,10 @@ export function formatArchitectureForPrompt(
   lines.push(
     "Stack facts come from the repo (detected). Overrides in ARCHITECTURE.md only fix intent/ambiguity. Do not re-upsert fields that already match detection.",
   );
+  if (!profile.dev?.command) {
+    lines.push(
+      "`dev` is never detected: if asked how to run the app for the live preview, work it out from the repo and upsert it. The human confirms before it runs.",
+    );
+  }
   return lines.join("\n");
 }

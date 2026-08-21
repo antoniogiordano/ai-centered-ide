@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type * as MonacoEditorApi from "monaco-editor";
 import { ensureMonacoEnvironment } from "../lib/monacoEnv";
 import { reportUiError } from "../lib/uiErrors";
 
@@ -9,8 +10,8 @@ type Props = {
   onChange?: (value: string) => void;
 };
 
-type MonacoApi = typeof import("monaco-editor");
-type MonacoEditorInstance = import("monaco-editor").editor.IStandaloneCodeEditor;
+type MonacoApi = typeof MonacoEditorApi;
+type MonacoEditorInstance = MonacoEditorApi.editor.IStandaloneCodeEditor;
 
 /**
  * Monaco loaded on demand (Phase 7.8). Default read-only; explicit edit mode via readOnly=false.
@@ -49,7 +50,7 @@ export function MonacoEditor(props: Props) {
           value,
           language: languageFromPath(path),
           readOnly,
-          theme: "vs-dark",
+          theme: "vs",
           minimap: { enabled: false },
           fontSize: 13,
           automaticLayout: true,
@@ -86,7 +87,6 @@ export function MonacoEditor(props: Props) {
       editorRef.current = null;
     };
     // Recreate when path/readOnly changes; value synced below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, readOnly]);
 
   useEffect(() => {

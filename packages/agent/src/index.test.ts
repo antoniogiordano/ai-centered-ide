@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MockProvider, chatContentText } from "@ai-ide/provider";
-import { AppError } from "@ai-ide/shared";
+import { MockProvider, chatContentText, type ChatMessage } from "@ai-ide/provider";
+import {
+  AppError,
+  MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT,
+  type SessionState,
+} from "@ai-ide/shared";
 import {
   CheckpointService,
   FilesystemService,
@@ -23,9 +27,13 @@ import {
   compactProviderMessages,
   isAgentTankMode,
   mergePlanQuestionFromAgent,
+  newGateFixBudget,
   newSession,
   normalizeFeatBranchName,
+  noteGateFixRound,
   runAgentTurn,
+  sanitizeProviderMessages,
+  takeSafeMessageTail,
   tryParsePartialJson,
   TurnStateMachine,
 } from "./index.js";
@@ -40,6 +48,67 @@ describe("agent runtime", () => {
     const result = await runAgentTurn(session, "hello", { provider });
     expect(result.assistantContent).toContain("Done");
     expect(result.state.turns.length).toBeGreaterThan(0);
+  });
+
+  it("streams reasoning as one train of thought and keeps it on the turn", async () => {
+    let round = 0;
+    const provider = {
+      async listModels() {
+        return [{ id: "mock" }];
+      },
+      cancel() {},
+      async *chat() {
+        round += 1;
+        if (round === 1) {
+          yield { type: "reasoning" as const, delta: "First I check" };
+          yield { type: "reasoning" as const, delta: " the plan." };
+          yield {
+            type: "tool_call" as const,
+            id: "call_1",
+            name: "read_plan",
+            argumentsDelta: "{}",
+            index: 0,
+          };
+          yield { type: "done" as const, finishReason: "tool_calls" };
+          return;
+        }
+        yield { type: "reasoning" as const, delta: " Now I answer." };
+        yield { type: "content" as const, delta: "Nothing to do." };
+        yield { type: "done" as const, finishReason: "stop" };
+      },
+    };
+
+    const emitted: string[] = [];
+    const result = await runAgentTurn(newSession("s-cot", "agent"), "go", {
+      provider,
+      onProgress: (event) => {
+        if (event.type === "reasoning") emitted.push(event.text);
+      },
+    });
+
+    // Each event carries the full thought so far, so a dropped frame during the
+    // 40ms UI flush cannot leave a hole in the middle of the text.
+    expect(emitted.at(-1)).toBe("First I check the plan. Now I answer.");
+    expect(emitted).toEqual([...emitted].sort((a, b) => a.length - b.length));
+
+    // Tool rounds are invisible in the result: one turn, one chain of thought.
+    const assistant = result.state.turns.filter((t) => t.role === "assistant");
+    expect(assistant.at(-1)?.reasoning).toBe(
+      "First I check the plan. Now I answer.",
+    );
+    expect(result.state.partialReasoningText).toBeNull();
+  });
+
+  it("leaves reasoning off the turn when the provider sends none", async () => {
+    const provider = new MockProvider({
+      name: "test",
+      steps: [{ type: "content", text: "Done." }],
+    });
+    const result = await runAgentTurn(newSession("s-no-cot", "ask"), "hi", {
+      provider,
+    });
+    const assistant = result.state.turns.filter((t) => t.role === "assistant");
+    expect(assistant.at(-1)?.reasoning).toBeUndefined();
   });
 
   it("calls read_file via tool_call then answers", async () => {
@@ -862,6 +931,134 @@ describe("agent runtime", () => {
     ).toBe(true);
   });
 
+  it("compacts and retries once on llama.cpp context overflow", async () => {
+    let turnCalls = 0;
+    const overflow = new AppError({
+      code: "PROVIDER_ERROR",
+      userMessage: "The AI provider request failed.",
+      technicalDetail:
+        "The number of tokens to keep from the initial prompt is greater than the context length.",
+    });
+    const provider = {
+      async listModels() {
+        return [{ id: "mock" }];
+      },
+      cancel() {},
+      async *chat(messages: ChatMessage[]) {
+        const first = messages[0];
+        const sys =
+          first?.role === "system" && typeof first.content === "string"
+            ? first.content
+            : "";
+        if (sys.includes("compress an AI coding-agent")) {
+          yield { type: "content" as const, delta: "Prior work summarized." };
+          return;
+        }
+        turnCalls += 1;
+        if (turnCalls === 1) {
+          yield { type: "error" as const, error: overflow };
+          return;
+        }
+        yield { type: "content" as const, delta: "ok after compact" };
+      },
+    };
+
+    const result = await runAgentTurn(newSession("s-overflow", "ask"), "hi", {
+      provider,
+    });
+
+    expect(turnCalls).toBe(2);
+    expect(result.state.status).not.toBe("error");
+    expect(result.assistantContent).toContain("ok after compact");
+  });
+
+  it("fails with a context-window hint if overflow persists after compact", async () => {
+    let turnCalls = 0;
+    const overflow = new AppError({
+      code: "PROVIDER_ERROR",
+      userMessage:
+        "This model's loaded context is too small for AICI's system prompt and tools.",
+      technicalDetail:
+        "The number of tokens to keep from the initial prompt is greater than the context length.",
+    });
+    const provider = {
+      async listModels() {
+        return [{ id: "mock" }];
+      },
+      cancel() {},
+      async *chat(messages: ChatMessage[]) {
+        const first = messages[0];
+        const sys =
+          first?.role === "system" && typeof first.content === "string"
+            ? first.content
+            : "";
+        if (sys.includes("compress an AI coding-agent")) {
+          yield { type: "content" as const, delta: "Prior work summarized." };
+          return;
+        }
+        turnCalls += 1;
+        yield { type: "error" as const, error: overflow };
+      },
+    };
+
+    const result = await runAgentTurn(newSession("s-overflow-2", "ask"), "hi", {
+      provider,
+    });
+
+    expect(turnCalls).toBe(2);
+    expect(result.state.status).toBe("error");
+    expect(result.state.error).toMatch(/loaded context is too small/i);
+  });
+
+  it("says so in the transcript when a turn dies outside the build phase", async () => {
+    const provider = {
+      async listModels() {
+        return [{ id: "mock" }];
+      },
+      cancel() {},
+      async *chat() {
+        yield { type: "content" as const, delta: "Checking the env files." };
+        yield {
+          type: "error" as const,
+          error: new AppError({
+            code: "PROVIDER_ERROR",
+            userMessage: "The AI provider returned an error.",
+            technicalDetail: "HTTP 429",
+          }),
+        };
+      },
+    };
+
+    // Testing phase: checklist complete, gate not started. This combination used
+    // to leave the transcript ending on the model's prose with no hint of the
+    // failure, and no banner offered a way back.
+    const session = {
+      ...newSession("s-testing-err", "agent"),
+      mode: "agent" as const,
+      planStatus: "executing" as const,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Phase 1",
+          status: "completed" as const,
+          checklist: [{ id: "c1", text: "Done item", done: true }],
+        },
+      ],
+    };
+
+    const result = await runAgentTurn(session, "verify", { provider });
+
+    expect(result.state.status).toBe("error");
+    const last = result.state.turns[result.state.turns.length - 1];
+    expect(last?.content).toContain("**Stopped**");
+    expect(last?.content).toContain("The AI provider returned an error.");
+    expect(last?.content).toContain("Resume");
+    // The model's own prose is kept as its own turn, not swallowed by the notice.
+    expect(
+      result.state.turns.some((t) => t.content.includes("Checking the env files")),
+    ).toBe(true);
+  });
+
   it("buildContext keeps goal + short tail, not full chat history", () => {
     const turns = [];
     turns.push({
@@ -1014,6 +1211,34 @@ describe("agent runtime", () => {
     expect(compacted[compacted.length - 2]?.role).toBe("assistant");
   });
 
+  it("sanitizeProviderMessages trims tool_calls when tail compaction dropped results", () => {
+    const messages = [
+      { role: "user" as const, content: "start" },
+      {
+        role: "assistant" as const,
+        content: null,
+        tool_calls: [
+          { id: "toolu_a", name: "read_file", arguments: '{"path":"a.ts"}' },
+          { id: "toolu_b", name: "read_file", arguments: '{"path":"b.ts"}' },
+        ],
+      },
+      { role: "tool" as const, tool_call_id: "toolu_a", content: "ok a" },
+      { role: "user" as const, content: "continue" },
+    ];
+    const tail = takeSafeMessageTail(messages, 2);
+    const clean = sanitizeProviderMessages(tail);
+    const assistant = clean.find(
+      (m) => m.role === "assistant" && m.tool_calls?.length,
+    );
+    expect(assistant?.role).toBe("assistant");
+    if (assistant?.role === "assistant" && assistant.tool_calls) {
+      expect(assistant.tool_calls.map((c) => c.id)).toEqual(["toolu_a"]);
+    }
+    expect(
+      clean.filter((m) => m.role === "tool").map((m) => m.tool_call_id),
+    ).toEqual(["toolu_a"]);
+  });
+
   it("planning tank keeps going on prose until upsert_plan / questions / ready", async () => {
     let chatCalls = 0;
     const provider = {
@@ -1108,5 +1333,116 @@ describe("agent runtime", () => {
       },
     };
     expect(isAgentTankMode(awaitingBuild)).toBe(false);
+  });
+});
+
+describe("test gate fix loop thrash budget", () => {
+  function failedGateState(): SessionState {
+    const at = new Date().toISOString();
+    return {
+      ...newSession("s-gate-thrash", "agent"),
+      mode: "agent" as const,
+      planStatus: "executing" as const,
+      planPhases: [
+        {
+          id: "p1",
+          title: "Phase 1",
+          status: "completed" as const,
+          checklist: [{ id: "c1", text: "Do thing", done: true }],
+        },
+      ],
+      testingConfirmedAt: at,
+      testRun: {
+        startedAt: at,
+        finishedAt: at,
+        status: "failed" as const,
+        specs: [],
+        suites: [],
+        digest: "fail",
+      },
+    };
+  }
+
+  function round(
+    name: string,
+    args: Record<string, unknown> = {},
+    success = true,
+  ) {
+    const id = `call-${name}-${JSON.stringify(args)}`;
+    return {
+      toolCalls: [
+        { id, name, arguments: args, riskLevel: "safe" as const },
+      ],
+      results: [{ callId: id, success, summary: "ok" }],
+    };
+  }
+
+  it("does not count rounds that fetch gate evidence for the first time", () => {
+    const state = failedGateState();
+    let budget = newGateFixBudget();
+    const evidence = [
+      round("get_test_report"),
+      round("list_failed_tests"),
+      round("read_test_log", { suiteId: "e2e", chunk: 0 }),
+      round("read_image", { path: "cypress/screenshots/a.png" }),
+    ];
+    for (const batch of evidence) {
+      const step = noteGateFixRound(state, budget, batch);
+      expect(step.stop).toBe(false);
+      budget = step.budget;
+    }
+    expect(budget.roundsWithoutEdit).toBe(0);
+    expect(budget.evidenceRoundsLeft).toBe(0);
+  });
+
+  it("counts re-reading the same evidence and opens the circuit as stalled", () => {
+    const state = failedGateState();
+    let budget = newGateFixBudget();
+    const first = noteGateFixRound(state, budget, round("get_test_report"));
+    budget = first.budget;
+
+    let last = first;
+    for (let i = 0; i < MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT; i += 1) {
+      last = noteGateFixRound(state, budget, round("get_test_report"));
+      budget = last.budget;
+    }
+
+    expect(last.stop).toBe(true);
+    expect(last.state.testGateCircuitOpen).toBe(true);
+    expect(last.state.testGateCircuitReason).toBe("stalled");
+    expect(last.state.turns.at(-1)?.content).toContain("fix loop stalled");
+  });
+
+  it("counts narration-only rounds and resets on a successful edit", () => {
+    const state = failedGateState();
+    let budget = newGateFixBudget();
+    for (let i = 0; i < MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT - 1; i += 1) {
+      const step = noteGateFixRound(state, budget, null);
+      expect(step.stop).toBe(false);
+      budget = step.budget;
+    }
+    expect(budget.roundsWithoutEdit).toBe(MAX_GATE_FIX_ROUNDS_WITHOUT_EDIT - 1);
+
+    const edited = noteGateFixRound(
+      state,
+      budget,
+      round("replace_in_file", { path: "src/a.ts" }),
+    );
+    expect(edited.stop).toBe(false);
+    expect(edited.budget.roundsWithoutEdit).toBe(0);
+
+    const failedEdit = noteGateFixRound(
+      state,
+      edited.budget,
+      round("write_file", { path: "src/b.ts" }, false),
+    );
+    expect(failedEdit.budget.roundsWithoutEdit).toBe(1);
+  });
+
+  it("stays inert outside the Check/Test fix tank", () => {
+    const idle = newSession("s-gate-idle", "agent");
+    const step = noteGateFixRound(idle, newGateFixBudget(), null);
+    expect(step.stop).toBe(false);
+    expect(step.budget.roundsWithoutEdit).toBe(0);
   });
 });

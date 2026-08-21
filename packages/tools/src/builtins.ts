@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { ToolRegistry, type ToolPhase } from "./registry.js";
 import { registerAskTools } from "./ask.js";
+import { registerHumanSetupTools } from "./human-setup.js";
+import { registerNoticeTools } from "./notice.js";
 import { registerCbmTools } from "./cbm-builtins.js";
 import { registerVisionTools } from "./vision.js";
 import { registerWebTools } from "./web.js";
@@ -835,9 +837,15 @@ export function registerBuiltinTools(registry: ToolRegistry): void {
       additionalProperties: false,
     },
     execute: async (args, ctx) => {
-      const { searchText } = await import("@ai-ide/workspace");
+      const { searchText, DEFAULT_SEARCH_MAX_RESULTS } = await import(
+        "@ai-ide/workspace"
+      );
       const matches = searchText(ctx.workspaceRoot, String(args.query));
-      return { summary: `Found ${matches.length} matches`, output: matches };
+      const capped = matches.length >= DEFAULT_SEARCH_MAX_RESULTS;
+      const summary = capped
+        ? `Found ${matches.length}+ matches (capped — narrow the query)`
+        : `Found ${matches.length} matches`;
+      return { summary, output: matches };
     },
   });
 
@@ -1579,5 +1587,7 @@ export function createDefaultRegistry(): ToolRegistry {
   registerWebTools(registry);
   registerVisionTools(registry);
   registerAskTools(registry);
+  registerHumanSetupTools(registry);
+  registerNoticeTools(registry);
   return registry;
 }

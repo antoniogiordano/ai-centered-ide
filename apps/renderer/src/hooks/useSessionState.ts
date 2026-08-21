@@ -8,6 +8,20 @@ export type SessionView = {
   activeSessionId: string | null;
 };
 
+function sameSummaries(a: SessionSummary[], b: SessionSummary[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((left, i) => {
+    const right = b[i]!;
+    return (
+      left.id === right.id &&
+      left.title === right.title &&
+      left.updatedAt === right.updatedAt &&
+      left.phase === right.phase &&
+      left.workspaceName === right.workspaceName
+    );
+  });
+}
+
 export function useSessionState(): SessionView {
   const [state, setState] = useState<SessionState | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -25,7 +39,12 @@ export function useSessionState(): SessionView {
     });
     const unsub = subscribeSession((event: SessionUpdateEvent) => {
       setState(event.state);
-      setSessions(event.sessions);
+      // The tab list is re-sent with every stream tick as a fresh clone. Keeping
+      // the previous array when nothing changed spares the session bar (and
+      // anything else reading it) a re-render many times a second.
+      setSessions((prev) =>
+        sameSummaries(prev, event.sessions) ? prev : event.sessions,
+      );
       setActiveSessionId(event.activeSessionId);
     });
     return () => {

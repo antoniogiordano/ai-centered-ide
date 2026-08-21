@@ -95,7 +95,6 @@ export function TerminalAskDialog(props: {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending.id, pending.options, selectedId, text]);
 
   return (

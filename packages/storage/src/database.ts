@@ -5,19 +5,23 @@ import { dirname } from "node:path";
 import type {
   AgentMode,
   ApprovalGrant,
+  HumanSetupRequest,
+  SessionNotice,
   PlanPhase,
   PlanQuestion,
   PlanReadyProposal,
   PlanStatus,
   PlanStep,
   SessionKind,
+  SessionLog,
   SessionModelUsage,
   Turn,
   WorkspaceRef,
 } from "@ai-ide/shared";
+import { SessionLogSchema } from "@ai-ide/shared";
 import { backupFile } from "./config.js";
 
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 type Migration = {
   version: number;
@@ -87,6 +91,31 @@ const migrations: Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS session_logs (
+          session_id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          title TEXT,
+          workspace_name TEXT,
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          updated_at TEXT NOT NULL,
+          outcome TEXT NOT NULL DEFAULT 'open',
+          outcome_detail TEXT,
+          feat_branch TEXT,
+          build_base_branch TEXT,
+          models_json TEXT NOT NULL DEFAULT '[]',
+          phases_json TEXT NOT NULL DEFAULT '[]',
+          errors_json TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE INDEX IF NOT EXISTS session_logs_project_updated
+          ON session_logs (project_id, updated_at DESC);
+      `);
+    },
+  },
 ];
 
 export function openDatabase(dbPath: string): Database.Database {
@@ -141,6 +170,7 @@ export class ProjectStorage {
       this.db
         .prepare("DELETE FROM checkpoints_index WHERE project_id = ?")
         .run(projectId);
+      this.db.prepare("DELETE FROM session_logs WHERE project_id = ?").run(projectId);
     })();
   }
 
@@ -221,7 +251,10 @@ export class ProjectStorage {
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
     buildBaseBranch?: string | null;
+    featBranch?: string | null;
   buildFlowCompletedAt?: string | null;
+  humanSetup?: HumanSetupRequest | null;
+  notices?: SessionNotice[];
   sessionKind: SessionKind;
   approvalGrants: ApprovalGrant[];
   sessionModelUsage?: SessionModelUsage[];
@@ -259,7 +292,10 @@ export class ProjectStorage {
           planQuestions: row.planQuestions,
           planReadyProposal: row.planReadyProposal,
           buildBaseBranch: row.buildBaseBranch ?? null,
+          featBranch: row.featBranch ?? null,
           buildFlowCompletedAt: row.buildFlowCompletedAt ?? null,
+          humanSetup: row.humanSetup ?? null,
+          notices: row.notices ?? [],
           sessionKind: row.sessionKind,
           approvalGrants: row.approvalGrants,
           sessionModelUsage: row.sessionModelUsage ?? [],
@@ -282,7 +318,10 @@ export class ProjectStorage {
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
     buildBaseBranch: string | null;
+    featBranch: string | null;
     buildFlowCompletedAt: string | null;
+    humanSetup: HumanSetupRequest | null;
+    notices: SessionNotice[];
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     sessionModelUsage: SessionModelUsage[];
@@ -322,7 +361,10 @@ export class ProjectStorage {
             planQuestions?: PlanQuestion[];
             planReadyProposal?: PlanReadyProposal | null;
             buildBaseBranch?: string | null;
+            featBranch?: string | null;
             buildFlowCompletedAt?: string | null;
+            humanSetup?: HumanSetupRequest | null;
+            notices?: SessionNotice[];
             sessionKind?: SessionKind;
             approvalGrants?: ApprovalGrant[];
             sessionModelUsage?: SessionModelUsage[];
@@ -345,7 +387,10 @@ export class ProjectStorage {
         planQuestions: meta.planQuestions ?? [],
         planReadyProposal: meta.planReadyProposal ?? null,
         buildBaseBranch: meta.buildBaseBranch ?? null,
+        featBranch: meta.featBranch ?? null,
         buildFlowCompletedAt: meta.buildFlowCompletedAt ?? null,
+        humanSetup: meta.humanSetup ?? null,
+        notices: meta.notices ?? [],
         sessionKind: meta.sessionKind ?? "delivery",
         approvalGrants: meta.approvalGrants ?? [],
         sessionModelUsage: meta.sessionModelUsage ?? [],
@@ -370,7 +415,10 @@ export class ProjectStorage {
     planQuestions: PlanQuestion[];
     planReadyProposal: PlanReadyProposal | null;
     buildBaseBranch: string | null;
+    featBranch: string | null;
     buildFlowCompletedAt: string | null;
+    humanSetup: HumanSetupRequest | null;
+    notices: SessionNotice[];
     sessionKind: SessionKind;
     approvalGrants: ApprovalGrant[];
     sessionModelUsage: SessionModelUsage[];
@@ -401,10 +449,11 @@ export class ProjectStorage {
       );
       for (const turn of turns) {
         const payload =
-          turn.toolCalls || turn.toolResults
+          turn.toolCalls || turn.toolResults || turn.reasoning
             ? JSON.stringify({
                 toolCalls: turn.toolCalls,
                 toolResults: turn.toolResults,
+                reasoning: turn.reasoning,
               })
             : null;
         insert.run(
@@ -438,6 +487,7 @@ export class ProjectStorage {
         ? (JSON.parse(row.payloadJson) as {
             toolCalls?: Turn["toolCalls"];
             toolResults?: Turn["toolResults"];
+            reasoning?: Turn["reasoning"];
           })
         : {};
       return {
@@ -447,9 +497,111 @@ export class ProjectStorage {
         createdAt: row.createdAt,
         ...(payload.toolCalls ? { toolCalls: payload.toolCalls } : {}),
         ...(payload.toolResults ? { toolResults: payload.toolResults } : {}),
+        ...(payload.reasoning ? { reasoning: payload.reasoning } : {}),
       };
     });
   }
+
+  upsertSessionLog(log: SessionLog): void {
+    const parsed = SessionLogSchema.parse(log);
+    this.db
+      .prepare(
+        `INSERT INTO session_logs (
+           session_id, project_id, title, workspace_name, started_at, ended_at,
+           updated_at, outcome, outcome_detail, feat_branch, build_base_branch,
+           models_json, phases_json, errors_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           project_id = excluded.project_id,
+           title = excluded.title,
+           workspace_name = excluded.workspace_name,
+           started_at = excluded.started_at,
+           ended_at = excluded.ended_at,
+           updated_at = excluded.updated_at,
+           outcome = excluded.outcome,
+           outcome_detail = excluded.outcome_detail,
+           feat_branch = excluded.feat_branch,
+           build_base_branch = excluded.build_base_branch,
+           models_json = excluded.models_json,
+           phases_json = excluded.phases_json,
+           errors_json = excluded.errors_json`,
+      )
+      .run(
+        parsed.sessionId,
+        parsed.projectId,
+        parsed.title,
+        parsed.workspaceName,
+        parsed.startedAt,
+        parsed.endedAt,
+        parsed.updatedAt,
+        parsed.outcome,
+        parsed.outcomeDetail,
+        parsed.featBranch,
+        parsed.buildBaseBranch,
+        JSON.stringify(parsed.models),
+        JSON.stringify(parsed.phases),
+        JSON.stringify(parsed.errors),
+      );
+  }
+
+  getSessionLog(sessionId: string): SessionLog | null {
+    const row = this.db
+      .prepare("SELECT * FROM session_logs WHERE session_id = ?")
+      .get(sessionId) as SessionLogRow | undefined;
+    return row ? rowToSessionLog(row) : null;
+  }
+
+  listSessionLogs(projectId?: string): SessionLog[] {
+    const rows = (
+      projectId
+        ? this.db
+            .prepare(
+              `SELECT * FROM session_logs WHERE project_id = ?
+               ORDER BY updated_at DESC`,
+            )
+            .all(projectId)
+        : this.db
+            .prepare("SELECT * FROM session_logs ORDER BY updated_at DESC")
+            .all()
+    ) as SessionLogRow[];
+    return rows.map(rowToSessionLog);
+  }
+}
+
+type SessionLogRow = {
+  session_id: string;
+  project_id: string;
+  title: string | null;
+  workspace_name: string | null;
+  started_at: string;
+  ended_at: string | null;
+  updated_at: string;
+  outcome: string;
+  outcome_detail: string | null;
+  feat_branch: string | null;
+  build_base_branch: string | null;
+  models_json: string;
+  phases_json: string;
+  errors_json: string;
+};
+
+function rowToSessionLog(row: SessionLogRow): SessionLog {
+  return SessionLogSchema.parse({
+    sessionId: row.session_id,
+    projectId: row.project_id,
+    title: row.title || "New chat",
+    workspaceName: row.workspace_name,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    updatedAt: row.updated_at,
+    outcome: row.outcome,
+    outcomeDetail: row.outcome_detail,
+    featBranch: row.feat_branch,
+    buildBaseBranch: row.build_base_branch,
+    models: JSON.parse(row.models_json),
+    phases: JSON.parse(row.phases_json),
+    errors: JSON.parse(row.errors_json),
+  });
 }
 
 export function getSchemaVersion(db: Database.Database): number {
